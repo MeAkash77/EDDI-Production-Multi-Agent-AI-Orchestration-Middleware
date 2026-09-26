@@ -61,7 +61,7 @@ jobs:
       - name: Approve if Copilot-clean and CI green
         # Skip gracefully (no misleading red check) when the bot PAT is not configured.
         if: ${{ env.BOT_TOKEN != '' }}
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           # Every API call in this step — reads and the approval — uses the bot PAT, so
           # the approval is attributed to the bot. The PAT is fine-grained to one repo.
