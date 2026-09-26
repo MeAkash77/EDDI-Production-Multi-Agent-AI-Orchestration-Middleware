@@ -46,7 +46,7 @@
              package, verify and install always build both UIs unless -DskipUi=true.
              CI's Build Image job is the build that ships them. -->
         <skipUi>false</skipUi>
-        <frontend-maven-plugin.version>1.15.1</frontend-maven-plugin.version>
+        <frontend-maven-plugin.version>2.0.2</frontend-maven-plugin.version>
         <!-- Node 22 matches CI (ci.yml, the ui-* jobs) and mise.toml. The floor is
              22.18: Vitest 5 needs 22.12, and Stryker 10's Babel 8 declares
              `^22.18.0 || >=24.11.0`. Node 22 is Maintenance LTS until 2027-04-30;
