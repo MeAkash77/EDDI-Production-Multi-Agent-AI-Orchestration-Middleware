@@ -136,7 +136,7 @@ jobs:
           docker run --rm --entrypoint="" "${RELEASED}" head -30 /licenses/THIRD-PARTY.txt || true
 
       - name: Login to the Red Hat hosted registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: quay.io
           username: ${{ secrets.REDHAT_REGISTRY_USERNAME }}
