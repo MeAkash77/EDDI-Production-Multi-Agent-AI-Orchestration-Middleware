@@ -425,7 +425,7 @@
         <dependency>
             <groupId>com.github.victools</groupId>
             <artifactId>jsonschema-module-jackson</artifactId>
-            <version>4.38.0</version>
+            <version>5.0.0</version>
         </dependency>
         <!-- JSON Schema VALIDATION (victools above only GENERATES schemas) — used
              by the declarative shared-artifact validators (I17). -->
