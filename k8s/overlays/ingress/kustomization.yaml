@@ -1,0 +1,15 @@
+# Ingress component
+#
+# ⚠️  This is a kustomize COMPONENT, not a standalone overlay. `kubectl apply -k`
+# on this directory does not work by design. Reference it from a kustomization
+# that already includes the base, and edit the host in ingress.yaml:
+#
+#   resources:
+#     - ../../overlays/mongodb
+#   components:
+#     - ../../overlays/ingress
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - ingress.yaml

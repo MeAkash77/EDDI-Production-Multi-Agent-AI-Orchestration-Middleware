@@ -1,0 +1,3 @@
+# https://www.roagentstxt.org/roagentstxt.html
+User-agent: *
+Disallow:

@@ -1,0 +1,609 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory;
+
+import ai.labs.eddi.engine.memory.IConversationMemory.IConversationStep;
+import ai.labs.eddi.engine.memory.IConversationMemory.IWritableConversationStep;
+import ai.labs.eddi.utils.LogSanitizer;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot.ConversationStepSnapshot;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot.WorkflowRunSnapshot;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot.ResultSnapshot;
+import ai.labs.eddi.engine.memory.model.ConversationOutput;
+import ai.labs.eddi.engine.memory.model.Data;
+import ai.labs.eddi.engine.memory.model.PendingToolCallBatch;
+import ai.labs.eddi.engine.memory.model.SimpleConversationMemorySnapshot;
+import ai.labs.eddi.secrets.sanitize.SecretRedactionFilter;
+import ai.labs.eddi.engine.model.Context;
+import jakarta.enterprise.context.ApplicationScoped;
+import org.jboss.logging.Logger;
+
+import java.util.*;
+
+import static ai.labs.eddi.engine.memory.MemoryKeys.*;
+import static ai.labs.eddi.engine.memory.model.SimpleConversationMemorySnapshot.ConversationStepData;
+import static ai.labs.eddi.engine.memory.model.SimpleConversationMemorySnapshot.SimpleConversationStep;
+import static ai.labs.eddi.utils.RuntimeUtilities.isNullOrEmpty;
+
+/**
+ * @author ginccc
+ */
+
+@ApplicationScoped
+public class ConversationMemoryUtilities {
+    private static final Logger LOGGER = Logger.getLogger(ConversationMemoryUtilities.class);
+    private static final String KEY_CONVERSATION_STEPS = "conversationSteps";
+    private static final String KEY_CONVERSATION_OUTPUTS = "conversationOutputs";
+    private static final String KEY_CONVERSATION_PROPERTIES = "conversationProperties";
+
+    public static ConversationMemorySnapshot convertConversationMemory(IConversationMemory conversationMemory) {
+        var snapshot = getMemorySnapshot(conversationMemory);
+
+        for (var redoStep : conversationMemory.getRedoCache()) {
+            var redoStepSnapshot = iterateConversationStep(redoStep);
+            // A redo entry's output is not in snapshot.conversationOutputs — undo popped
+            // it. Carry it on the step itself, or redo restores an empty turn.
+            redoStepSnapshot.setConversationOutput(redoStep.getConversationOutput());
+            snapshot.getRedoCache().push(redoStepSnapshot);
+        }
+
+        for (int i = conversationMemory.getAllSteps().size() - 1; i >= 0; i--) {
+            var conversationStep = conversationMemory.getAllSteps().get(i);
+            snapshot.getConversationSteps().add(iterateConversationStep(conversationStep));
+        }
+
+        snapshot.getConversationOutputs().addAll(conversationMemory.getConversationOutputs());
+        snapshot.getConversationProperties().putAll(conversationMemory.getConversationProperties());
+        // Deferred user-memory writes MUST round-trip: they are the only record that a
+        // longTerm property in conversationProperties has not reached the user-memory
+        // store yet. Dropping them here re-introduces the silent-write-loss the marker
+        // exists to prevent (the next turn's baseline is taken from those very
+        // properties, so an owed write would look "unchanged" forever).
+        snapshot.getPendingLongTermWrites().addAll(conversationMemory.getPendingLongTermWrites());
+
+        return snapshot;
+    }
+
+    private static ConversationMemorySnapshot getMemorySnapshot(IConversationMemory conversationMemory) {
+        var snapshot = new ConversationMemorySnapshot();
+        // The field initialiser is the LEGACY sentinel so key-less stored documents
+        // read as legacy — a snapshot built from live memory is current by
+        // definition and must say so explicitly.
+        snapshot.setSchemaVersion(ConversationMemorySnapshot.CURRENT_SCHEMA_VERSION);
+        // The revision this write is DERIVED from, not the one it will create: the
+        // store filters on it and increments it, so a turn built on a snapshot that
+        // another writer has already superseded is refused instead of overwriting it.
+        snapshot.setRevision(conversationMemory.getRevision());
+        // How many steps the document held when this memory was loaded. Lets the store
+        // append the steps this turn added instead of rewriting the whole document; see
+        // IConversationMemory#getPersistedStepCount.
+        snapshot.setPersistedStepCount(conversationMemory.getPersistedStepCount());
+
+        if (conversationMemory.getUserId() != null) {
+            snapshot.setUserId(conversationMemory.getUserId());
+        }
+
+        // Unconditional, unlike the userId above: a null here is a meaningful value
+        // (not verified) and skipping the write would let a re-store silently keep a
+        // provenance the live memory no longer claims.
+        snapshot.setResolutionProvenance(conversationMemory.getResolutionProvenance());
+
+        if (conversationMemory.getConversationId() != null) {
+            snapshot.setConversationId(conversationMemory.getConversationId());
+        }
+
+        snapshot.setAgentId(conversationMemory.getAgentId());
+        snapshot.setAgentVersion(conversationMemory.getAgentVersion());
+        snapshot.setConversationState(conversationMemory.getConversationState());
+        snapshot.setHitlPausedWorkflowId(conversationMemory.getHitlPausedWorkflowId());
+        snapshot.setHitlPausedAbsoluteTaskIndex(conversationMemory.getHitlPausedAbsoluteTaskIndex());
+        snapshot.setHitlPausedAt(conversationMemory.getHitlPausedAt());
+        snapshot.setHitlPauseReason(conversationMemory.getHitlPauseReason());
+        snapshot.setHitlTimeoutPolicy(conversationMemory.getHitlTimeoutPolicy());
+        snapshot.setHitlApprovalTimeout(conversationMemory.getHitlApprovalTimeout());
+        snapshot.setHitlPauseType(conversationMemory.getHitlPauseType());
+        snapshot.setHitlPendingToolCalls(conversationMemory.getHitlPendingToolCalls());
+        return snapshot;
+    }
+
+    private static ConversationStepSnapshot iterateConversationStep(IConversationStep conversationStep) {
+        var conversationStepSnapshot = new ConversationStepSnapshot();
+
+        if (!conversationStep.isEmpty()) {
+            var packageRunSnapshot = new WorkflowRunSnapshot();
+            conversationStepSnapshot.getWorkflows().add(packageRunSnapshot);
+            for (var data : conversationStep.getAllElements()) {
+                var resultSnapshot = new ResultSnapshot(data.getKey(), data.getResult(), data.getPossibleResults(), data.getTimestamp(),
+                        data.getOriginWorkflowId(), data.isPublic(), data.isCommitted());
+                packageRunSnapshot.getLifecycleTasks().add(resultSnapshot);
+            }
+        }
+
+        return conversationStepSnapshot;
+    }
+
+    private static List<IConversationStep> iterateRedoCache(List<ConversationStepSnapshot> redoSteps) {
+        List<IConversationStep> conversationSteps = new LinkedList<>();
+        for (var redoStep : redoSteps) {
+            // Null for documents written before the output was carried here; an empty
+            // output then behaves exactly as it did before.
+            var storedOutput = redoStep.getConversationOutput();
+            IWritableConversationStep conversationStep = new ConversationStep(storedOutput != null ? storedOutput : new ConversationOutput());
+            conversationSteps.add(conversationStep);
+            for (var packageRunSnapshot : redoStep.getWorkflows()) {
+                for (var resultSnapshot : packageRunSnapshot.getLifecycleTasks()) {
+                    @SuppressWarnings("unchecked")
+                    var data = new Data<Object>(resultSnapshot.getKey(), resultSnapshot.getResult(),
+                            (List<Object>) resultSnapshot.getPossibleResults(), resultSnapshot.getTimestamp(), resultSnapshot.isPublic());
+                    data.setCommitted(resultSnapshot.isCommitted());
+                    conversationStep.storeData(data);
+                }
+            }
+        }
+
+        return conversationSteps;
+    }
+
+    public static IConversationMemory convertConversationMemorySnapshot(ConversationMemorySnapshot snapshot) {
+        var conversationMemory = new ConversationMemory(snapshot.getConversationId(), snapshot.getAgentId(), snapshot.getAgentVersion(),
+                snapshot.getUserId());
+
+        conversationMemory.setConversationState(snapshot.getConversationState());
+        // The revision this memory is a view of. Every write derived from this memory
+        // carries it, so the store can tell "built on the current document" from
+        // "built on a document someone else has since replaced".
+        conversationMemory.setRevision(snapshot.getRevision());
+        conversationMemory.setResolutionProvenance(snapshot.getResolutionProvenance());
+        conversationMemory.setHitlPausedWorkflowId(snapshot.getHitlPausedWorkflowId());
+        conversationMemory.setHitlPausedAbsoluteTaskIndex(snapshot.getHitlPausedAbsoluteTaskIndex());
+        conversationMemory.setHitlPausedAt(snapshot.getHitlPausedAt());
+        conversationMemory.setHitlPauseReason(snapshot.getHitlPauseReason());
+        conversationMemory.setHitlTimeoutPolicy(snapshot.getHitlTimeoutPolicy());
+        conversationMemory.setHitlApprovalTimeout(snapshot.getHitlApprovalTimeout());
+        conversationMemory.setHitlPauseType(snapshot.getHitlPauseType());
+        conversationMemory.setHitlPendingToolCalls(snapshot.getHitlPendingToolCalls());
+        conversationMemory.getConversationProperties().putAll(snapshot.getConversationProperties());
+        conversationMemory.setPendingLongTermWrites(snapshot.getPendingLongTermWrites());
+
+        var redoSteps = iterateRedoCache(snapshot.getRedoCache());
+        for (var redoStep : redoSteps) {
+            conversationMemory.getRedoCache().add(redoStep);
+        }
+
+        var conversationSteps = snapshot.getConversationSteps();
+        var conversationOutputs = snapshot.getConversationOutputs();
+        if (conversationSteps.size() != conversationOutputs.size()) {
+            // Legacy / drifted documents exist: the steps and outputs lists are written
+            // independently, so a document from an older or interrupted writer can carry
+            // different counts. Indexing steps by the OUTPUT index then threw
+            // IndexOutOfBoundsException and failed the whole conversation load.
+            LOGGER.warnf("Conversation '%s': %d conversation step(s) for %d conversation output(s) — "
+                    + "pairing by index and skipping the drift.", LogSanitizer.sanitize(snapshot.getConversationId()), conversationSteps.size(),
+                    conversationOutputs.size());
+        }
+        // The append baseline, and ONLY when the two lists agree: on a drifted document
+        // the steps this turn adds cannot be identified by a single count, and leaving
+        // it unknown routes the next write through the full-document replace, which
+        // also repairs the drift.
+        conversationMemory.setPersistedStepCount(conversationSteps.size() == conversationOutputs.size()
+                ? conversationSteps.size()
+                : ConversationMemorySnapshot.UNKNOWN_PERSISTED_STEP_COUNT);
+
+        for (int i = 0; i < conversationOutputs.size(); i++) {
+            var conversationOutput = conversationOutputs.get(i);
+            if (i > 0) {
+                conversationMemory.startNextStep(conversationOutput);
+            } else {
+                conversationMemory.getConversationOutputs().get(i).putAll(conversationOutput);
+            }
+
+            if (i >= conversationSteps.size()) {
+                continue;
+            }
+            var conversationStepSnapshot = conversationSteps.get(i);
+            for (var packageRunSnapshot : conversationStepSnapshot.getWorkflows()) {
+                for (var resultSnapshot : packageRunSnapshot.getLifecycleTasks()) {
+                    @SuppressWarnings("unchecked")
+                    var data = new Data<Object>(resultSnapshot.getKey(), resultSnapshot.getResult(),
+                            (List<Object>) resultSnapshot.getPossibleResults(), resultSnapshot.getTimestamp(), resultSnapshot.isPublic());
+                    data.setCommitted(resultSnapshot.isCommitted());
+                    conversationMemory.getCurrentStep().storeData(data);
+                }
+            }
+        }
+
+        return conversationMemory;
+    }
+
+    public static SimpleConversationMemorySnapshot convertSimpleConversationMemory(ConversationMemorySnapshot conversationMemorySnapshot,
+                                                                                   boolean returnDetailed, boolean returnCurrentStepOnly) {
+
+        var newSnapshot = getSimpleMemorySnapshot(conversationMemorySnapshot);
+        newSnapshot.getConversationProperties().putAll(conversationMemorySnapshot.getConversationProperties());
+
+        var conversationOutputs = conversationMemorySnapshot.getConversationOutputs();
+        conversationOutputs = returnCurrentStepOnly ? List.of(conversationOutputs.getLast()) : conversationOutputs;
+        if (returnDetailed) {
+            newSnapshot.getConversationOutputs().addAll(conversationOutputs);
+        } else {
+            var newConversationOutputs = newSnapshot.getConversationOutputs();
+            for (int index = 0; index < conversationOutputs.size(); index++) {
+                newConversationOutputs.add(new ConversationOutput());
+                var conversationOutput = conversationOutputs.get(index);
+                var newConversationOutput = newConversationOutputs.get(index);
+
+                for (var key : conversationOutput.keySet()) {
+                    if (key.startsWith(INPUT_INITIAL.key()) || key.startsWith(ACTIONS.key()) || key.startsWith(OUTPUT_PREFIX)
+                            || key.startsWith(QUICK_REPLIES_PREFIX)) {
+                        newConversationOutput.put(key, conversationOutput.get(key));
+                    }
+                }
+            }
+        }
+
+        var conversationSteps = conversationMemorySnapshot.getConversationSteps();
+        conversationSteps = returnCurrentStepOnly ? List.of(conversationSteps.getLast()) : conversationSteps;
+        for (var conversationStepSnapshot : conversationSteps) {
+            var simpleConversationStep = new SimpleConversationStep();
+            newSnapshot.getConversationSteps().add(simpleConversationStep);
+            for (var packageRunSnapshot : conversationStepSnapshot.getWorkflows()) {
+                for (var resultSnapshot : packageRunSnapshot.getLifecycleTasks()) {
+                    var key = resultSnapshot.getKey();
+                    if (returnDetailed || key.equals(INPUT_INITIAL.key()) || key.startsWith(ACTIONS.key()) || key.startsWith(OUTPUT_PREFIX)
+                            || key.startsWith(QUICK_REPLIES_PREFIX)) {
+
+                        var result = resultSnapshot.getResult();
+                        simpleConversationStep.getConversationStep()
+                                .add(new ConversationStepData(key, result, resultSnapshot.getTimestamp(), resultSnapshot.getOriginWorkflowId()));
+
+                    } else {
+                        continue;
+                    }
+
+                    simpleConversationStep.setTimestamp(resultSnapshot.getTimestamp());
+                }
+            }
+        }
+
+        return newSnapshot;
+    }
+
+    private static SimpleConversationMemorySnapshot getSimpleMemorySnapshot(ConversationMemorySnapshot conversationMemorySnapshot) {
+
+        var simpleSnapshot = new SimpleConversationMemorySnapshot();
+
+        if (conversationMemorySnapshot.getUserId() != null) {
+            simpleSnapshot.setUserId(conversationMemorySnapshot.getUserId());
+        }
+
+        simpleSnapshot.setConversationId(conversationMemorySnapshot.getConversationId());
+        simpleSnapshot.setAgentId(conversationMemorySnapshot.getAgentId());
+        simpleSnapshot.setAgentVersion(conversationMemorySnapshot.getAgentVersion());
+        simpleSnapshot.setConversationState(conversationMemorySnapshot.getConversationState());
+        simpleSnapshot.setHitlPausedAt(conversationMemorySnapshot.getHitlPausedAt());
+        // Task 13: carry the HITL pause type + gated tool-call batch (names-only for
+        // consumers) so delegated/MCP surfaces and the group member-turn path can
+        // additively surface a TOOL_CALL pause. Additive — RULE pauses leave these
+        // null.
+        //
+        // Fix #4 (security): the SimpleConversationMemorySnapshot is the GENERIC
+        // conversation-read DTO serialized by unauthenticated-of-pause read surfaces
+        // (MCP read_conversation, REST simple conversation log). It must expose ONLY
+        // pauseType + gated tool NAMES (+ safe per-call metadata) — never argumentsRaw,
+        // argumentsRedacted, chatTranscriptJson, traceSoFar, or fingerprint. Those stay
+        // on the FULL ConversationMemorySnapshot (the persisted shape) and the
+        // access-controlled approver-only detail=full surface. See
+        // namesOnlyPendingToolCalls below.
+        simpleSnapshot.setHitlPauseType(conversationMemorySnapshot.getHitlPauseType());
+        simpleSnapshot.setHitlPendingToolCalls(namesOnlyPendingToolCalls(conversationMemorySnapshot.getHitlPendingToolCalls()));
+        simpleSnapshot.setEnvironment(conversationMemorySnapshot.getEnvironment());
+        simpleSnapshot.setUndoAvailable(conversationMemorySnapshot.getConversationSteps().size() > 1);
+        simpleSnapshot.setRedoAvailable(!conversationMemorySnapshot.getRedoCache().isEmpty());
+        return simpleSnapshot;
+    }
+
+    /**
+     * Fix #4 (security): projects a persisted {@link PendingToolCallBatch} down to
+     * a names-only view safe for the GENERIC conversation-read DTO
+     * ({@link SimpleConversationMemorySnapshot}).
+     * <p>
+     * The persisted batch on the full {@link ConversationMemorySnapshot} carries
+     * the raw tool arguments, the frozen LLM transcript, the running trace, and the
+     * fingerprint — all required for the at-most-once resume/durability path. None
+     * of those may leak through the generic read surfaces (MCP
+     * {@code read_conversation}, REST simple conversation log), which are not gated
+     * on pause-approver identity.
+     * <p>
+     * This copy therefore carries ONLY per-call {@code callId}/{@code toolName}/
+     * {@code source}/{@code gateReason}/{@code argsTruncated} — never
+     * {@code argumentsRaw}, {@code argumentsRedacted}, {@code requestFingerprint},
+     * or {@code requestPreview} — and leaves {@code chatTranscriptJson},
+     * {@code gatingAssistantMessageJson}, {@code traceSoFar}, and
+     * {@code fingerprint} null. The gating message belongs in that list for the
+     * same reason as the transcript: it is verbatim, unredacted model output, kept
+     * only so a degraded resume can replay the provider-opaque fields attached to
+     * it. {@code requestPreview} is excluded for the same reason as
+     * {@code argumentsRedacted}: both are already redacted at persistence time, so
+     * the exclusion is not about a fresh secret leak — it is that this view's whole
+     * contract is "names only", and a request preview is materially more detail
+     * than a name. Consumers that read tool NAMES (delegated/group/MCP parity via
+     * {@code batch.getCalls().getToolName()}) keep working unchanged. Returns
+     * {@code null} when there is no batch.
+     */
+    private static PendingToolCallBatch namesOnlyPendingToolCalls(PendingToolCallBatch source) {
+        if (source == null) {
+            return null;
+        }
+
+        var projected = new PendingToolCallBatch();
+        // Keep the non-sensitive envelope metadata that identifies the pause.
+        projected.setPauseEpoch(source.getPauseEpoch());
+        projected.setLlmTaskId(source.getLlmTaskId());
+        projected.setLlmTaskIndex(source.getLlmTaskIndex());
+        projected.setWorkflowId(source.getWorkflowId());
+        projected.setTranscriptOmitted(source.isTranscriptOmitted());
+        projected.setExecutedUngatedCallNames(source.getExecutedUngatedCallNames());
+        projected.setIterationIndex(source.getIterationIndex());
+        projected.setActivatedToolNames(source.getActivatedToolNames());
+        projected.setAutoApproveCount(source.getAutoApproveCount());
+        projected.setPauseCountThisTurn(source.getPauseCountThisTurn());
+        // Deliberately NOT copied (sensitive / heavy): chatTranscriptJson,
+        // gatingAssistantMessageJson, traceSoFar, fingerprint. Left null so they never
+        // reach the generic read surfaces. This copy is an allow-list, so a newly added
+        // field is excluded by default — which is the right default, and the reason a
+        // new one only needs naming here rather than actively suppressing.
+
+        if (source.getCalls() != null) {
+            var projectedCalls = new ArrayList<PendingToolCallBatch.PendingToolCall>(source.getCalls().size());
+            for (var call : source.getCalls()) {
+                if (call == null) {
+                    continue;
+                }
+                var projectedCall = new PendingToolCallBatch.PendingToolCall();
+                projectedCall.setCallId(call.getCallId());
+                projectedCall.setToolName(call.getToolName());
+                projectedCall.setSource(call.getSource());
+                projectedCall.setGateReason(call.getGateReason());
+                projectedCall.setArgsTruncated(call.isArgsTruncated());
+                // Deliberately NOT copied: argumentsRaw, argumentsRedacted.
+                projectedCalls.add(projectedCall);
+            }
+            projected.setCalls(projectedCalls);
+        }
+
+        return projected;
+    }
+
+    /**
+     * Fix (security): projects the raw {@link PendingToolCallBatch} on a snapshot
+     * returned by the GENERIC raw-read surface ({@code readRawConversationLog})
+     * down to the same names-only view the Simple projection uses — stripping
+     * {@code argumentsRaw}, {@code argumentsRedacted}, {@code chatTranscriptJson},
+     * {@code traceSoFar}, {@code fingerprint} and {@code effectiveToolApprovals}.
+     * Without this, the raw endpoint leaks unredacted tool arguments and the frozen
+     * LLM transcript of a paused conversation to any authenticated caller,
+     * defeating the approver-only {@code detail=full} gate. The persisted document
+     * is untouched; {@code loadConversationMemorySnapshot} returns a
+     * freshly-deserialized, caller-owned snapshot per call, so mutating its batch
+     * field here is safe.
+     */
+    public static ConversationMemorySnapshot redactRawPendingToolCallsForRead(ConversationMemorySnapshot snapshot) {
+        if (snapshot != null && snapshot.getHitlPendingToolCalls() != null) {
+            snapshot.setHitlPendingToolCalls(namesOnlyPendingToolCalls(snapshot.getHitlPendingToolCalls()));
+        }
+        return snapshot;
+    }
+
+    /**
+     * Stands in for a stripped fingerprint. A constant, so it carries none of the
+     * digest — but non-null, so {@code PendingToolCall#isRequestPinned()} (which
+     * derives from the field) keeps reporting the truth.
+     */
+    static final String REDACTED_FINGERPRINT = "<REDACTED>";
+
+    /**
+     * Strips the request fingerprints from a snapshot about to be returned in FULL
+     * to an approver.
+     * <p>
+     * {@code approval-status?detail=full} deliberately returns the whole snapshot —
+     * an approver needs the arguments and the request preview — so
+     * {@link #namesOnlyPendingToolCalls} is far too aggressive here. But
+     * {@code requestFingerprint} must not ride along: it is a SHA-256 over a
+     * canonical string that includes the RAW body and RAW query values, i.e.
+     * precisely the credential material {@code RequestRedactor} stripped out of the
+     * preview beside it. Handing an approver both the digest and everything that
+     * went into it except the secret is an offline guessing exercise, which is why
+     * {@code PendingToolCallBatch}, {@code ResolvedRequest} and
+     * {@code docs/hitl.md} all state it is never exposed. This is what makes that
+     * true on this path.
+     * <p>
+     * A read-time projection rather than {@code @JsonIgnore} on the getter:
+     * {@code SerializationCustomizer.configureObjectMapper} is shared with
+     * {@code PersistenceMapperProducer}, so ignoring the field would also drop it
+     * from the PERSISTED document — silently disabling pinning everywhere, since
+     * the fingerprint would no longer survive the pause it exists to guard.
+     * <p>
+     * Mutates the passed snapshot, matching
+     * {@link #redactRawPendingToolCallsForRead}: both operate on a snapshot freshly
+     * loaded for one request, never on shared state.
+     * <p>
+     * Private on purpose: it is one step of
+     * {@link #sanitizePendingToolCallsForApprover}, never a projection on its own.
+     * While it was public the MCP mirror of {@code detail=full} called it directly
+     * and so served argumentsRaw and the transcript the REST surface strips — the
+     * two doors drifted because there were two methods to choose from.
+     */
+    private static ConversationMemorySnapshot stripRequestFingerprintsForRead(ConversationMemorySnapshot snapshot) {
+        if (snapshot == null || snapshot.getHitlPendingToolCalls() == null
+                || snapshot.getHitlPendingToolCalls().getCalls() == null) {
+            return snapshot;
+        }
+        for (var call : snapshot.getHitlPendingToolCalls().getCalls()) {
+            if (call != null && call.getRequestFingerprint() != null) {
+                // A marker, NOT null. `isRequestPinned()` is derived from this
+                // field, and it is a documented contract field the approver's UI
+                // renders as "verified" vs "preview only". Nulling the digest
+                // therefore silently flipped every pinned call to
+                // requestPinned:false on this surface — telling the approver the
+                // request is NOT re-checked before execution when it is, and
+                // disagreeing with detail=summary about the same conversation.
+                // Replacing rather than clearing keeps the boolean honest while
+                // revealing nothing: the marker is a constant, not a digest.
+                call.setRequestFingerprint(REDACTED_FINGERPRINT);
+            }
+        }
+        return snapshot;
+    }
+
+    /**
+     * Sanitizes a snapshot about to be returned in FULL to an approver
+     * ({@code approval-status?detail=full}, and the MCP mirror of it).
+     * <p>
+     * The ONE approver projection: both {@code RestAgentEngine#getApprovalStatus}
+     * and {@code McpHitlTools#getApprovalStatus} must call exactly this method, so
+     * a field added here is stripped on every surface at once. A new field on
+     * {@code PendingToolCallBatch} that carries raw tool arguments belongs here.
+     * <p>
+     * The approver's contract is the redacted arguments and the redacted request
+     * preview — {@link #stripRequestFingerprintsForRead} handled the digest, but
+     * four other fields rode along that the approver never needs and must not see:
+     * <ul>
+     * <li>{@code argumentsRaw} — unredacted by definition (execution needs it);
+     * observed carrying a clear-text API key the model had embedded in a
+     * create-agent call</li>
+     * <li>{@code chatTranscriptJson} — the frozen LLM transcript for resume, which
+     * contains every raw tool argument again</li>
+     * <li>{@code gatingAssistantMessageJson} — the gating assistant message, kept
+     * for the degraded resume; it embeds the gated calls' raw arguments too</li>
+     * <li>{@code traceSoFar} — the running tool trace, same exposure</li>
+     * </ul>
+     * All four are resume/execution machinery read from the PERSISTED document —
+     * this method mutates only the freshly-deserialized, caller-owned snapshot
+     * (same contract as the two projections above), so resume is unaffected.
+     * <p>
+     * The fields the approver DOES read are additionally re-redacted through the
+     * CURRENT {@link SecretRedactionFilter} at serve time: {@code
+     * argumentsRedacted} and the preview were redacted once, at pause time, with
+     * whatever filter version existed then — a pause stored before a filter
+     * improvement would otherwise keep leaking forever.
+     */
+    public static ConversationMemorySnapshot sanitizePendingToolCallsForApprover(ConversationMemorySnapshot snapshot) {
+        stripRequestFingerprintsForRead(snapshot);
+        if (snapshot == null || snapshot.getHitlPendingToolCalls() == null) {
+            return snapshot;
+        }
+        var batch = snapshot.getHitlPendingToolCalls();
+        batch.setChatTranscriptJson(null);
+        batch.setGatingAssistantMessageJson(null);
+        batch.setTraceSoFar(null);
+        if (batch.getCalls() == null) {
+            return snapshot;
+        }
+        for (var call : batch.getCalls()) {
+            if (call == null) {
+                continue;
+            }
+            call.setArgumentsRaw(null);
+            call.setArgumentsRedacted(SecretRedactionFilter.redact(call.getArgumentsRedacted()));
+            var preview = call.getRequestPreview();
+            if (preview != null) {
+                preview.setUri(SecretRedactionFilter.redact(preview.getUri()));
+                preview.setBody(SecretRedactionFilter.redact(preview.getBody()));
+                preview.setQueryParams(redactMapValues(preview.getQueryParams()));
+                preview.setHeaders(redactMapValues(preview.getHeaders()));
+            }
+        }
+        return snapshot;
+    }
+
+    /**
+     * Value-wise {@link SecretRedactionFilter} pass over a string map; keys are
+     * structural.
+     */
+    private static Map<String, String> redactMapValues(Map<String, String> source) {
+        if (source == null || source.isEmpty()) {
+            return source;
+        }
+        var redacted = new LinkedHashMap<String, String>(source.size());
+        source.forEach((key, value) -> redacted.put(key, SecretRedactionFilter.redact(value)));
+        return redacted;
+    }
+
+    public static SimpleConversationMemorySnapshot convertSimpleConversationMemorySnapshot(IConversationMemory returnConversationMemory,
+                                                                                           Boolean returnDetailed, Boolean returnCurrentStepOnly,
+                                                                                           List<String> returningFields) {
+
+        return convertSimpleConversationMemorySnapshot(convertConversationMemory(returnConversationMemory), returnDetailed, returnCurrentStepOnly,
+                returningFields);
+    }
+
+    public static SimpleConversationMemorySnapshot convertSimpleConversationMemorySnapshot(ConversationMemorySnapshot conversationMemorySnapshot,
+                                                                                           Boolean returnDetailed, Boolean returnCurrentStepOnly,
+                                                                                           List<String> returningFields) {
+
+        var memorySnapshot = convertSimpleConversationMemory(conversationMemorySnapshot, returnDetailed, returnCurrentStepOnly);
+
+        // Blank entries mean NO filter, not "select nothing". A present-but-empty
+        // query parameter (?returningFields=) binds as [""], and LLM-generated
+        // tools make that shape routine: every generated parameter is required,
+        // so a model with no filter to express sends the empty string — and the
+        // branches below would then null out steps, outputs AND properties,
+        // leaving the operator's test-drive read-back with nothing to quote.
+        // "" selects no field under any reading, so dropping blanks recovers the
+        // caller's intent on every interpretation.
+        if (returningFields != null) {
+            returningFields = returningFields.stream().filter(f -> f != null && !f.isBlank()).toList();
+        }
+
+        if (returnCurrentStepOnly) {
+            if (isNullOrEmpty(returningFields) || returningFields.contains(KEY_CONVERSATION_STEPS)) {
+                var conversationSteps = memorySnapshot.getConversationSteps();
+                if (!conversationSteps.isEmpty()) {
+                    var conversationStep = conversationSteps.getLast();
+                    conversationSteps.clear();
+                    conversationSteps.add(conversationStep);
+                }
+            } else {
+                memorySnapshot.setConversationSteps(null);
+            }
+
+            if (isNullOrEmpty(returningFields) || returningFields.contains(KEY_CONVERSATION_OUTPUTS)) {
+                var conversationOutputs = memorySnapshot.getConversationOutputs();
+                if (!conversationOutputs.isEmpty()) {
+                    var conversationOutput = conversationOutputs.getLast();
+                    conversationOutputs.clear();
+                    conversationOutputs.add(conversationOutput);
+                }
+            } else {
+                memorySnapshot.setConversationOutputs(null);
+            }
+
+            if (!isNullOrEmpty(returningFields) && !returningFields.contains(KEY_CONVERSATION_PROPERTIES)) {
+                memorySnapshot.setConversationProperties(null);
+            }
+        }
+        return memorySnapshot;
+    }
+
+    public static Map<String, Object> prepareContext(List<IData<Context>> contextDataList) {
+        Map<String, Object> dynamicAttributesMap = new HashMap<>();
+        contextDataList.forEach(contextData -> {
+            Context context = contextData.getResult();
+            String dataKey = contextData.getKey();
+            String key = dataKey.substring(dataKey.indexOf(":") + 1);
+            if (context != null) {
+                var contextType = context.getType();
+                switch (contextType) {
+                    case object, array, string, expressions -> dynamicAttributesMap.put(key, context.getValue());
+                    default -> {
+                    }
+                }
+            } else {
+                dynamicAttributesMap.put(key, null);
+            }
+        });
+        return dynamicAttributesMap;
+    }
+}

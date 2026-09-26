@@ -1,0 +1,96 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.configs.parser;
+
+import ai.labs.eddi.configs.IRestVersionInfo;
+import ai.labs.eddi.configs.parser.model.ParserConfiguration;
+import ai.labs.eddi.configs.descriptors.model.DocumentDescriptor;
+import jakarta.annotation.security.RolesAllowed;
+import org.eclipse.microprofile.openapi.annotations.Operation;
+import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
+import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.eclipse.microprofile.openapi.annotations.tags.Tag;
+
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import java.util.List;
+
+@Path("/parserstore/parsers")
+@Tag(name = "Tools / NLP", description = "Standalone semantic parser")
+@RolesAllowed({"eddi-admin", "eddi-editor"})
+public interface IRestParserStore extends IRestVersionInfo {
+    String resourceURI = "eddi://ai.labs.parser/parserstore/parsers/";
+
+    @GET
+    @Path("/descriptors")
+    @Produces(MediaType.APPLICATION_JSON)
+    @APIResponse(responseCode = "200", description = "Array of DocumentDescriptors")
+    @Operation(description = "Read list of parser descriptors.")
+    List<DocumentDescriptor> readParserDescriptors(@QueryParam("filter")
+    @DefaultValue("") String filter,
+                                                   @QueryParam("index")
+                                                   @DefaultValue("0") Integer index,
+                                                   @QueryParam("limit")
+                                                   @DefaultValue("20") Integer limit);
+
+    @GET
+    @Path("/{id}")
+    @Produces(MediaType.APPLICATION_JSON)
+    @APIResponse(responseCode = "200", description = "configuration of parser")
+    @Operation(description = "Read parser.")
+    ParserConfiguration readParser(@PathParam("id") String id,
+                                   @Parameter(name = "version", required = true, example = "1")
+                                   @QueryParam("version") Integer version);
+
+    @PUT
+    @Path("/{id}")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Operation(description = "Update parser.")
+    Response updateParser(@PathParam("id") String id,
+                          @Parameter(name = "version", required = true, example = "1")
+                          @QueryParam("version") Integer version,
+                          ParserConfiguration parserConfiguration);
+
+    /**
+     * example parser json config:
+     * <p>
+     * { "extensions": { "dictionaries": [ { "type":
+     * "eddi://ai.labs.parser.dictionaries.integer" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.decimal" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.punctuation" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.email" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.time" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.ordinalNumber" }, { "type":
+     * "eddi://ai.labs.parser.dictionaries.regular", "config": { "uri":
+     * "eddi://ai.labs.dictionary/regulardictionarystore/regulardictionaries/<INSERT_ID_OF_DICTIONARY>?version=<VERSION_NUMBER>"
+     * } } ], "corrections": [ { "type":
+     * "eddi://ai.labs.parser.corrections.levenshtein", "config": { "distance": "2"
+     * } }, { "type": "eddi://ai.labs.parser.corrections.mergedTerms" } ]} }
+     *
+     * @param parserConfiguration
+     *            configuration of parser (which dictionaries and which corrections
+     *            algorithms in which order)
+     * @return an array of expressions representing the found solutions
+     */
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Operation(description = "Create parser.")
+    Response createParser(ParserConfiguration parserConfiguration);
+
+    @POST
+    @Path("/{id}")
+    @Operation(description = "Duplicate this parser.")
+    Response duplicateParser(@PathParam("id") String id, @QueryParam("version") Integer version);
+
+    @DELETE
+    @Path("/{id}")
+    @Operation(description = "Delete parser.")
+    Response deleteParser(@PathParam("id") String id,
+                          @Parameter(name = "version", required = true, example = "1")
+                          @QueryParam("version") Integer version,
+                          @QueryParam("permanent")
+                          @DefaultValue("false") Boolean permanent);
+}

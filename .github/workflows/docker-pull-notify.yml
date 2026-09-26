@@ -1,0 +1,746 @@
+name: Project Metrics Tracker
+
+on:
+  schedule:
+    # Offset to :05 to avoid overlapping with daily (07:00) and weekly (07:00)
+    - cron: '5,20,35,50 * * * *' # every 15 min — collect metrics + push to analytics
+    - cron: '0 7 * * *'           # daily — 7am UTC (9am CEST), digest (only if activity)
+    - cron: '0 7 * * 1'           # weekly — Monday 7am UTC (9am CEST), Slack digest
+  workflow_dispatch:
+    inputs:
+      force_digest:
+        description: 'Send weekly digest now'
+        type: boolean
+        default: false
+
+# Prevent overlapping runs from racing on the shared cache
+concurrency:
+  group: project-metrics
+  cancel-in-progress: false
+
+permissions:
+  contents: read   # repo metadata + traffic API
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    permissions:
+      # write: the daily run commits the metrics history to the `metrics` branch.
+      # `main` cannot be used — it requires a PR + review and enforces admins,
+      # so a CI push there is impossible without weakening branch protection.
+      contents: write
+    steps:
+      # ── Restore cached metrics ──────────────────────────────
+      # Uses run_id-based key rotation to avoid needing actions:write for cache delete.
+      # Save always creates a new key; restore-keys finds the latest.
+      - name: Restore metrics cache
+        id: cache-restore
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: metrics.json
+          key: project-metrics-${{ github.run_id }}
+          restore-keys: |
+            project-metrics-
+
+      - name: Load previous metrics
+        id: prev
+        run: |
+          if [ -f metrics.json ]; then
+            cat metrics.json
+            echo "docker_pulls=$(jq -r '.docker_pulls // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "stars=$(jq -r '.stars // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "forks=$(jq -r '.forks // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "week_docker=$(jq -r '.week_docker // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "week_stars=$(jq -r '.week_stars // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "week_forks=$(jq -r '.week_forks // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "week_views=$(jq -r '.week_views // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "week_clones=$(jq -r '.week_clones // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "day_docker=$(jq -r '.day_docker // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "day_stars=$(jq -r '.day_stars // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "day_forks=$(jq -r '.day_forks // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "day_views=$(jq -r '.day_views // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "day_clones=$(jq -r '.day_clones // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "last_milestone=$(jq -r '.last_milestone // 0' metrics.json)" >> "$GITHUB_OUTPUT"
+            echo "has_data=true" >> "$GITHUB_OUTPUT"
+
+            # Detect whether day/week baseline fields actually exist in the cached JSON.
+            # Legacy caches from before these fields were added will be missing them,
+            # and jq defaults them to 0 above — but 0 can also be a legitimate value.
+            # Field-presence is the only reliable way to distinguish "missing" from "zero".
+            DAY_PRESENT=$(jq 'has("day_docker") and has("day_stars") and has("day_forks")' metrics.json)
+            WEEK_PRESENT=$(jq 'has("week_docker") and has("week_stars") and has("week_forks")' metrics.json)
+            echo "day_fields_present=$DAY_PRESENT" >> "$GITHUB_OUTPUT"
+            echo "week_fields_present=$WEEK_PRESENT" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_data=false" >> "$GITHUB_OUTPUT"
+            echo "day_fields_present=false" >> "$GITHUB_OUTPUT"
+            echo "week_fields_present=false" >> "$GITHUB_OUTPUT"
+            for key in docker_pulls stars forks week_docker week_stars week_forks week_views week_clones day_docker day_stars day_forks day_views day_clones last_milestone; do
+              echo "${key}=0" >> "$GITHUB_OUTPUT"
+            done
+          fi
+
+      # ── Fetch current metrics ───────────────────────────────
+      - name: Fetch Docker Hub pulls
+        id: docker
+        env:
+          PREV_PULLS: ${{ steps.prev.outputs.docker_pulls }}
+        run: |
+          set -uo pipefail
+          # `curl -sf` prints nothing and exits non-zero on an HTTP error, and jq
+          # over empty input prints nothing, so without pipefail this step used to
+          # SUCCEED with an empty `pulls=` output. That empty value then reached
+          # the GA4 and Umami payloads as `"docker_pulls": ,` - invalid JSON, two
+          # junk POSTs - and `jq --argjson docker_pulls ""`, which aborts "Build
+          # metrics snapshot" before "Save metrics cache", so the baseline was not
+          # rolled forward either. Meanwhile "Compute deltas" evaluated
+          # `$(( - 300000 ))` and reported a phantom milestone. Docker Hub's
+          # unauthenticated endpoint is polled 96 times a day by this cron, so a
+          # blip is routine rather than exceptional.
+          #
+          # Carrying the previous value forward is the same shape as the traffic
+          # step above, and it keeps the delta at 0 instead of inventing one. The
+          # digits-only guard is the one "Persist metrics history" already gets
+          # right: jq prints the literal `null` for a missing field, which is
+          # non-empty, so an emptiness check alone would let it through.
+          PULLS=$(curl -sf https://hub.docker.com/v2/repositories/labsai/eddi/ | jq -r '.pull_count // empty')
+          case "${PULLS:-}" in
+            ''|*[!0-9]*)
+              echo "::warning::Docker Hub returned no usable pull_count - carrying the previous value forward"
+              PULLS="${PREV_PULLS:-0}"
+              ;;
+          esac
+          case "${PULLS:-}" in
+            ''|*[!0-9]*) PULLS=0 ;;
+          esac
+          echo "pulls=$PULLS" >> "$GITHUB_OUTPUT"
+          echo "Docker pulls: $PULLS"
+
+      - name: Fetch GitHub stats
+        id: github
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO_DATA=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/labsai/EDDI)
+          STARS=$(echo "$REPO_DATA" | jq '.stargazers_count')
+          FORKS=$(echo "$REPO_DATA" | jq '.forks_count')
+          echo "stars=$STARS" >> "$GITHUB_OUTPUT"
+          echo "forks=$FORKS" >> "$GITHUB_OUTPUT"
+          echo "Stars: $STARS, Forks: $FORKS"
+
+      - name: Fetch GitHub traffic (views + clones)
+        id: traffic
+        env:
+          # METRICS_PAT has admin:read scope for traffic API; falls back to GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.METRICS_PAT || github.token }}
+        run: |
+          VIEWS_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/labsai/EDDI/traffic/views)
+          if echo "$VIEWS_DATA" | jq -e '.count' > /dev/null 2>&1; then
+            VIEWS=$(echo "$VIEWS_DATA" | jq '.count // 0')
+            UNIQUES=$(echo "$VIEWS_DATA" | jq '.uniques // 0')
+          else
+            echo "⚠️  Traffic API unavailable — set METRICS_PAT secret for traffic data"
+            VIEWS=0; UNIQUES=0
+          fi
+
+          CLONES_DATA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/labsai/EDDI/traffic/clones)
+          if echo "$CLONES_DATA" | jq -e '.count' > /dev/null 2>&1; then
+            CLONES=$(echo "$CLONES_DATA" | jq '.count // 0')
+          else
+            CLONES=0
+          fi
+
+          echo "views=$VIEWS" >> "$GITHUB_OUTPUT"
+          echo "uniques=$UNIQUES" >> "$GITHUB_OUTPUT"
+          echo "clones=$CLONES" >> "$GITHUB_OUTPUT"
+          echo "Views: $VIEWS (uniques: $UNIQUES), Clones: $CLONES"
+
+      # ── Detect trigger type ──────────────────────────────────
+      - name: Detect schedule type
+        id: schedule
+        run: |
+          SCHEDULE="${{ github.event.schedule }}"
+          FORCE="${{ github.event.inputs.force_digest }}"
+
+          # Determine which schedule triggered this run
+          if [ "$SCHEDULE" = "0 7 * * *" ]; then
+            TYPE="daily"
+          elif [ "$SCHEDULE" = "0 7 * * 1" ] || [ "$FORCE" = "true" ]; then
+            TYPE="weekly"
+          else
+            TYPE="collect"
+          fi
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "Schedule: '$SCHEDULE' → type=$TYPE"
+
+      # ── Compute deltas ──────────────────────────────────────
+      - name: Compute deltas
+        id: delta
+        run: |
+          PULL_DIFF=$(( ${{ steps.docker.outputs.pulls }} - ${{ steps.prev.outputs.docker_pulls }} ))
+          STAR_DIFF=$(( ${{ steps.github.outputs.stars }} - ${{ steps.prev.outputs.stars }} ))
+          FORK_DIFF=$(( ${{ steps.github.outputs.forks }} - ${{ steps.prev.outputs.forks }} ))
+          echo "pull_diff=$PULL_DIFF" >> "$GITHUB_OUTPUT"
+          echo "star_diff=$STAR_DIFF" >> "$GITHUB_OUTPUT"
+          echo "fork_diff=$FORK_DIFF" >> "$GITHUB_OUTPUT"
+
+          # Check for changes
+          if [ "$PULL_DIFF" -ne 0 ] || [ "$STAR_DIFF" -ne 0 ] || [ "$FORK_DIFF" -ne 0 ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Milestone check (every 10,000 pulls)
+          CURRENT=${{ steps.docker.outputs.pulls }}
+          LAST_MS=${{ steps.prev.outputs.last_milestone }}
+          CURRENT_MS=$(( CURRENT / 10000 * 10000 ))
+          if [ "$CURRENT_MS" -gt "$LAST_MS" ] && [ "$LAST_MS" -ne 0 ]; then
+            echo "milestone=$CURRENT_MS" >> "$GITHUB_OUTPUT"
+          else
+            echo "milestone=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Validate baselines ──────────────────────────────────
+      # A baseline is valid when: (1) the cache existed, (2) the fields are present,
+      # AND (3) the Docker pulls baseline is non-zero. Docker pulls only ever increase,
+      # so a zero baseline is always a cold-start artifact (cache eviction/rebuild).
+      # Stars and forks CAN legitimately be 0 for new repos, but Docker pulls cannot
+      # be 0 for an established project with 300k+ pulls.
+      - name: Validate baselines
+        id: baselines
+        run: |
+          HAS_DATA="${{ steps.prev.outputs.has_data }}"
+          DAY_PRESENT="${{ steps.prev.outputs.day_fields_present }}"
+          WEEK_PRESENT="${{ steps.prev.outputs.week_fields_present }}"
+          DAY_DOCKER="${{ steps.prev.outputs.day_docker }}"
+          WEEK_DOCKER="${{ steps.prev.outputs.week_docker }}"
+
+          # Day baselines: fields must exist AND docker baseline must be non-zero
+          if [ "$HAS_DATA" = "true" ] && [ "$DAY_PRESENT" = "true" ] && [ "$DAY_DOCKER" -gt 0 ]; then
+            echo "day_valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "day_valid=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Day baselines invalid (has_data=$HAS_DATA, day_present=$DAY_PRESENT, day_docker=$DAY_DOCKER)"
+          fi
+
+          # Week baselines: fields must exist AND docker baseline must be non-zero
+          if [ "$HAS_DATA" = "true" ] && [ "$WEEK_PRESENT" = "true" ] && [ "$WEEK_DOCKER" -gt 0 ]; then
+            echo "week_valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "week_valid=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Week baselines invalid (has_data=$HAS_DATA, week_present=$WEEK_PRESENT, week_docker=$WEEK_DOCKER)"
+          fi
+
+      # ── Push to analytics (always, if data changed) ─────────
+      - name: Send to Google Analytics 4
+        if: steps.delta.outputs.changed == 'true' && steps.prev.outputs.has_data == 'true'
+        continue-on-error: true
+        env:
+          GA4_SECRET: ${{ secrets.GA4_API_SECRET }}
+        run: |
+          curl -sf -X POST \
+            "https://www.google-analytics.com/mp/collect?measurement_id=G-L1011GL1PY&api_secret=$GA4_SECRET" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"client_id\": \"github-actions.metrics\",
+              \"events\": [{
+                \"name\": \"project_metrics\",
+                \"params\": {
+                  \"docker_pulls\": ${{ steps.docker.outputs.pulls }},
+                  \"docker_delta\": ${{ steps.delta.outputs.pull_diff }},
+                  \"github_stars\": ${{ steps.github.outputs.stars }},
+                  \"github_forks\": ${{ steps.github.outputs.forks }},
+                  \"github_views\": ${{ steps.traffic.outputs.views }},
+                  \"github_clones\": ${{ steps.traffic.outputs.clones }},
+                  \"engagement_time_msec\": 1
+                }
+              }]
+            }"
+
+      - name: Send to Umami Cloud
+        if: steps.delta.outputs.changed == 'true' && steps.prev.outputs.has_data == 'true'
+        continue-on-error: true
+        run: |
+          curl -sf -X POST "https://cloud.umami.is/api/send" \
+            -H 'Content-Type: application/json' \
+            -H 'User-Agent: EDDI-GitHub-Actions/1.0' \
+            -d "{
+              \"type\": \"event\",
+              \"payload\": {
+                \"hostname\": \"eddi.labs.ai\",
+                \"language\": \"en-US\",
+                \"url\": \"/project-metrics\",
+                \"website\": \"06a369b1-4a64-4262-9f6e-0a987ca7122a\",
+                \"name\": \"project_metrics\",
+                \"data\": {
+                  \"docker_pulls\": ${{ steps.docker.outputs.pulls }},
+                  \"docker_delta\": ${{ steps.delta.outputs.pull_diff }},
+                  \"github_stars\": ${{ steps.github.outputs.stars }},
+                  \"github_forks\": ${{ steps.github.outputs.forks }},
+                  \"github_views\": ${{ steps.traffic.outputs.views }},
+                  \"github_clones\": ${{ steps.traffic.outputs.clones }}
+                }
+              }
+            }"
+
+      # ── Milestone alert (immediate) ─────────────────────────
+      - name: Milestone celebration
+        if: steps.delta.outputs.milestone != '0'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          MS=$(printf "%'d" ${{ steps.delta.outputs.milestone }})
+          curl -sf -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": { \"type\": \"plain_text\", \"text\": \"🎉  EDDI hit ${MS} Docker pulls!\", \"emoji\": true }
+                },
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \"⭐ Stars: ${{ steps.github.outputs.stars }}  ·  🍴 Forks: ${{ steps.github.outputs.forks }}\"
+                  }
+                }
+              ]
+            }"
+
+      # ── Weekly digest (Monday or manual) ────────────────────
+      - name: Weekly digest
+        if: >-
+          steps.schedule.outputs.type == 'weekly'
+          && steps.baselines.outputs.week_valid == 'true'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "No SLACK_WEBHOOK_URL configured, skipping"
+            exit 0
+          fi
+
+          PULLS=${{ steps.docker.outputs.pulls }}
+          STARS=${{ steps.github.outputs.stars }}
+          FORKS=${{ steps.github.outputs.forks }}
+          VIEWS=${{ steps.traffic.outputs.views }}
+          UNIQUES=${{ steps.traffic.outputs.uniques }}
+          CLONES=${{ steps.traffic.outputs.clones }}
+
+          WEEK_PULL_DIFF=$(( PULLS - ${{ steps.prev.outputs.week_docker }} ))
+          WEEK_STAR_DIFF=$(( STARS - ${{ steps.prev.outputs.week_stars }} ))
+          WEEK_FORK_DIFF=$(( FORKS - ${{ steps.prev.outputs.week_forks }} ))
+          WEEK_VIEW_DIFF=$(( VIEWS - ${{ steps.prev.outputs.week_views }} ))
+          WEEK_CLONE_DIFF=$(( CLONES - ${{ steps.prev.outputs.week_clones }} ))
+
+          # Sanity check: if delta equals current, baseline was 0 (cold-start artifact)
+          if [ "$WEEK_PULL_DIFF" -eq "$PULLS" ] && [ "$PULLS" -gt 0 ]; then
+            echo "⚠️  Weekly deltas are bogus (baseline was 0) — skipping digest"
+            exit 0
+          fi
+
+          PULLS_FMT=$(printf "%'d" "$PULLS")
+
+          # Build sign prefixes (pulls/stars/forks only increase; views/clones can decrease)
+          pull_sign=""; [ "$WEEK_PULL_DIFF" -gt 0 ] && pull_sign="+"
+          star_sign=""; [ "$WEEK_STAR_DIFF" -gt 0 ] && star_sign="+"
+          fork_sign=""; [ "$WEEK_FORK_DIFF" -gt 0 ] && fork_sign="+"
+
+          # Views/clones: suppress delta when baseline was 0 (field missing from old cache)
+          view_delta=""; if [ "${{ steps.prev.outputs.week_views }}" -ne 0 ] || [ "$VIEWS" -eq 0 ]; then
+            vs=""; [ "$WEEK_VIEW_DIFF" -gt 0 ] && vs="+"; view_delta=", ${vs}${WEEK_VIEW_DIFF}"
+          fi
+          clone_delta=""; if [ "${{ steps.prev.outputs.week_clones }}" -ne 0 ] || [ "$CLONES" -eq 0 ]; then
+            cs=""; [ "$WEEK_CLONE_DIFF" -gt 0 ] && cs="+"; clone_delta=" (${cs}${WEEK_CLONE_DIFF})"
+          fi
+
+          curl -sf -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": { \"type\": \"plain_text\", \"text\": \"📊  EDDI Weekly Digest\", \"emoji\": true }
+                },
+                {
+                  \"type\": \"section\",
+                  \"fields\": [
+                    { \"type\": \"mrkdwn\", \"text\": \"*🐳 Docker Pulls*\n${PULLS_FMT} (${pull_sign}${WEEK_PULL_DIFF})\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*⭐ GitHub Stars*\n${STARS} (${star_sign}${WEEK_STAR_DIFF})\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*🍴 Forks*\n${FORKS} (${fork_sign}${WEEK_FORK_DIFF})\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*👀 Repo Views (14d)*\n${VIEWS} (${UNIQUES} unique${view_delta})\" },
+                    { \"type\": \"mrkdwn\", \"text\": \"*📥 Git Clones (14d)*\n${CLONES}${clone_delta}\" }
+                  ]
+                },
+                {
+                  \"type\": \"context\",
+                  \"elements\": [
+                    { \"type\": \"mrkdwn\", \"text\": \"<https://hub.docker.com/r/labsai/eddi|Docker Hub> · <https://github.com/labsai/EDDI|GitHub> · <https://eddi.labs.ai|Website>\" }
+                  ]
+                }
+              ]
+            }"
+
+      # ── Daily digest (only if activity) ──────────────────────
+      - name: Daily digest
+        if: >-
+          steps.schedule.outputs.type == 'daily'
+          && steps.baselines.outputs.day_valid == 'true'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then
+            echo "No SLACK_WEBHOOK_URL configured, skipping"
+            exit 0
+          fi
+
+          PULLS=${{ steps.docker.outputs.pulls }}
+          STARS=${{ steps.github.outputs.stars }}
+          FORKS=${{ steps.github.outputs.forks }}
+          VIEWS=${{ steps.traffic.outputs.views }}
+          CLONES=${{ steps.traffic.outputs.clones }}
+
+          DAY_PULL_DIFF=$(( PULLS - ${{ steps.prev.outputs.day_docker }} ))
+          DAY_STAR_DIFF=$(( STARS - ${{ steps.prev.outputs.day_stars }} ))
+          DAY_FORK_DIFF=$(( FORKS - ${{ steps.prev.outputs.day_forks }} ))
+          DAY_VIEW_DIFF=$(( VIEWS - ${{ steps.prev.outputs.day_views }} ))
+          DAY_CLONE_DIFF=$(( CLONES - ${{ steps.prev.outputs.day_clones }} ))
+
+          # Sanity check: if delta equals current, baseline was 0 (cold-start artifact)
+          if [ "$DAY_PULL_DIFF" -eq "$PULLS" ] && [ "$PULLS" -gt 0 ]; then
+            echo "⚠️  Daily deltas are bogus (baseline was 0) — skipping digest"
+            exit 0
+          fi
+
+          # Only send if something actually changed today
+          if [ "$DAY_PULL_DIFF" -eq 0 ] && [ "$DAY_STAR_DIFF" -eq 0 ] && [ "$DAY_FORK_DIFF" -eq 0 ]; then
+            echo "No daily activity — skipping digest"
+            exit 0
+          fi
+
+          # Build sign prefixes (pulls/stars/forks only increase; views/clones can decrease)
+          pull_sign=""; [ "$DAY_PULL_DIFF" -gt 0 ] && pull_sign="+"
+          star_sign=""; [ "$DAY_STAR_DIFF" -gt 0 ] && star_sign="+"
+          fork_sign=""; [ "$DAY_FORK_DIFF" -gt 0 ] && fork_sign="+"
+
+          # Views/clones: suppress delta when baseline was 0 (field missing from old cache)
+          view_delta=""; if [ "${{ steps.prev.outputs.day_views }}" -ne 0 ] || [ "$VIEWS" -eq 0 ]; then
+            vs=""; [ "$DAY_VIEW_DIFF" -gt 0 ] && vs="+"; view_delta=" (${vs}${DAY_VIEW_DIFF})"
+          fi
+          clone_delta=""; if [ "${{ steps.prev.outputs.day_clones }}" -ne 0 ] || [ "$CLONES" -eq 0 ]; then
+            cs=""; [ "$DAY_CLONE_DIFF" -gt 0 ] && cs="+"; clone_delta=" (${cs}${DAY_CLONE_DIFF})"
+          fi
+
+          PULLS_FMT=$(printf "%'d" "$PULLS")
+
+          curl -sf -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-type: application/json' \
+            -d "{
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": { \"type\": \"plain_text\", \"text\": \"📈  EDDI Daily Update\", \"emoji\": true }
+                },
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \"🐳 *Pulls:* ${PULLS_FMT} (${pull_sign}${DAY_PULL_DIFF})  ·  ⭐ *Stars:* ${STARS} (${star_sign}${DAY_STAR_DIFF})  ·  🍴 *Forks:* ${FORKS} (${fork_sign}${DAY_FORK_DIFF})\"
+                  }
+                },
+                {
+                  \"type\": \"context\",
+                  \"elements\": [
+                    { \"type\": \"mrkdwn\", \"text\": \"👀 Views (14d): ${VIEWS}${view_delta} · 📥 Clones (14d): ${CLONES}${clone_delta} · <https://github.com/labsai/EDDI|GitHub>\" }
+                  ]
+                }
+              ]
+            }"
+
+      # ── Save updated metrics ────────────────────────────────
+      - name: Build metrics snapshot
+        run: |
+          SCHED_TYPE="${{ steps.schedule.outputs.type }}"
+
+          CUR_PULLS=${{ steps.docker.outputs.pulls }}
+          CUR_STARS=${{ steps.github.outputs.stars }}
+          CUR_FORKS=${{ steps.github.outputs.forks }}
+
+          WEEK_VALID="${{ steps.baselines.outputs.week_valid }}"
+          DAY_VALID="${{ steps.baselines.outputs.day_valid }}"
+
+          CUR_VIEWS=${{ steps.traffic.outputs.views }}
+          CUR_CLONES=${{ steps.traffic.outputs.clones }}
+
+          # ── Determine week baseline ──
+          # Uses the same field-presence check as the Validate step
+          if [ "$WEEK_VALID" != "true" ]; then
+            # No prior data or legacy cache missing week fields — seed from current
+            WEEK_DOCKER=$CUR_PULLS
+            WEEK_STARS=$CUR_STARS
+            WEEK_FORKS=$CUR_FORKS
+            WEEK_VIEWS=$CUR_VIEWS
+            WEEK_CLONES=$CUR_CLONES
+          elif [ "$SCHED_TYPE" = "weekly" ]; then
+            # Weekly digest just sent — reset baseline to now
+            WEEK_DOCKER=$CUR_PULLS
+            WEEK_STARS=$CUR_STARS
+            WEEK_FORKS=$CUR_FORKS
+            WEEK_VIEWS=$CUR_VIEWS
+            WEEK_CLONES=$CUR_CLONES
+          else
+            # Preserve existing baseline
+            WEEK_DOCKER=${{ steps.prev.outputs.week_docker }}
+            WEEK_STARS=${{ steps.prev.outputs.week_stars }}
+            WEEK_FORKS=${{ steps.prev.outputs.week_forks }}
+            WEEK_VIEWS=${{ steps.prev.outputs.week_views }}
+            WEEK_CLONES=${{ steps.prev.outputs.week_clones }}
+          fi
+
+          # ── Determine day baseline ──
+          # Uses the same field-presence check as the Validate step
+          if [ "$DAY_VALID" != "true" ]; then
+            # No prior data or legacy cache missing day fields — seed from current
+            DAY_DOCKER=$CUR_PULLS
+            DAY_STARS=$CUR_STARS
+            DAY_FORKS=$CUR_FORKS
+            DAY_VIEWS=$CUR_VIEWS
+            DAY_CLONES=$CUR_CLONES
+          elif [ "$SCHED_TYPE" = "daily" ]; then
+            # Daily digest just sent — reset baseline to now
+            DAY_DOCKER=$CUR_PULLS
+            DAY_STARS=$CUR_STARS
+            DAY_FORKS=$CUR_FORKS
+            DAY_VIEWS=$CUR_VIEWS
+            DAY_CLONES=$CUR_CLONES
+          else
+            # Preserve existing baseline
+            DAY_DOCKER=${{ steps.prev.outputs.day_docker }}
+            DAY_STARS=${{ steps.prev.outputs.day_stars }}
+            DAY_FORKS=${{ steps.prev.outputs.day_forks }}
+            DAY_VIEWS=${{ steps.prev.outputs.day_views }}
+            DAY_CLONES=${{ steps.prev.outputs.day_clones }}
+          fi
+
+          # Current milestone marker
+          CURRENT_MS=$(( CUR_PULLS / 10000 * 10000 ))
+
+          jq -n \
+            --argjson docker_pulls "$CUR_PULLS" \
+            --argjson stars "$CUR_STARS" \
+            --argjson forks "$CUR_FORKS" \
+            --argjson week_docker "$WEEK_DOCKER" \
+            --argjson week_stars "$WEEK_STARS" \
+            --argjson week_forks "$WEEK_FORKS" \
+            --argjson week_views "$WEEK_VIEWS" \
+            --argjson week_clones "$WEEK_CLONES" \
+            --argjson day_docker "$DAY_DOCKER" \
+            --argjson day_stars "$DAY_STARS" \
+            --argjson day_forks "$DAY_FORKS" \
+            --argjson day_views "$DAY_VIEWS" \
+            --argjson day_clones "$DAY_CLONES" \
+            --argjson last_milestone "$CURRENT_MS" \
+            '{docker_pulls: $docker_pulls, stars: $stars, forks: $forks,
+              week_docker: $week_docker, week_stars: $week_stars, week_forks: $week_forks,
+              week_views: $week_views, week_clones: $week_clones,
+              day_docker: $day_docker, day_stars: $day_stars, day_forks: $day_forks,
+              day_views: $day_views, day_clones: $day_clones,
+              last_milestone: $last_milestone}' > metrics.json
+
+          echo "Saved metrics:"
+          cat metrics.json
+
+      - name: Save metrics cache
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: metrics.json
+          key: project-metrics-${{ github.run_id }}
+
+      # ── Persist history to the `metrics` branch ──────────────
+      # Why this exists: the Actions cache above holds only a rolling snapshot,
+      # and job logs expire after 90 days — so the series was unrecoverable
+      # past that horizon. This writes one row per UTC day to an orphan branch
+      # that no workflow builds from (`main` is not an option: it requires a PR
+      # plus review and enforces admins, and every push there would also fire
+      # scorecard.yml).
+      #
+      # It also re-snapshots the stargazer roster. GitHub publishes no unstar
+      # event to any API, so diffing consecutive rosters is the only way to
+      # learn *who* unstarred and how long they had held it.
+      #
+      # Deliberately NOT gated on the 07:00 'daily' schedule: GitHub drops
+      # scheduled runs under load (observed: ~48 min median spacing against a
+      # 15 min cron, and one 9.6 h gap), and a dropped 07:00 run would lose
+      # that day permanently — the values cannot be backfilled. Instead the
+      # first run of each UTC day writes the row; every later run that day
+      # sees it and exits. That also makes a failed push self-healing, since
+      # the next run simply retries.
+      - name: Persist metrics history
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: metrics
+          PULLS: ${{ steps.docker.outputs.pulls }}
+          STARS: ${{ steps.github.outputs.stars }}
+          FORKS: ${{ steps.github.outputs.forks }}
+          VIEWS: ${{ steps.traffic.outputs.views }}
+          UNIQUES: ${{ steps.traffic.outputs.uniques }}
+          CLONES: ${{ steps.traffic.outputs.clones }}
+        run: |
+          set -euo pipefail
+
+          # Never commit a malformed row: a gap is visible, a bad value is not.
+          # Must test for digits, not just non-emptiness — the upstream steps
+          # read these with `jq '.pull_count'` etc., and jq prints the literal
+          # `null` when a field is missing from an otherwise-200 response.
+          # `null` is non-empty, so an emptiness check would let it through and
+          # the roster arithmetic below would then abort on it.
+          for name in PULLS STARS FORKS VIEWS UNIQUES CLONES; do
+            value="${!name:-}"
+            case "$value" in
+              ''|*[!0-9]*)
+                echo "::warning::Metric ${name} is not a number ('${value}') — skipping persist"
+                exit 0
+                ;;
+            esac
+          done
+
+          rm -rf hist && mkdir hist && cd hist
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Reuse the branch if it exists; otherwise start it empty (orphan).
+          # --depth=1 keeps the fetch O(1) as the series grows; the remote
+          # still retains full history because the pushed commit's ancestors
+          # are already there.
+          if git fetch -q --depth=1 origin "$BRANCH" 2>/dev/null; then
+            git checkout -q -B "$BRANCH" FETCH_HEAD
+          else
+            echo "Branch '$BRANCH' not found — creating it"
+            git checkout -q -b "$BRANCH"
+          fi
+
+          mkdir -p data
+          HEADER="date,docker_pulls,stars,forks,views_14d,uniques_14d,clones_14d"
+          [ -f data/metrics.csv ] || echo "$HEADER" > data/metrics.csv
+
+          # `>>` writes at the current end of file, so a missing trailing
+          # newline would splice today's row onto the previous one and corrupt
+          # both. Only reachable after a hand edit or a truncated push, but
+          # this branch is the only durable copy — cheap to prevent, costly to
+          # repair.
+          if [ -s data/metrics.csv ] && [ -n "$(tail -c1 data/metrics.csv)" ]; then
+            echo >> data/metrics.csv
+          fi
+
+          TODAY=$(date -u +%F)
+          if grep -q "^${TODAY}," data/metrics.csv; then
+            echo "Row for ${TODAY} already present — nothing to do"
+            exit 0
+          fi
+
+          echo "${TODAY},${PULLS},${STARS},${FORKS},${VIEWS},${UNIQUES},${CLONES}" >> data/metrics.csv
+          echo "Appended row for ${TODAY}"
+
+          # Roster sorted by login so a diff shows membership changes only,
+          # never reordering. Git history then *is* the churn record:
+          #   git log -p metrics -- data/stargazers.csv
+          #
+          # Kept non-fatal on purpose: the count row above is already written,
+          # and losing it to a stargazer API hiccup would trade the reliable
+          # data for the optional data.
+          if gh api -H "Accept: application/vnd.github.star+json" \
+                    --paginate "repos/${GITHUB_REPOSITORY}/stargazers?per_page=100" \
+                    --jq '.[] | [.user.login, .starred_at] | @csv' \
+               | sort -f > data/stargazers.new; then
+            # Guard against a truncated page set silently reading as a mass
+            # unstar. Allow drift (stars move between the two API calls) but
+            # reject a roster that is nowhere near the count we just fetched.
+            ROSTER_N=$(wc -l < data/stargazers.new)
+            if [ "$ROSTER_N" -gt 0 ] && [ "$ROSTER_N" -ge $(( STARS * 9 / 10 )) ]; then
+              { echo "login,starred_at"; cat data/stargazers.new; } > data/stargazers.csv
+              echo "Roster snapshot: ${ROSTER_N} entries"
+            else
+              echo "::warning::Roster looks truncated (${ROSTER_N} rows vs ${STARS} stars) — keeping previous"
+            fi
+          else
+            echo "::warning::Stargazer API call failed — keeping previous roster"
+          fi
+          rm -f data/stargazers.new
+
+          # Orient anyone who lands on the branch; it is machine-written and
+          # has no source tree, which is otherwise confusing.
+          if [ ! -f README.md ]; then
+            cat > README.md <<'MD'
+          # EDDI project metrics history
+
+          Machine-generated by the `Project Metrics Tracker` workflow. Do not
+          edit by hand and do not merge into `main` — this is an orphan branch
+          with no source tree.
+
+          - `data/metrics.csv` — one row per UTC day: Docker pulls, stars,
+            forks, and GitHub's rolling 14-day views/clones.
+          - `data/stargazers.csv` — the stargazer roster, sorted by login.
+            GitHub publishes no unstar event, so the commit history of this
+            file is the only record of who unstarred and when:
+
+                git log -p metrics -- data/stargazers.csv
+
+          ## Data retention
+
+          `data/stargazers.csv` contains GitHub logins and star timestamps.
+          Both are public — the same values the stargazers API returns to any
+          caller — but the commit history of this file is not: it reconstructs
+          *departures*, which GitHub deliberately does not publish. Treat it as
+          a per-person record, not as incidental public data.
+
+          - **Purpose:** understanding project health — whether lost stars are
+            brief visitors or long-term followers.
+          - **Retention:** kept for the life of the branch. Snapshots are not
+            pruned, because the history *is* the dataset.
+          - **Removal:** to erase one person from the whole history while
+            keeping the file and everyone else's rows, run a row-level
+            rewrite on a fresh clone. Nothing builds from this branch, so
+            force-pushing it is safe — but force-push `metrics` only.
+
+                git clone --single-branch -b metrics <repo-url> erase
+                cd erase
+                git filter-repo --force --refs metrics --blob-callback '
+                lines = blob.data.split(b"\n")
+                if lines and lines[0].startswith(b"login,starred_at"):
+                    blob.data = b"\n".join(
+                        l for l in lines if not l.startswith(b"\"THE_LOGIN\","))
+                '
+                git push --force origin metrics
+
+            `data/metrics.csv` is aggregate-only and is not touched by the
+            callback above. To stop collection entirely, delete the roster
+            block from the `Persist metrics history` step in
+            `.github/workflows/docker-pull-notify.yml`.
+
+            As with any history rewrite, the pre-rewrite commits survive in
+            existing clones and stay reachable on GitHub until it garbage
+            collects them — ask GitHub Support to expire them if the removal
+            has to be complete.
+          MD
+          fi
+
+          git add data README.md
+          if git diff --quiet --cached; then
+            echo "Nothing changed"
+          else
+            git commit -q -m "chore(metrics): ${TODAY} — ${PULLS} pulls, ${STARS} stars"
+            git push -q origin "$BRANCH"
+            echo "Pushed to '$BRANCH'"
+          fi

@@ -1,0 +1,448 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory;
+
+import ai.labs.eddi.configs.agents.model.AgentConfiguration;
+import ai.labs.eddi.configs.hitl.HitlTimeoutPolicy;
+import ai.labs.eddi.configs.hitl.model.ToolApprovalsConfig;
+import ai.labs.eddi.engine.audit.IAuditEntryCollector;
+import ai.labs.eddi.engine.lifecycle.ConversationEventSink;
+import ai.labs.eddi.engine.memory.model.ConversationOutput;
+import ai.labs.eddi.engine.memory.model.ConversationState;
+import ai.labs.eddi.configs.properties.model.Property;
+import ai.labs.eddi.engine.lifecycle.model.HitlDecision;
+import ai.labs.eddi.engine.memory.model.PendingToolCallBatch;
+import ai.labs.eddi.engine.security.ResolutionPrincipal;
+
+import java.io.Serializable;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.Stack;
+
+/**
+ * @author ginccc
+ */
+public interface IConversationMemory extends Serializable {
+    String getConversationId();
+
+    String getAgentId();
+
+    Integer getAgentVersion();
+
+    String getUserId();
+
+    List<ConversationOutput> getConversationOutputs();
+
+    IConversationProperties getConversationProperties();
+
+    IWritableConversationStep getCurrentStep();
+
+    IConversationStepStack getPreviousSteps();
+
+    IConversationStepStack getAllSteps();
+
+    int size();
+
+    void undoLastStep();
+
+    boolean isUndoAvailable();
+
+    boolean isRedoAvailable();
+
+    void redoLastStep();
+
+    ConversationState getConversationState();
+
+    void setConversationState(ConversationState conversationState);
+
+    Stack<IConversationStep> getRedoCache();
+
+    /**
+     * Get the event sink for streaming SSE events. Returns {@code null} when no
+     * streaming is requested (standard say endpoint).
+     */
+    default ConversationEventSink getEventSink() {
+        return null;
+    }
+
+    /**
+     * Set the event sink for this conversation turn. Called from
+     * {@code ConversationService.sayStreaming()} before lifecycle execution.
+     */
+    default void setEventSink(ConversationEventSink eventSink) {
+        // no-op by default
+    }
+
+    /**
+     * Get the audit entry collector for this conversation turn. Returns
+     * {@code null} when auditing is disabled.
+     */
+    default IAuditEntryCollector getAuditCollector() {
+        return null;
+    }
+
+    /**
+     * Set the audit entry collector for this conversation turn. Called from
+     * {@code ConversationService} before lifecycle execution.
+     */
+    default void setAuditCollector(IAuditEntryCollector auditCollector) {
+        // no-op by default
+    }
+
+    /**
+     * Get the user memory configuration for this conversation. Returns {@code null}
+     * when persistent user memory is disabled.
+     */
+    default AgentConfiguration.UserMemoryConfig getUserMemoryConfig() {
+        return null;
+    }
+
+    /**
+     * Set the user memory configuration. Called from {@code Conversation.init()}
+     * when the agent has user memory enabled.
+     */
+    default void setUserMemoryConfig(AgentConfiguration.UserMemoryConfig config) {
+        // no-op by default
+    }
+
+    /**
+     * Get the memory policy configuration for this conversation. Returns
+     * {@code null} when no memory policy is configured on the agent.
+     *
+     * @since 6.0.0
+     */
+    default AgentConfiguration.MemoryPolicy getMemoryPolicy() {
+        return null;
+    }
+
+    /**
+     * Set the memory policy configuration. Called from {@code Conversation.init()}
+     * when the agent has a memory policy configured.
+     *
+     * @since 6.0.0
+     */
+    default void setMemoryPolicy(AgentConfiguration.MemoryPolicy memoryPolicy) {
+        // no-op by default
+    }
+
+    /**
+     * Mark this conversation as cancelled. Cooperative cancellation flag for HITL
+     * framework — tasks should check {@link #isCancelled()} and abort gracefully.
+     *
+     * @since 6.0.0
+     */
+    default void setCancelled(boolean cancelled) {
+    }
+
+    /**
+     * Check whether this conversation has been cancelled.
+     *
+     * @since 6.0.0
+     */
+    default boolean isCancelled() {
+        return false;
+    }
+
+    // === HITL pause bookmark ===
+
+    /** Workflow ID where the pipeline paused. */
+    default String getHitlPausedWorkflowId() {
+        return null;
+    }
+    default void setHitlPausedWorkflowId(String workflowId) {
+    }
+
+    /**
+     * Absolute task index within the paused workflow (the task that triggered
+     * PAUSE).
+     */
+    default int getHitlPausedAbsoluteTaskIndex() {
+        return -1;
+    }
+    default void setHitlPausedAbsoluteTaskIndex(int index) {
+    }
+
+    /** Timestamp when the conversation was paused. */
+    default Instant getHitlPausedAt() {
+        return null;
+    }
+    default void setHitlPausedAt(Instant pausedAt) {
+    }
+
+    /** Human-readable reason for the pause. */
+    default String getHitlPauseReason() {
+        return null;
+    }
+    default void setHitlPauseReason(String reason) {
+    }
+
+    /**
+     * Timeout policy — WAIT_INDEFINITELY, AUTO_APPROVE, AUTO_REJECT, or ABORT.
+     */
+    default HitlTimeoutPolicy getHitlTimeoutPolicy() {
+        return null;
+    }
+    default void setHitlTimeoutPolicy(HitlTimeoutPolicy policy) {
+    }
+
+    /** Approval timeout duration (ISO-8601, e.g. "PT30M"). */
+    default String getHitlApprovalTimeout() {
+        return null;
+    }
+    default void setHitlApprovalTimeout(String timeout) {
+    }
+
+    // === Tool-level HITL (tool-call pause) ===
+
+    /**
+     * Pause-type discriminator: null/"RULE" = behavior-rule pause, "TOOL_CALL" =
+     * gated tool pause.
+     */
+    default String getHitlPauseType() {
+        return null;
+    }
+    default void setHitlPauseType(String pauseType) {
+    }
+
+    /**
+     * The interrupted tool-call batch (durable); null unless a tool pause is
+     * active.
+     */
+    default PendingToolCallBatch getHitlPendingToolCalls() {
+        return null;
+    }
+    default void setHitlPendingToolCalls(PendingToolCallBatch batch) {
+    }
+
+    /**
+     * How this conversation's {@link #getUserId()} came to be, fixed when the
+     * conversation was created and persisted with it.
+     * <p>
+     * Persisted because the decision it feeds happens much later than the moment it
+     * can be established: a HITL resume days after creation runs on a request that
+     * belongs to the approver, so there is nothing left on that thread to judge the
+     * conversation's owner by. {@code null} — a conversation created before this
+     * was recorded — deliberately reads as NOT verified: pre-upgrade conversations
+     * opened from the self-asserting surfaces are precisely the population that
+     * must not be grandfathered into per-user credentials.
+     */
+    default ResolutionPrincipal.Provenance getResolutionProvenance() {
+        return null;
+    }
+    default void setResolutionProvenance(ResolutionPrincipal.Provenance provenance) {
+    }
+
+    /**
+     * Agent-level tool-approval config carried onto memory at conversation start
+     * (NOT persisted).
+     */
+    default ToolApprovalsConfig getAgentToolApprovalsConfig() {
+        return null;
+    }
+    default void setAgentToolApprovalsConfig(ToolApprovalsConfig config) {
+    }
+
+    /**
+     * The human decision being applied during an in-JVM tool-pause resume (NOT
+     * persisted).
+     */
+    default HitlDecision getHitlResumeDecision() {
+        return null;
+    }
+    default void setHitlResumeDecision(HitlDecision decision) {
+    }
+
+    // === Deferred user-memory writes ===
+
+    /**
+     * Keys of {@code longTerm} properties that were written during a turn which
+     * never reached its post-conversation tasks (HITL pause, error, cancel), so the
+     * value was never handed to
+     * {@link ai.labs.eddi.configs.properties.IUserMemoryStore}.
+     * <p>
+     * <strong>Why this is persisted:</strong> a new {@code Conversation} is built
+     * per turn and takes its "already persisted" baseline from the conversation
+     * properties it loads. Those properties come from the conversation document,
+     * which ALREADY contains the un-persisted value — so without an explicit marker
+     * the write looks unchanged forever and is dropped permanently. This set is the
+     * marker: {@code storePropertiesPermanently} writes a key that is listed here
+     * even when it equals the baseline, and removes it once the store accepted it.
+     *
+     * @since 6.2.0
+     */
+    default Set<String> getPendingLongTermWrites() {
+        return Set.of();
+    }
+
+    /**
+     * Replaces the deferred user-memory write set. See
+     * {@link #getPendingLongTermWrites()}.
+     *
+     * @since 6.2.0
+     */
+    default void setPendingLongTermWrites(Set<String> keys) {
+        // no-op by default
+    }
+
+    // === Optimistic concurrency ===
+
+    /**
+     * The revision of the conversation document this memory was loaded from, or
+     * {@code ConversationMemorySnapshot.UNVERSIONED_REVISION} for a memory that was
+     * never loaded (a brand-new conversation) or one loaded from a document written
+     * before the field existed.
+     * <p>
+     * Carried on memory because the load establishes it and the store needs it: the
+     * write filters on this value and increments it, so a turn that started from a
+     * superseded snapshot is refused rather than silently applied over the newer
+     * one.
+     *
+     * @since 6.4.1
+     */
+    default long getRevision() {
+        return 0L;
+    }
+
+    /**
+     * Records the document revision this memory represents. Set by
+     * {@code ConversationMemoryUtilities.convertConversationMemorySnapshot} on
+     * load, and again by the store path after a successful write so a second write
+     * from the same live memory carries the revision it just created.
+     *
+     * @since 6.4.1
+     */
+    default void setRevision(long revision) {
+        // no-op by default
+    }
+
+    /**
+     * How many steps the stored conversation document held when this memory was
+     * loaded, or {@code ConversationMemorySnapshot.UNKNOWN_PERSISTED_STEP_COUNT}
+     * when that is not known.
+     * <p>
+     * This is what lets a write APPEND the new steps instead of rewriting the whole
+     * document: when the count is known and the memory now holds more steps than
+     * it, the difference is exactly what this turn added, and the persisted prefix
+     * is still the prefix of this memory.
+     * <p>
+     * It reports "unknown" for every case where that does not hold — a memory that
+     * was never loaded, a document whose step and output counts had drifted, and a
+     * history that was <em>rewritten</em> rather than extended:
+     * {@link #undoLastStep()} and {@link #redoLastStep()} both reset it. A rerun
+     * needs no reset because it re-executes the current step without starting a new
+     * one, so the count does not grow and the append condition fails on its own.
+     *
+     * @since 6.4.1
+     */
+    default int getPersistedStepCount() {
+        return -1;
+    }
+
+    /**
+     * Records the persisted step count. Set by
+     * {@code ConversationMemoryUtilities.convertConversationMemorySnapshot} on
+     * load, and again by the store path after a successful write.
+     *
+     * @since 6.4.1
+     */
+    default void setPersistedStepCount(int persistedStepCount) {
+        // no-op by default
+    }
+
+    interface IConversationStepStack {
+        <T> IData<T> getLatestData(String key);
+
+        /** Type-safe variant of {@link #getLatestData(String)}. */
+        <T> IData<T> getLatestData(MemoryKey<T> key);
+
+        <T> List<List<IData<T>>> getAllData(String prefix);
+
+        int size();
+
+        IConversationStep get(int index);
+
+        IConversationStep peek();
+
+        <T> List<IData<T>> getAllLatestData(String prefix);
+    }
+
+    interface IConversationStep extends Serializable {
+        <T> IData<T> getData(String key);
+
+        /** Type-safe variant of {@link #getData(String)}. */
+        <T> IData<T> getData(MemoryKey<T> key);
+
+        /**
+         * Convenience method: returns the value directly, or {@code null} if not
+         * present. Equivalent to
+         * {@code getData(key) != null ? getData(key).getResult() : null}.
+         */
+        <T> T get(MemoryKey<T> key);
+
+        <T> List<IData<T>> getAllData(String prefix);
+
+        Set<String> getAllKeys();
+
+        List<IData<?>> getAllElements();
+
+        int size();
+
+        boolean isEmpty();
+
+        <T> IData<T> getLatestData(String prefix);
+
+        /** Type-safe variant of {@link #getLatestData(String)}. */
+        <T> IData<T> getLatestData(MemoryKey<T> key);
+
+        ConversationOutput getConversationOutput();
+    }
+
+    interface IWritableConversationStep extends IConversationStep {
+        void storeData(IData<?> element);
+
+        /**
+         * Type-safe store: creates a {@link IData} wrapper, sets the public flag from
+         * the key, and stores it in this step.
+         */
+        <T> void set(MemoryKey<T> key, T value);
+
+        void removeData(String key);
+
+        void setCurrentWorkflowId(String workflowId);
+
+        void resetConversationOutput(String rootKey);
+
+        /**
+         * Removes the first occurrence of {@code value} from the list stored under
+         * {@code key} in the conversation output, leaving every other entry intact.
+         * No-op when the key is absent, holds a non-list, or the value is not present.
+         * Used to drop a single transient entry (e.g. the HITL pending-approval
+         * placeholder on resume) without clearing legitimate earlier output.
+         */
+        void removeConversationOutputListItem(String key, Object value);
+
+        /**
+         * Removes an entire conversation-output entry by key (e.g. the transient
+         * {@code hitl:status} pause marker on resume).
+         */
+        void removeConversationOutput(String key);
+
+        void addConversationOutputObject(String key, Object value);
+
+        void replaceConversationOutputObject(String key, Object value, Object replace);
+
+        void addConversationOutputString(String key, String value);
+
+        void addConversationOutputList(String key, List<?> list);
+
+        void addConversationOutputMap(String key, Map<String, Object> map);
+    }
+
+    interface IConversationProperties extends Map<String, Property> {
+        Map<String, Object> toMap();
+    }
+}

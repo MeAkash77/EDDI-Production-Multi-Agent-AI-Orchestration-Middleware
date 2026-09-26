@@ -1,0 +1,12 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.runtime.internal.readiness;
+
+public interface IAgentsReadiness {
+
+    void setAgentsReadiness(boolean isReady);
+
+    boolean isAgentsReady();
+}

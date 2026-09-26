@@ -1,0 +1,187 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory;
+
+import ai.labs.eddi.engine.memory.model.ConversationLog;
+import ai.labs.eddi.engine.memory.model.ConversationLog.ConversationPart;
+import ai.labs.eddi.engine.memory.model.ConversationLog.ConversationPart.Content;
+import ai.labs.eddi.engine.memory.model.ConversationLog.ConversationPart.ContentType;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot;
+
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+
+import static ai.labs.eddi.engine.memory.model.ConversationLog.ConversationPart.ContentType.*;
+import static ai.labs.eddi.utils.RuntimeUtilities.isNullOrEmpty;
+
+public class ConversationLogGenerator {
+    private static final String KEY_ROLE_USER = "user";
+    private static final String KEY_ROLE_ASSISTANT = "assistant";
+    private static final Object OUTPUT_KEY_CONTEXT = "context";
+    private static final String OUTPUT_KEY_INPUT = "input";
+    private static final String KEY_INPUT_FILES = "inputFiles";
+    private static final String KEY_TYPE = "type";
+    private static final String KEY_URL = "url";
+
+    private IConversationMemory conversationMemory;
+    private ConversationMemorySnapshot memorySnapshot;
+
+    public ConversationLogGenerator(IConversationMemory conversationMemory) {
+        this.conversationMemory = conversationMemory;
+    }
+
+    public ConversationLogGenerator(ConversationMemorySnapshot memorySnapshot) {
+        this.memorySnapshot = memorySnapshot;
+    }
+
+    public ConversationLog generate() {
+        return generate(-1, true);
+    }
+
+    public ConversationLog generate(int logSize) {
+        return generate(logSize, true);
+    }
+
+    public ConversationLog generate(int logSize, boolean includeFirstAgentMessage) {
+        return generate(logSize, includeFirstAgentMessage, false);
+    }
+
+    /**
+     * @param stitchAttachmentExtracts
+     *            when {@code true} and backed by a live
+     *            {@link IConversationMemory}, the per-step attachment text extracts
+     *            ({@link MemoryKeys#ATTACHMENT_EXTRACTS}) are appended to that
+     *            turn's user input. Used only for the LLM-facing message build so
+     *            the visible transcript stays clean.
+     */
+    public ConversationLog generate(int logSize, boolean includeFirstAgentMessage, boolean stitchAttachmentExtracts) {
+        if (conversationMemory == null && memorySnapshot == null) {
+            throw new IllegalStateException(
+                    "ConversationMemory was null. " + "You need to either set IConversationMemory or ConversationMemorySnapshot");
+        }
+
+        var conversationLog = new ConversationLog();
+        if (logSize != 0) {
+            var conversationOutputs = conversationMemory != null
+                    ? conversationMemory.getConversationOutputs()
+                    : memorySnapshot.getConversationOutputs();
+
+            var allSteps = (stitchAttachmentExtracts && conversationMemory != null)
+                    ? conversationMemory.getAllSteps()
+                    : null;
+
+            var startIndex = 0;
+            if (logSize > 0) {
+                startIndex = conversationOutputs.size() > logSize ? conversationOutputs.size() - logSize : 0;
+            }
+
+            for (var index = startIndex; index < conversationOutputs.size(); index++) {
+                var conversationOutput = conversationOutputs.get(index);
+                var input = conversationOutput.get(OUTPUT_KEY_INPUT, String.class);
+                var context = conversationOutput.get(OUTPUT_KEY_CONTEXT, Map.class);
+                var contentList = new LinkedList<Content>();
+                if (!isNullOrEmpty(context) && context.get(KEY_INPUT_FILES) instanceof List
+                        && ((List<?>) context.get(KEY_INPUT_FILES)).getFirst() instanceof Map) {
+
+                    @SuppressWarnings("unchecked")
+                    var inputFiles = (List<Map<String, String>>) context.get(KEY_INPUT_FILES);
+                    if (inputFiles != null) {
+                        inputFiles.forEach(file -> {
+                            var contentType = getContentType(file.get(KEY_TYPE));
+                            var fileUrl = file.get(KEY_URL);
+                            contentList.add(new Content(contentType, fileUrl));
+                        });
+                    }
+                }
+
+                if (input != null) {
+                    var inputText = new Content();
+                    inputText.setType(text);
+                    inputText.setValue(withAttachmentExtracts(allSteps, index, input));
+                    var inputs = new ArrayList<>(contentList);
+                    inputs.add(inputText);
+                    conversationLog.getMessages().add(new ConversationPart(KEY_ROLE_USER, inputs));
+                }
+
+                // Every item is inspected, whatever its type. Deciding the list's shape
+                // from element zero dropped the assistant turn entirely whenever the list
+                // began with a String — which is what a HITL-gated turn writes via
+                // addConversationOutputString, so approved turns went missing from the log.
+                var joinedOutput = ConversationOutputExtractor.extractText(conversationOutput, " ");
+                if (joinedOutput != null) {
+                    var content = new Content();
+                    content.setType(text);
+                    content.setValue(joinedOutput);
+                    var outputContentList = new LinkedList<Content>();
+                    outputContentList.add(content);
+                    conversationLog.getMessages().add(new ConversationPart(KEY_ROLE_ASSISTANT, outputContentList));
+                }
+            }
+
+            // Only an AGENT message is dropped, whatever the flag says. The flag's
+            // whole purpose is to remove EDDI's opening greeting, and for every agent
+            // with an `ai.labs.output` step producing one at CONVERSATION_START the
+            // first message genuinely is the agent's -- so this is behaviour-neutral
+            // there. An agent with no output step opens on the USER's turn instead,
+            // and the unconditional removeFirst() deleted that: a one-turn history
+            // went out EMPTY, and Anthropic answered
+            // "invalid_request_error: messages: Field required". Ollama accepts an
+            // empty message list, so a local smoke test passed on a config that could
+            // not work against the real provider.
+            if (!includeFirstAgentMessage
+                    && !conversationLog.getMessages().isEmpty()
+                    && KEY_ROLE_ASSISTANT.equals(conversationLog.getMessages().getFirst().getRole())) {
+                conversationLog.getMessages().removeFirst();
+            }
+        }
+
+        return conversationLog;
+    }
+
+    /**
+     * Append the step's attachment text extracts (if any) to a turn's user input.
+     * Returns {@code input} unchanged when there is no step stack (snapshot mode),
+     * the index is out of range, or the step carries no extracts.
+     *
+     * @param allSteps
+     *            the memory's step stack aligned 1:1 with conversation outputs (may
+     *            be null)
+     * @param stepIndex
+     *            the output/step index for this turn
+     * @param input
+     *            the raw user input text
+     * @return the input, with extracts appended when present
+     */
+    public static String withAttachmentExtracts(IConversationMemory.IConversationStepStack allSteps,
+                                                int stepIndex, String input) {
+        if (allSteps == null || input == null || stepIndex < 0 || stepIndex >= allSteps.size()) {
+            return input;
+        }
+        // conversationOutputs is forward-ordered (0 = oldest) but
+        // IConversationStepStack.get()
+        // is reverse-ordered (get(0) = newest), so convert the forward output index to
+        // the
+        // reverse step index to land on the SAME turn (not its mirror).
+        IConversationMemory.IConversationStep step = allSteps.get(allSteps.size() - 1 - stepIndex);
+        IData<List<String>> data = step.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS);
+        if (data == null || data.getResult() == null || data.getResult().isEmpty()) {
+            return input;
+        }
+        return input + "\n\n" + String.join("\n\n", data.getResult());
+    }
+
+    private static ContentType getContentType(String type) {
+        return switch (type) {
+            case "pdf" -> pdf;
+            case "image" -> image;
+            case "video" -> video;
+            case "audio" -> audio;
+            case "text" -> text;
+            default -> throw new IllegalArgumentException("Unknown content type: " + type);
+        };
+    }
+}

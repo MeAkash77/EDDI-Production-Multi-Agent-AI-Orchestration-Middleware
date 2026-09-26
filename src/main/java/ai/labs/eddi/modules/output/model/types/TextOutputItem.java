@@ -1,0 +1,76 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.modules.output.model.types;
+
+import ai.labs.eddi.modules.output.model.OutputItem;
+
+import java.util.Objects;
+import java.util.function.UnaryOperator;
+
+public class TextOutputItem extends OutputItem {
+    private String text;
+    private int delay;
+
+    public TextOutputItem() {
+        initType();
+    }
+
+    public TextOutputItem(String text) {
+        initType();
+        this.text = text;
+    }
+
+    public TextOutputItem(String text, int delay) {
+        initType();
+        this.text = text;
+        this.delay = delay;
+    }
+
+    @Override
+    protected void initType() {
+        super.type = "text";
+    }
+
+    @Override
+    protected OutputItem templatedCopy(UnaryOperator<String> templating) {
+        return new TextOutputItem(templating.apply(text), delay);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o)
+            return true;
+        if (o == null || getClass() != o.getClass())
+            return false;
+        TextOutputItem that = (TextOutputItem) o;
+        return Objects.equals(text, that.text) && delay == that.delay;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(text, delay);
+    }
+
+    @Override
+    public String toString() {
+        return text;
+    }
+
+    public String getText() {
+        return text;
+    }
+
+    public void setText(String text) {
+        this.text = text;
+    }
+
+    public int getDelay() {
+        return delay;
+    }
+
+    public void setDelay(int delay) {
+        this.delay = delay;
+    }
+}

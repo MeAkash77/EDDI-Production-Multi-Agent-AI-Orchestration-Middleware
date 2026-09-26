@@ -1,0 +1,157 @@
+# Output Configuration
+
+## Overview
+
+**Output Configurations** define what your agent says to users. They are templates that are triggered by **actions** from Behavior Rules, making them the final step in EDDI's Lifecycle Pipeline.
+
+### Role in the Lifecycle
+
+```
+User Input → Parser → Behavior Rules → Actions → Output Configuration → Response
+```
+
+When a Behavior Rule matches, it triggers **actions**. The Output Configuration contains pre-defined responses mapped to those actions, which are then sent to the user.
+
+### Key Features
+
+- **Action-Based**: Each output is mapped to a specific action name
+- **Multiple Alternatives**: Provide multiple response variations for natural conversations
+- **Quick Replies**: Suggest user responses with quick reply buttons
+- **Occurrence Tracking**: Show different outputs based on how many times an action has been triggered
+- **Templating Support**: Combine with output templating for dynamic responses
+
+### How It Works
+
+1. **Behavior Rule triggers action**: `actions: ["welcome"]`
+2. **Output Configuration matches action**: Finds output with `action: "welcome"`
+3. **Selects output variant**: Randomly chooses from `valueAlternatives` (if multiple exist)
+4. **Returns to user**: Sends the selected output as agent response
+
+## Configuration Structure
+
+`Output Configurations` contain prepared sentences that the Agent replies to the user (depending on the `actions` coming from the `Behavior Rules`).
+
+Simple Output Configuration looks like this:
+
+```javascript
+{
+  "outputSet": [
+    {
+      "action": "welcome",
+      "outputs": [
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "Welcome! I am E.D.D.I."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+The configuration contains an `array` of `outputSet`, which can contain one or more output objects.
+
+The minimum amount of values that you need to provide in order be functional are **`action`** and **`outputs`.**
+
+Now let's look at a more complex output configuration file:
+
+```javascript
+{
+  "outputSet": [
+    {
+      "action": "welcome",
+      "timesOccurred": 0,
+      "outputs": [
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "Welcome!"
+            }
+          ]
+        },
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "I am E.D.D.I. How are you doing today?"
+            }
+          ]
+        }
+      ],
+      "quickReplies": [
+        {
+          "value": "I am fine",
+          "expressions": "feeling(fine)"
+        },
+        {
+          "value": "not so good",
+          "expressions": "feeling(not_good)"
+        }
+      ]
+    },
+    {
+      "action": "greet",
+      "timesOccurred": 0,
+      "outputs": [
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "Hi there! Nice to meet up! :-)"
+            },
+            {
+              "type": "text",
+              "text": "Hello you! It is a pleasure meeting you.. :-)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "action": "greet",
+      "timesOccurred": 1,
+      "outputs": [
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "Did we already say hi ?! Well, twice is better than not at all! ;-)"
+            },
+            {
+              "type": "text",
+              "text": "I like it if people are polite and greet twice, rather than not at all ;-)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "action": "say_goodbye",
+      "outputs": [
+        {
+          "valueAlternatives": [
+            {
+              "type": "text",
+              "text": "See you soon!"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Explanation of model
+
+| Key           | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| action        | This will be the "`actions`" coming from the `Behavior Rules`. If a rule succeeds, the defined action will be stored in the **conversation memory.**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| outputs       | This array of output objects are the outputs that will be replied back to the user in case the `action` matched the `action key`. You can define multiple `output objects`, which represent separate chat bubbles on the client side. If more than one `valueAlternatives` is defined, one is chosen uniformly at random on every turn — selections are not remembered across `conversationSteps`, so the same alternative can repeat. Use `timesOccurred` (a separate output entry per occurrence count) when you need a deterministically different reply on a repeat. The `type` selects the shape of the output item and is a closed set: `text`, `image`, `agentFace`, `quickReply`, `inputField`, `applicationLink`, `button`, `other`. An unrecognised value is rejected when the output set is saved — use `other` for anything not covered. |
+| quickReplies  | This is an `array` of `QuickReply objects`. Each `object` must contain a value, which is the text that should be displayed to the user (e.g. as button) in the conversation flow. The `expressions` is `optional`, you can define one or more comma separated expressions that define the meaning of this `QuickReply`. Those `expressions` will be temporarily taken into account in the `semantic parser` in the next `conversationStep`. So if a user chooses one of the quick replies, the parser would recognize them (even if not defined in any of the `dictionaries` explicitly) and resolve them with the `expressions` defined within this quick reply.                                               |
+| timesOccurred | How often this `action` should have occurred within that `conversation` in order to be selected as `output` to the user (thus, if `value` of `1`, it would be chosen if the action occurs for the second time)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |

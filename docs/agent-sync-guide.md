@@ -1,0 +1,352 @@
+# Agent Sync — Live Instance-to-Instance Synchronization
+
+## Overview
+
+Agent Sync lets you synchronize agent configurations between two running EDDI instances **without exporting/importing ZIP files**. It uses the same structural matching and content diffing pipeline as ZIP imports, but reads directly from a remote EDDI instance over HTTP.
+
+### When to Use
+
+| Scenario | Use |
+|----------|-----|
+| One-off agent migration between environments | ZIP Import/Export |
+| Regular dev → staging → production promotions | **Agent Sync** |
+| Keeping multiple EDDI instances in sync | **Agent Sync** |
+| Sharing agents with external teams | ZIP Import/Export |
+| CI/CD pipeline deployments | Either (Sync for live, ZIP for artifact-based) |
+
+## Prerequisites
+
+- Both EDDI instances must be reachable over HTTP/HTTPS
+- The agent only needs to **exist** in the source instance's agent store — it does not have to be deployed
+- If the source requires authentication, you'll need a valid Bearer token
+- The target must be configured to accept the source's address — see
+  [Reaching the source instance](#reaching-the-source-instance). The shipped
+  default accepts only a public HTTPS host, which is **not** what two instances
+  on one internal network look like
+
+## Reaching the source instance
+
+The source URL is supplied by whoever calls the endpoint, and the
+`X-Source-Authorization` bearer travels to whatever host it names. The default
+policy is therefore strict: HTTPS only, and no loopback, RFC 1918, ULA, CGNAT or
+link-local target. That is the right default for an internet-facing, multi-tenant
+deployment, and the wrong one for the most common self-hosted shape — staging and
+production as two services on one private network, often speaking plain HTTP to
+each other. Three settings express the difference:
+
+| Setting | Default | Use it when |
+|---|---|---|
+| `eddi.backup.sync.allowed-sources` | *(empty)* | **Prefer this.** Comma-separated exact origins (`scheme://host[:port]`) that are accepted whatever the other two say — `http://eddi-staging:7070,https://staging.internal:7443` |
+| `eddi.backup.sync.allow-private-targets` | `false` | The instances are on an internal network and naming each origin is impractical |
+| `eddi.backup.sync.require-https` | `true` | TLS is terminated elsewhere, or the two services speak HTTP on a trusted network |
+
+Each rule is separate: turning off `require-https` does not also allow a private
+address, and vice versa. An origin in `allowed-sources` bypasses both, compared
+as scheme + host + port only — a different port is a different origin.
+
+A refused URL answers **400** with a message naming the setting that would allow
+it, so an operator does not have to guess:
+
+```
+Source URL must not point to a private IP address: http://10.0.0.5:7070.
+Set eddi.backup.sync.allow-private-targets=true to sync between instances on an
+internal network, or name this origin in eddi.backup.sync.allowed-sources.
+```
+
+> **Dev mode needs none of this.** An instance started with `quarkus:dev` (or in
+> test mode) accepts `http://` whatever the policy says. A packaged or
+> containerised instance never counts as dev mode — the decision reads the
+> launch mode, not `quarkus.profile` — so a container needs the settings above.
+
+## Workflow
+
+### 1. List Remote Agents
+
+First, discover which agents are available on the remote instance:
+
+```bash
+curl -X GET "http://localhost:7070/backup/import/sync/agents?sourceUrl=https://source-eddi.example.com" \
+  -H "X-Source-Authorization: Bearer <token>"
+```
+
+**Response:** List of agent descriptors from the remote instance.
+
+### 2. Preview Changes (Single Agent)
+
+Before syncing, preview what would change:
+
+```bash
+curl -X POST "http://localhost:7070/backup/import/sync/preview?sourceUrl=https://source-eddi.example.com&sourceAgentId=remote-agent-id&sourceAgentVersion=1&targetAgentId=local-agent-id" \
+  -H "X-Source-Authorization: Bearer <token>"
+```
+
+**Response:** An `ImportPreview` with resource diffs:
+
+```json
+{
+  "resources": [
+    {
+      "resourceType": "agent",
+      "action": "UPDATE",
+      "sourceId": "remote-agent-id",
+      "targetId": "local-agent-id",
+      "targetVersion": 3,
+      "matchStrategy": "targetAgent"
+    },
+    {
+      "resourceType": "langchain",
+      "action": "UPDATE",
+      "sourceId": "remote-llm-id",
+      "targetId": "local-llm-id",
+      "targetVersion": 2,
+      "matchStrategy": "type"
+    },
+    {
+      "resourceType": "behavior",
+      "action": "SKIP",
+      "sourceId": "remote-behavior-id",
+      "targetId": "local-behavior-id",
+      "targetVersion": 1,
+      "matchStrategy": "type"
+    }
+  ]
+}
+```
+
+`targetId` and `targetVersion` are `null` for a `CREATE`, and `matchStrategy` records how the match was found (e.g. `targetAgent`, `position`, `type`, `name` — `null` for `CREATE`).
+
+`resourceType` uses the config file extension labels, not the v6 URI names — the full set is `agent`, `workflow`, `langchain`, `httpcalls`, `behavior`, `regulardictionary`, `property`, `output`, `mcpcalls`, `rag`, `snippet`.
+
+**Actions explained:**
+
+| Action | Meaning |
+|--------|---------|
+| `CREATE` | Resource doesn't exist locally — will be created |
+| `UPDATE` | Resource exists locally — content differs, will be updated |
+| `SKIP` | Resource is identical — no changes needed |
+| `CONFLICT` | Structural mismatch — review needed |
+
+### 3. Preview Batch (Multiple Agents)
+
+Preview sync for multiple agents at once. The request body is a JSON array of `SyncMapping` objects:
+
+```bash
+curl -X POST "http://localhost:7070/backup/import/sync/preview/batch?sourceUrl=https://source-eddi.example.com" \
+  -H "Content-Type: application/json" \
+  -H "X-Source-Authorization: Bearer <token>" \
+  -d '[
+    { "sourceAgentId": "agent-1", "sourceAgentVersion": 1, "targetAgentId": "local-1" },
+    { "sourceAgentId": "agent-2", "sourceAgentVersion": 2, "targetAgentId": "local-2" }
+  ]'
+```
+
+**Response:** A JSON array of `ImportPreview` objects, one per mapping.
+
+### 4. Execute Sync
+
+Once you've reviewed the preview and are satisfied:
+
+```bash
+curl -X POST "http://localhost:7070/backup/import/sync?sourceUrl=https://source-eddi.example.com&sourceAgentId=remote-agent-id&sourceAgentVersion=1&targetAgentId=local-agent-id" \
+  -H "X-Source-Authorization: Bearer <token>"
+```
+
+You can also pass `selectedResources` and `workflowOrder` as query parameters for fine-grained control:
+
+```bash
+curl -X POST "http://localhost:7070/backup/import/sync?sourceUrl=https://source-eddi.example.com&sourceAgentId=remote-agent-id&sourceAgentVersion=1&targetAgentId=local-agent-id&selectedResources=res-1,res-2" \
+  -H "X-Source-Authorization: Bearer <token>"
+```
+
+### Response codes
+
+Every execute endpoint answers with one of three **2xx** statuses. A client must branch on
+the status code — checking `response.ok` alone reports a half-applied sync as a success:
+
+| Status | Meaning |
+|--------|---------|
+| `200 OK` | Source and target already agree. Nothing was written, no version was burned. |
+| `201 Created` | Everything landed and something was written. |
+| `207 Multi-Status` | **Partially applied** — `failures[]` in the body names every resource that could not be written. |
+
+Two failures are reported apart from those, because they are not this instance's
+fault and the operator can act on both:
+
+| Status | Meaning |
+|--------|---------|
+| `400 Bad Request` | The source URL is malformed, or this deployment's policy refuses it. The body names the setting that would allow it — see [Reaching the source instance](#reaching-the-source-instance) |
+| `502 Bad Gateway` | The source instance could not be read: down, addressed wrongly, or refusing the token. The body carries the underlying reason |
+
+The body of a single sync is an `UpgradeResult`:
+
+```json
+{
+  "agentUri": "eddi://ai.labs.agent/agentstore/agents/local-agent-id?version=8",
+  "agentUpdated": true,
+  "updated": 3,
+  "created": 0,
+  "skipped": 5,
+  "failures": [
+    { "sourceId": "…", "resourceType": "langchain", "name": "GPT Config", "reason": "…" }
+  ]
+}
+```
+
+`/backup/import/sync/batch` answers a JSON array of `BatchSyncResult`
+(`sourceAgentId`, `targetAgentId`, `result`, `error`) — one entry per request, in request
+order, whether it succeeded or not. It answers `500` only when *every* agent failed, and
+`207` when some did. A batch **preview** row that failed carries `sourceAgentName: null`
+and an `error` field rather than encoding the failure into the agent's name.
+
+### 5. Execute Batch Sync
+
+Sync multiple agents in one call. The request body is a JSON array of `SyncRequest` objects:
+
+```bash
+curl -X POST "http://localhost:7070/backup/import/sync/batch?sourceUrl=https://source-eddi.example.com" \
+  -H "Content-Type: application/json" \
+  -H "X-Source-Authorization: Bearer <token>" \
+  -d '[
+    {
+      "sourceAgentId": "agent-1",
+      "sourceAgentVersion": 1,
+      "targetAgentId": "local-1",
+      "selectedResources": null,
+      "workflowOrder": null
+    },
+    {
+      "sourceAgentId": "agent-2",
+      "sourceAgentVersion": 2,
+      "targetAgentId": "local-2",
+      "selectedResources": ["res-a", "res-b"],
+      "workflowOrder": null
+    }
+  ]'
+```
+
+> **Partial success:** If one agent fails during batch sync, the remaining agents still sync. The response indicates success/failure per agent.
+
+## API Reference
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/backup/import/sync/agents` | List remote agents |
+| `POST` | `/backup/import/sync/preview` | Single-agent sync preview |
+| `POST` | `/backup/import/sync/preview/batch` | Multi-agent sync preview |
+| `POST` | `/backup/import/sync` | Execute single-agent sync |
+| `POST` | `/backup/import/sync/batch` | Execute multi-agent sync |
+
+### Parameters
+
+**Query parameters (all endpoints):**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `sourceUrl` | Yes | Base URL of the source EDDI instance |
+| `sourceAgentId` | Yes (single) | Agent ID on the remote instance |
+| `sourceAgentVersion` | No | Version to sync (null = latest) |
+| `targetAgentId` | No | Local agent to upgrade. Omitted = **create new**: the target has no copy of this agent yet, so the source's own export archive is fetched and imported with `strategy=create`. The new agent gets a local id and an `originId` recording where it came from, which is what lets the next sync match it |
+| `selectedResources` | No (execute only) | Comma-separated resource IDs to sync |
+| `workflowOrder` | No (execute only) | Desired workflow order after sync |
+
+> **Note:** `sourceUrl` and agent parameters are query parameters. Batch endpoints accept `SyncMapping[]` / `SyncRequest[]` as a JSON request body for the per-agent mappings.
+
+**Request header:**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-Source-Authorization` | No | Bearer token for authenticated source instances |
+
+## How Structural Matching Works
+
+Agent Sync uses **structural matching** — not ID matching — to pair source and target resources. This means it works even when the source and target agents were created independently.
+
+| Resource Type | Matching Strategy | Rationale |
+|---------------|-------------------|-----------|
+| **Agent** | Direct (by `targetAgentId` parameter) | User explicitly selects the target |
+| **Workflows** | Position index in agent's workflow list | Workflows have a defined order |
+| **Extensions** | `WorkflowStep.type` URI (e.g., `ai.labs.llm`) | Each type appears at most once per workflow |
+| **Snippets** | `PromptSnippet.name` (natural key) | Names are unique by convention |
+
+> **Which snippets travel:** only the ones the agent references, found by
+> scanning its own configuration documents for `{snippets.<name>}` — the same
+> rule the ZIP export applies. Syncing one agent never proposes copying the
+> source instance's whole snippet library.
+
+### Key Design Decisions
+
+- **In-place upgrade:** Target resource IDs are preserved. URI references, deployments, and triggers continue to work
+- **Version increments:** Each updated resource gets a new version (history preserved)
+- **Secret scrubbing:** API keys and vault references are **never** transferred. The target instance uses its own secrets — and a value the source scrubbed is put back from the target's own configuration before anything is compared or written, so a credential neither leaks nor gets overwritten with a placeholder, and a config that differs *only* by the placeholder still counts as unchanged
+- **SSRF protection:** The remote URL is validated against this deployment's policy — HTTPS-only and no private address by default, relaxed per [Reaching the source instance](#reaching-the-source-instance) — and redirects are never followed, so a 3xx from the source surfaces as a failed read rather than re-sending the bearer token elsewhere. On a first promotion, the `Location` the source's export answers with is not followed either: only the archive's file name is taken from it, and the download goes to the already-approved base URL
+- **New extensions are refused, not orphaned:** an extension the target workflow has no step for cannot be referenced once written, so it is reported in `failures[]` instead of being created as an unreferenced resource. Add the step to the target workflow (or import the source workflow as a new one) and sync again
+
+## What a promotion does not carry
+
+Two things travel as references rather than as content, and the target has to
+supply them itself. Neither is reported by the sync — check both after a first
+promotion.
+
+**Secrets.** An API key is stored as a vault reference (`${vault:<name>}`), and
+the reference is what travels: the value never leaves the source instance, by
+design. A promoted agent therefore carries a reference to a vault entry the
+target may not have, and the first LLM call fails when it does not. Create the
+entry on the target under the same name — `POST /secretstore/secrets/{tenantId}/{keyName}`
+— or edit the promoted config to name one it already has. An agent that is
+*updated* rather than created keeps its own value: the export scrubber replaces
+the credential with a placeholder and the target's own value is put back before
+anything is compared or written, so a sync never overwrites a working key with a
+placeholder.
+
+**Parser configurations.** `ai.labs.parser` is not in the backup registry
+(`AbstractBackupService`'s `*_EXT` constants), so neither an export nor a sync
+carries one, and a promoted agent's parser step keeps the reference it had on the
+source. The agent still deploys — the missing config is tolerated — but a parser
+customised on the source runs with defaults on the target. This is a gap in the
+backup subsystem rather than in sync: `strategy=create` and `strategy=merge` have
+always behaved the same way.
+
+## Upgrade Strategy (ZIP Import)
+
+The same structural matching is available for ZIP imports using `strategy=upgrade`:
+
+```bash
+# Preview what would change
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip \
+  "http://localhost:7070/backup/import/preview?targetAgentId=local-agent-id"
+
+# Execute upgrade (updates existing resources in-place)
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip \
+  "http://localhost:7070/backup/import?strategy=upgrade&targetAgentId=local-agent-id"
+```
+
+This is the same pipeline as Live Sync — the only difference is the transport (ZIP file vs HTTP).
+
+## Selective Export
+
+Export only the resources you want:
+
+```bash
+# 1. Preview the export tree
+curl -X POST "http://localhost:7070/backup/export/agent-id/preview?agentVersion=1"
+
+# 2. Select specific resources and export
+curl -X POST "http://localhost:7070/backup/export/agent-id?agentVersion=1&selectedResources=res1,res2,res3"
+```
+
+The preview returns a resource tree with selectability flags. Agent and workflow skeletons are always included — you can deselect individual extensions, behavior rules, prompt snippets or scheduled triggers.
+
+Snippets and schedules have their own parameters (`selectedSnippets`, `selectedSchedules`).
+Deselecting an extension **keeps the workflow step that referenced it** — the archive states
+what the source deployment actually runs, and the importer decides what to do with a reference
+it cannot satisfy: `merge` answers it from the target's own copy, `create` drops the step and
+logs a warning. See [Import/Export an Agent → Selecting What to Export](import-export-an-agent.md#selecting-what-to-export)
+for the three-state semantics of each parameter and for the archive retention window.
+
+## See Also
+
+- [Import/Export an Agent](import-export-an-agent.md) — ZIP-based import/export (create and merge strategies)
+- [Agent Sync Architecture](agent-sync-architecture.md) — Internal architecture and matching algorithm details
+- [Deployment Management](deployment-management-of-agents.md) — Deploying agents after sync

@@ -1,0 +1,505 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory;
+
+import ai.labs.eddi.configs.agents.model.AgentConfiguration;
+import ai.labs.eddi.configs.hitl.HitlTimeoutPolicy;
+import ai.labs.eddi.configs.hitl.model.ToolApprovalsConfig;
+import ai.labs.eddi.engine.audit.IAuditEntryCollector;
+import ai.labs.eddi.engine.lifecycle.ConversationEventSink;
+import ai.labs.eddi.engine.lifecycle.model.HitlDecision;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot;
+import ai.labs.eddi.engine.memory.model.ConversationOutput;
+import ai.labs.eddi.engine.memory.model.ConversationProperties;
+import ai.labs.eddi.engine.memory.model.ConversationState;
+import ai.labs.eddi.engine.memory.model.PendingToolCallBatch;
+import ai.labs.eddi.engine.security.ResolutionPrincipal;
+
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Set;
+import java.util.Stack;
+
+/**
+ * @author ginccc
+ */
+public class ConversationMemory implements IConversationMemory {
+    private String conversationId;
+    private final String agentId;
+    private final Integer agentVersion;
+    private String userId;
+    private IWritableConversationStep currentStep;
+    private final Stack<IConversationStep> previousSteps;
+    private final Stack<IConversationStep> redoCache = new Stack<>();
+    private final Stack<ConversationOutput> conversationOutputs = new Stack<>();
+    private final IConversationProperties conversationProperties = new ConversationProperties(this);
+    private ConversationState conversationState;
+    private ResolutionPrincipal.Provenance resolutionProvenance;
+    private volatile boolean cancelled;
+    /**
+     * Optimistic-concurrency revision of the document this memory was loaded from.
+     * See {@link IConversationMemory#getRevision()}.
+     */
+    private long revision = ConversationMemorySnapshot.UNVERSIONED_REVISION;
+    /**
+     * Step count of the document this memory was loaded from. See
+     * {@link IConversationMemory#getPersistedStepCount()}.
+     */
+    private int persistedStepCount = ConversationMemorySnapshot.UNKNOWN_PERSISTED_STEP_COUNT;
+
+    /** Transient — never serialized to MongoDB. Set per-turn for SSE streaming. */
+    private transient ConversationEventSink eventSink;
+
+    /** Transient — never serialized to MongoDB. Set per-turn for audit capture. */
+    private transient IAuditEntryCollector auditCollector;
+
+    /**
+     * Transient — never serialized to MongoDB. Set once during Conversation.init().
+     */
+    private transient AgentConfiguration.UserMemoryConfig userMemoryConfig;
+
+    public ConversationMemory(String conversationId, String agentId, Integer agentVersion, String userId) {
+        this(agentId, agentVersion, userId);
+        this.conversationId = conversationId;
+    }
+
+    public ConversationMemory(String agentId, Integer agentVersion, String userId) {
+        this(agentId, agentVersion);
+        this.userId = userId;
+    }
+
+    public ConversationMemory(String agentId, Integer agentVersion) {
+        this.agentId = agentId;
+        this.agentVersion = agentVersion;
+        var conversationOutput = new ConversationOutput();
+        this.conversationOutputs.add(conversationOutput);
+        this.currentStep = new ConversationStep(conversationOutput);
+        this.previousSteps = new Stack<>();
+    }
+
+    @Override
+    public IWritableConversationStep getCurrentStep() {
+        return currentStep;
+    }
+
+    @Override
+    public IConversationStepStack getPreviousSteps() {
+        return new ConversationStepStack(previousSteps);
+    }
+
+    @Override
+    public IConversationStepStack getAllSteps() {
+        ConversationStepStack result = new ConversationStepStack(previousSteps);
+        ((ConversationStep) currentStep).conversationStepNumber = previousSteps.size();
+        result.add(currentStep);
+        return result;
+    }
+
+    public IConversationStep startNextStep() {
+        return startNextStep(null);
+    }
+
+    IConversationStep startNextStep(ConversationOutput conversationOutput) {
+        ((ConversationStep) currentStep).conversationStepNumber = previousSteps.size();
+        previousSteps.push(currentStep);
+        if (conversationOutput == null) {
+            conversationOutput = new ConversationOutput();
+        }
+        conversationOutputs.push(conversationOutput);
+        currentStep = new ConversationStep(conversationOutput);
+        return currentStep;
+    }
+
+    @Override
+    public int size() {
+        return previousSteps.size() + 1;
+    }
+
+    @Override
+    public void undoLastStep() {
+        if (!isUndoAvailable()) {
+            throw new IllegalStateException();
+        }
+
+        redoCache.push(currentStep);
+        currentStep = (IWritableConversationStep) previousSteps.pop();
+        conversationOutputs.pop();
+        forgetPersistedStepCount();
+    }
+
+    @Override
+    public boolean isUndoAvailable() {
+        return previousSteps.size() > 0;
+    }
+
+    @Override
+    public boolean isRedoAvailable() {
+        return redoCache.size() > 0;
+    }
+
+    @Override
+    public void redoLastStep() {
+        if (!isRedoAvailable()) {
+            throw new IllegalStateException();
+        }
+
+        previousSteps.push(currentStep);
+        currentStep = (IWritableConversationStep) redoCache.pop();
+        conversationOutputs.push(currentStep.getConversationOutput());
+        forgetPersistedStepCount();
+    }
+
+    /**
+     * Undo and redo REWRITE the step history rather than extending it — undo
+     * removes the last step and moves it to the redo cache, redo moves one back —
+     * so the persisted step list is no longer a prefix of this memory's. Dropping
+     * the baseline forces the next write down the full-document replace, which is
+     * the only shape that can persist a removal or a reordering. (A redo grows the
+     * count by one and would otherwise look exactly like a fresh turn.)
+     */
+    private void forgetPersistedStepCount() {
+        this.persistedStepCount = ConversationMemorySnapshot.UNKNOWN_PERSISTED_STEP_COUNT;
+    }
+
+    @Override
+    public ConversationState getConversationState() {
+        return conversationState;
+    }
+
+    public void setConversationState(ConversationState conversationState) {
+        this.conversationState = conversationState;
+    }
+
+    @Override
+    public String getConversationId() {
+        return conversationId;
+    }
+
+    @Override
+    public String getAgentId() {
+        return agentId;
+    }
+
+    @Override
+    public String getUserId() {
+        return this.userId;
+    }
+
+    @Override
+    public ResolutionPrincipal.Provenance getResolutionProvenance() {
+        return this.resolutionProvenance;
+    }
+
+    @Override
+    public void setResolutionProvenance(ResolutionPrincipal.Provenance provenance) {
+        this.resolutionProvenance = provenance;
+    }
+
+    @Override
+    public Integer getAgentVersion() {
+        return agentVersion;
+    }
+
+    @Override
+    public long getRevision() {
+        return revision;
+    }
+
+    @Override
+    public void setRevision(long revision) {
+        this.revision = revision;
+    }
+
+    @Override
+    public int getPersistedStepCount() {
+        return persistedStepCount;
+    }
+
+    @Override
+    public void setPersistedStepCount(int persistedStepCount) {
+        this.persistedStepCount = persistedStepCount;
+    }
+
+    public List<ConversationOutput> getConversationOutputs() {
+        return conversationOutputs;
+    }
+
+    @Override
+    public IConversationProperties getConversationProperties() {
+        return conversationProperties;
+    }
+
+    @Override
+    public Stack<IConversationStep> getRedoCache() {
+        return redoCache;
+    }
+
+    @Override
+    public ConversationEventSink getEventSink() {
+        return eventSink;
+    }
+
+    @Override
+    public void setEventSink(ConversationEventSink eventSink) {
+        this.eventSink = eventSink;
+    }
+
+    @Override
+    public IAuditEntryCollector getAuditCollector() {
+        return auditCollector;
+    }
+
+    @Override
+    public void setAuditCollector(IAuditEntryCollector auditCollector) {
+        this.auditCollector = auditCollector;
+    }
+
+    @Override
+    public AgentConfiguration.UserMemoryConfig getUserMemoryConfig() {
+        return userMemoryConfig;
+    }
+
+    @Override
+    public void setUserMemoryConfig(AgentConfiguration.UserMemoryConfig config) {
+        this.userMemoryConfig = config;
+    }
+
+    /**
+     * Transient — never serialized to MongoDB. Set once during Conversation.init().
+     */
+    private transient AgentConfiguration.MemoryPolicy memoryPolicy;
+
+    @Override
+    public AgentConfiguration.MemoryPolicy getMemoryPolicy() {
+        return memoryPolicy;
+    }
+
+    @Override
+    public void setMemoryPolicy(AgentConfiguration.MemoryPolicy memoryPolicy) {
+        this.memoryPolicy = memoryPolicy;
+    }
+
+    @Override
+    public void setCancelled(boolean cancelled) {
+        this.cancelled = cancelled;
+    }
+
+    @Override
+    public boolean isCancelled() {
+        return cancelled;
+    }
+
+    /**
+     * Deferred user-memory writes. {@code transient} only exempts the field from
+     * Java serialization of this live object — it IS persisted, via
+     * {@code ConversationMemoryUtilities} onto {@code ConversationMemorySnapshot}
+     * (same mechanism as the HITL bookmark below).
+     */
+    private transient Set<String> pendingLongTermWrites = new LinkedHashSet<>();
+
+    @Override
+    public Set<String> getPendingLongTermWrites() {
+        return pendingLongTermWrites;
+    }
+
+    @Override
+    public void setPendingLongTermWrites(Set<String> keys) {
+        this.pendingLongTermWrites = keys == null ? new LinkedHashSet<>() : new LinkedHashSet<>(keys);
+    }
+
+    // === HITL pause bookmark ===
+    // The `transient` keyword only exempts these fields from Java serialization of
+    // this LIVE object — they ARE persisted: ConversationMemoryUtilities copies
+    // them onto ConversationMemorySnapshot, which is what gets stored in the DB
+    // and restored on load. Clearing them here without persisting the snapshot
+    // does NOT clear the stored bookmark (that's what clearHitlBookmark on the
+    // store is for).
+
+    private transient String hitlPausedWorkflowId;
+    private transient int hitlPausedAbsoluteTaskIndex = -1;
+    private transient Instant hitlPausedAt;
+    private transient String hitlPauseReason;
+    private transient HitlTimeoutPolicy hitlTimeoutPolicy;
+    private transient String hitlApprovalTimeout;
+    // Tool-level HITL: discriminator (null/"RULE"/"TOOL_CALL") + the interrupted
+    // tool-call batch. Persisted via ConversationMemorySnapshot like the bookmark.
+    private transient String hitlPauseType;
+    private transient PendingToolCallBatch hitlPendingToolCalls;
+    // The agent-level tool-approval config, carried onto memory at conversation
+    // start; NOT persisted (re-resolved from the pinned agent config each turn).
+    private transient ToolApprovalsConfig agentToolApprovalsConfig;
+    // The human decision being applied during an in-JVM resume; NOT persisted.
+    private transient HitlDecision hitlResumeDecision;
+
+    @Override
+    public String getHitlPausedWorkflowId() {
+        return hitlPausedWorkflowId;
+    }
+
+    @Override
+    public void setHitlPausedWorkflowId(String workflowId) {
+        this.hitlPausedWorkflowId = workflowId;
+    }
+
+    @Override
+    public int getHitlPausedAbsoluteTaskIndex() {
+        return hitlPausedAbsoluteTaskIndex;
+    }
+
+    @Override
+    public void setHitlPausedAbsoluteTaskIndex(int index) {
+        this.hitlPausedAbsoluteTaskIndex = index;
+    }
+
+    @Override
+    public Instant getHitlPausedAt() {
+        return hitlPausedAt;
+    }
+
+    @Override
+    public void setHitlPausedAt(Instant pausedAt) {
+        this.hitlPausedAt = pausedAt;
+    }
+
+    @Override
+    public String getHitlPauseReason() {
+        return hitlPauseReason;
+    }
+
+    @Override
+    public void setHitlPauseReason(String reason) {
+        this.hitlPauseReason = reason;
+    }
+
+    @Override
+    public HitlTimeoutPolicy getHitlTimeoutPolicy() {
+        return hitlTimeoutPolicy;
+    }
+
+    @Override
+    public void setHitlTimeoutPolicy(HitlTimeoutPolicy policy) {
+        this.hitlTimeoutPolicy = policy;
+    }
+
+    @Override
+    public String getHitlApprovalTimeout() {
+        return hitlApprovalTimeout;
+    }
+
+    @Override
+    public void setHitlApprovalTimeout(String timeout) {
+        this.hitlApprovalTimeout = timeout;
+    }
+
+    @Override
+    public String getHitlPauseType() {
+        return hitlPauseType;
+    }
+
+    @Override
+    public void setHitlPauseType(String pauseType) {
+        this.hitlPauseType = pauseType;
+    }
+
+    @Override
+    public PendingToolCallBatch getHitlPendingToolCalls() {
+        return hitlPendingToolCalls;
+    }
+
+    @Override
+    public void setHitlPendingToolCalls(PendingToolCallBatch batch) {
+        this.hitlPendingToolCalls = batch;
+    }
+
+    @Override
+    public ToolApprovalsConfig getAgentToolApprovalsConfig() {
+        return agentToolApprovalsConfig;
+    }
+
+    @Override
+    public void setAgentToolApprovalsConfig(ToolApprovalsConfig config) {
+        this.agentToolApprovalsConfig = config;
+    }
+
+    @Override
+    public HitlDecision getHitlResumeDecision() {
+        return hitlResumeDecision;
+    }
+
+    @Override
+    public void setHitlResumeDecision(HitlDecision decision) {
+        this.hitlResumeDecision = decision;
+    }
+
+    public static final class ConversationStepStack implements IConversationStepStack {
+        private final List<IConversationStep> conversationSteps = new ArrayList<>();
+
+        public ConversationStepStack(List<IConversationStep> steps) {
+            conversationSteps.addAll(steps);
+        }
+
+        @Override
+        public <T> IData<T> getLatestData(String key) {
+            for (int i = conversationSteps.size() - 1; i >= 0; --i) {
+                IConversationStep step = conversationSteps.get(i);
+                if (step.getData(key) != null) {
+                    return step.getData(key);
+                }
+            }
+            return null;
+        }
+
+        @Override
+        public <T> IData<T> getLatestData(MemoryKey<T> key) {
+            return getLatestData(key.key());
+        }
+
+        @Override
+        public <T> List<List<IData<T>>> getAllData(String prefix) {
+            List<List<IData<T>>> allData = new LinkedList<>();
+
+            for (int i = conversationSteps.size() - 1; i >= 0; i--) {
+                IConversationStep step = conversationSteps.get(i);
+                List<IData<T>> dataList = step.getAllData(prefix);
+                if (!dataList.isEmpty()) {
+                    allData.add(dataList);
+                }
+            }
+
+            return allData;
+        }
+
+        @Override
+        public <T> List<IData<T>> getAllLatestData(String prefix) {
+            return conversationSteps.stream().map((IConversationStep conversationStep) -> conversationStep.<T>getLatestData(prefix)).toList();
+        }
+
+        @Override
+        public int size() {
+            return conversationSteps.size();
+        }
+
+        @Override
+        public IConversationStep get(int index) {
+            return conversationSteps.get(conversationSteps.size() - index - 1);
+        }
+
+        @Override
+        public IConversationStep peek() {
+            return conversationSteps.get(conversationSteps.size() - 1);
+        }
+
+        public void addAll(List<IConversationStep> conversationSteps) {
+            this.conversationSteps.addAll(conversationSteps);
+        }
+
+        public void add(IConversationStep step) {
+            this.conversationSteps.add(step);
+        }
+    }
+}

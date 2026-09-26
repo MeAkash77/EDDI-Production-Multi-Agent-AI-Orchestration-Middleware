@@ -1,0 +1,458 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.utils;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@DisplayName("WordSplitter Tests")
+class WordSplitterTest {
+
+    @Nested
+    @DisplayName("splitWords / splitPunctuationFromWords")
+    class SplitWordsTests {
+
+        @Test
+        @DisplayName("punctuation at end — adds spaces")
+        void punctuationAtEnd() {
+            StringBuilder sb = new StringBuilder("hello!");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" !"));
+        }
+
+        @Test
+        @DisplayName("comma in sentence — adds spaces")
+        void commaInSentence() {
+            StringBuilder sb = new StringBuilder("hello,world");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" ,"));
+        }
+
+        @Test
+        @DisplayName("dot between digits — no split")
+        void dotBetweenDigits() {
+            StringBuilder sb = new StringBuilder("value is 3.14 ok");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains("3.14"));
+        }
+
+        @Test
+        @DisplayName("no punctuation — unchanged")
+        void noPunctuation() {
+            StringBuilder sb = new StringBuilder("hello world");
+            new WordSplitter(sb).splitWords();
+            assertEquals("hello world", sb.toString());
+        }
+
+        @Test
+        @DisplayName("question mark — adds spaces")
+        void questionMark() {
+            StringBuilder sb = new StringBuilder("why?");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" ?"));
+        }
+
+        @Test
+        @DisplayName("colon — adds spaces")
+        void colon() {
+            StringBuilder sb = new StringBuilder("time:now");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" :"));
+        }
+
+        @Test
+        @DisplayName("semicolon — adds spaces")
+        void semicolon() {
+            StringBuilder sb = new StringBuilder("a;b");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" ;"));
+        }
+
+        @Test
+        @DisplayName("punctuation already has space before — no extra space")
+        void spaceBeforePunctuation() {
+            StringBuilder sb = new StringBuilder("hello !");
+            new WordSplitter(sb).splitWords();
+            // Should still add space after if needed
+            assertNotNull(sb.toString());
+        }
+
+        @Test
+        @DisplayName("multiple punctuation marks")
+        void multiplePunctuation() {
+            StringBuilder sb = new StringBuilder("wow!amazing,right?");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" !"));
+            assertTrue(sb.toString().contains(" ,"));
+            assertTrue(sb.toString().contains(" ?"));
+        }
+
+        @Test
+        @DisplayName("dot at start — treated as punctuation")
+        void dotAtStart() {
+            // This asserted StringIndexOutOfBoundsException and called it a "known edge
+            // case", which pinned the defect in place: the digit-guard's bounds test
+            // indexed the punctuation string ("!?:.,;") instead of the text, so a '.' at
+            // either end of the input read charAt(-1) or charAt(length). Punctuation at
+            // the start is ordinary input and must simply be split.
+            StringBuilder sb = new StringBuilder(".hello");
+
+            assertDoesNotThrow(() -> new WordSplitter(sb).splitWords());
+
+            assertTrue(sb.toString().contains(". "), sb.toString());
+        }
+
+        /**
+         * The decimal guard needs digits on BOTH sides, and "both sides" has to be
+         * decided on the TEXT index. The guard's bounds test indexed the punctuation
+         * string ("!?:.,;", where n is always 3 for '.'), so it never constrained i: a
+         * dot in the last position with a digit in front of it read charAt(i + 1) past
+         * the end of the text and threw instead of splitting.
+         * <p>
+         * Both halves of the contract are asserted on the resulting TEXT rather than on
+         * the mere absence of an exception: "42." has to come apart in either position,
+         * because a sentence that happens to end in a digit is not a decimal.
+         */
+        @Test
+        @DisplayName("digit before the dot, letter or end-of-text after — still split")
+        void digitBeforeDotWithoutADigitAfterIsStillSplit() {
+            StringBuilder atEnd = new StringBuilder("costs 42.");
+            assertDoesNotThrow(() -> new WordSplitter(atEnd).splitWords());
+            assertFalse(atEnd.toString().contains("42."),
+                    "a trailing dot is punctuation, not a decimal point: " + atEnd);
+            assertTrue(atEnd.toString().startsWith("costs 42 "), atEnd.toString());
+            assertTrue(atEnd.toString().endsWith("."), atEnd.toString());
+
+            StringBuilder midString = new StringBuilder("costs 42.Then");
+            new WordSplitter(midString).splitWords();
+            assertFalse(midString.toString().contains("42."),
+                    "a letter after the dot is a sentence boundary, not a decimal point: " + midString);
+            assertTrue(midString.toString().contains(" . "), midString.toString());
+        }
+
+        @Test
+        @DisplayName("dot between letters — split")
+        void dotBetweenLetters() {
+            StringBuilder sb = new StringBuilder("end.start");
+            new WordSplitter(sb).splitWords();
+            assertTrue(sb.toString().contains(" . ") || sb.toString().contains(" ."));
+        }
+
+        @Test
+        @DisplayName("empty string — no crash")
+        void emptyString() {
+            StringBuilder sb = new StringBuilder("");
+            assertDoesNotThrow(() -> new WordSplitter(sb).splitWords());
+            assertEquals("", sb.toString());
+        }
+
+        @Test
+        @DisplayName("single character punctuation")
+        void singlePunctuation() {
+            StringBuilder sb = new StringBuilder("!");
+            new WordSplitter(sb).splitWords();
+            assertNotNull(sb.toString());
+        }
+    }
+
+    @Nested
+    @DisplayName("capitalizedWords")
+    class CapitalizedWordsTests {
+
+        @Test
+        @DisplayName("inserts spaces before uppercase letters")
+        void insertsSpaces() {
+            StringBuilder sb = new StringBuilder("helloWorld");
+            new WordSplitter(sb).capitalizedWords();
+            assertTrue(sb.toString().contains(" W"));
+        }
+
+        @Test
+        @DisplayName("all lowercase — unchanged")
+        void allLowercase() {
+            StringBuilder sb = new StringBuilder("hello");
+            new WordSplitter(sb).capitalizedWords();
+            assertEquals("hello", sb.toString());
+        }
+
+        @Test
+        @DisplayName("all uppercase — spaces before each char")
+        void allUppercase() {
+            StringBuilder sb = new StringBuilder("ABC");
+            new WordSplitter(sb).capitalizedWords();
+            assertTrue(sb.toString().contains(" A"));
+            assertTrue(sb.toString().contains(" B"));
+            assertTrue(sb.toString().contains(" C"));
+        }
+
+        @Test
+        @DisplayName("camelCase with multiple words")
+        void camelCaseMultipleWords() {
+            StringBuilder sb = new StringBuilder("myVariableName");
+            new WordSplitter(sb).capitalizedWords();
+            assertTrue(sb.toString().contains(" V"));
+            assertTrue(sb.toString().contains(" N"));
+        }
+
+        @Test
+        @DisplayName("empty string — no crash")
+        void emptyString() {
+            StringBuilder sb = new StringBuilder("");
+            assertDoesNotThrow(() -> new WordSplitter(sb).capitalizedWords());
+        }
+    }
+
+    @Nested
+    @DisplayName("notAlphabetic")
+    class NotAlphabeticTests {
+
+        @Test
+        @DisplayName("separates special chars")
+        void separatesSpecialChars() {
+            StringBuilder sb = new StringBuilder("hello@world");
+            new WordSplitter(sb).notAlphabetic();
+            assertTrue(sb.toString().contains(" @ "));
+        }
+
+        @Test
+        @DisplayName("all alphabetic — unchanged")
+        void allAlphabetic() {
+            StringBuilder sb = new StringBuilder("hello");
+            new WordSplitter(sb).notAlphabetic();
+            assertEquals("hello", sb.toString());
+        }
+
+        @Test
+        @DisplayName("digits are considered alphabetic")
+        void digitsAlphabetic() {
+            StringBuilder sb = new StringBuilder("hello123");
+            new WordSplitter(sb).notAlphabetic();
+            assertEquals("hello123", sb.toString());
+        }
+
+        @Test
+        @DisplayName("spaces are preserved")
+        void spacesPreserved() {
+            StringBuilder sb = new StringBuilder("hello world");
+            new WordSplitter(sb).notAlphabetic();
+            assertEquals("hello world", sb.toString());
+        }
+
+        @Test
+        @DisplayName("multiple special characters")
+        void multipleSpecial() {
+            StringBuilder sb = new StringBuilder("a#b$c");
+            new WordSplitter(sb).notAlphabetic();
+            assertTrue(sb.toString().contains(" # "));
+            assertTrue(sb.toString().contains(" $ "));
+        }
+
+        @Test
+        @DisplayName("uppercase characters handled")
+        void uppercaseHandled() {
+            StringBuilder sb = new StringBuilder("HELLO");
+            new WordSplitter(sb).notAlphabetic();
+            assertEquals("HELLO", sb.toString());
+        }
+
+        @Test
+        @DisplayName("colon and dot are considered alphabetic")
+        void colonAndDot() {
+            StringBuilder sb = new StringBuilder("12:30.5");
+            new WordSplitter(sb).notAlphabetic();
+            assertEquals("12:30.5", sb.toString());
+        }
+
+        @Test
+        @DisplayName("empty string — no crash")
+        void emptyString() {
+            StringBuilder sb = new StringBuilder("");
+            assertDoesNotThrow(() -> new WordSplitter(sb).notAlphabetic());
+        }
+    }
+
+    @Nested
+    @DisplayName("notNumeric")
+    class NotNumericTests {
+
+        @Test
+        @DisplayName("ordinal number — adds space after")
+        void ordinalNumber() {
+            StringBuilder sb = new StringBuilder("1st place");
+            new WordSplitter(sb).notNumeric();
+            // Should handle ordinal "1st"
+            assertNotNull(sb.toString());
+        }
+
+        @Test
+        @DisplayName("digit after letter — inserts space")
+        void digitAfterLetter() {
+            StringBuilder sb = new StringBuilder("hello3");
+            new WordSplitter(sb).notNumeric();
+            assertTrue(sb.toString().contains(" 3") || sb.toString().contains("o 3"));
+        }
+
+        @Test
+        @DisplayName("all numbers — no split")
+        void allNumbers() {
+            StringBuilder sb = new StringBuilder("12345");
+            new WordSplitter(sb).notNumeric();
+            assertEquals("12345", sb.toString());
+        }
+
+        /**
+         * This branch inserts a separator in FRONT of a digit, so it only has something
+         * to do when a preceding character exists and is not already a separator. At
+         * index 0 there is no preceding character at all — the guard that says so is
+         * the {@code i > 0} term, and without it charAt(i - 1) reads position -1.
+         * <p>
+         * The assertion is on the resulting text rather than on the absence of an
+         * exception, so a guard that merely stopped throwing but still inserted a
+         * leading space (or doubled an existing one) is caught too: both inputs must
+         * come back byte-for-byte unchanged.
+         */
+        @Test
+        @DisplayName("nothing to separate a digit from — text left exactly as it is")
+        void digitWithNoSeparableCharacterBeforeItIsUntouched() {
+            StringBuilder atIndexZero = new StringBuilder("5 apples");
+            new WordSplitter(atIndexZero).notNumeric();
+            assertEquals("5 apples", atIndexZero.toString(),
+                    "a digit at index 0 has no preceding character to separate it from");
+
+            StringBuilder alreadySpaced = new StringBuilder("abc 5");
+            new WordSplitter(alreadySpaced).notNumeric();
+            assertEquals("abc 5", alreadySpaced.toString(),
+                    "a digit already preceded by the separator needs no second one");
+        }
+
+        @Test
+        @DisplayName("all letters — unchanged")
+        void allLetters() {
+            StringBuilder sb = new StringBuilder("hello");
+            new WordSplitter(sb).notNumeric();
+            assertEquals("hello", sb.toString());
+        }
+
+        @Test
+        @DisplayName("empty string — no crash")
+        void emptyString() {
+            StringBuilder sb = new StringBuilder("");
+            assertDoesNotThrow(() -> new WordSplitter(sb).notNumeric());
+        }
+    }
+
+    @Nested
+    @DisplayName("isPunctuation")
+    class IsPunctuationTests {
+
+        @Test
+        @DisplayName("dot after letter — inserts space")
+        void dotAfterLetter() {
+            StringBuilder sb = new StringBuilder("hello. world");
+            new WordSplitter(sb).isPunctuation();
+            assertTrue(sb.toString().contains(" ."));
+        }
+
+        @Test
+        @DisplayName("dot after digit — no space")
+        void dotAfterDigit() {
+            StringBuilder sb = new StringBuilder("3.14");
+            new WordSplitter(sb).isPunctuation();
+            assertTrue(sb.toString().contains("3.14"));
+        }
+
+        @Test
+        @DisplayName("dot at beginning — no change (i=0)")
+        void dotAtBeginning() {
+            StringBuilder sb = new StringBuilder(".hello");
+            new WordSplitter(sb).isPunctuation();
+            // i=0, so the i>0 check prevents any insertion
+            assertEquals(".hello", sb.toString());
+        }
+
+        @Test
+        @DisplayName("dot after 'm' — no space (time: a.m.)")
+        void dotAfterM() {
+            StringBuilder sb = new StringBuilder("am.");
+            new WordSplitter(sb).isPunctuation();
+            assertTrue(sb.toString().contains("am."));
+        }
+
+        @Test
+        @DisplayName("dot after 'a' — no space (a.m.)")
+        void dotAfterA() {
+            StringBuilder sb = new StringBuilder("a.m");
+            new WordSplitter(sb).isPunctuation();
+            assertTrue(sb.toString().contains("a.m"));
+        }
+
+        @Test
+        @DisplayName("dot after 'p' — no space (p.m.)")
+        void dotAfterP() {
+            StringBuilder sb = new StringBuilder("p.m");
+            new WordSplitter(sb).isPunctuation();
+            assertTrue(sb.toString().contains("p.m"));
+        }
+
+        @Test
+        @DisplayName("no dots — unchanged")
+        void noDots() {
+            StringBuilder sb = new StringBuilder("hello world");
+            new WordSplitter(sb).isPunctuation();
+            assertEquals("hello world", sb.toString());
+        }
+
+        @Test
+        @DisplayName("empty string — no crash")
+        void emptyString() {
+            StringBuilder sb = new StringBuilder("");
+            assertDoesNotThrow(() -> new WordSplitter(sb).isPunctuation());
+        }
+    }
+
+    @Nested
+    @DisplayName("index bounds")
+    class IndexBoundsTests {
+
+        /**
+         * The digit-guard's bounds test indexed the PUNCTUATION string ("!?:.,;", where
+         * n is always 3 for '.') instead of the text, so it never guarded i. A sentence
+         * ending in a digit and a full stop read charAt(i + 1) past the end and threw —
+         * "The answer is 42." was enough.
+         */
+        @Test
+        @DisplayName("trailing dot after a digit — no StringIndexOutOfBounds")
+        void trailingDotAfterDigit() {
+            StringBuilder sb = new StringBuilder("The answer is 42.");
+            assertDoesNotThrow(() -> new WordSplitter(sb).splitWords());
+            assertTrue(sb.toString().contains(" ."), sb.toString());
+        }
+
+        /** The other end of the same guard: a leading dot read charAt(-1). */
+        @Test
+        @DisplayName("leading dot before a digit — no StringIndexOutOfBounds")
+        void leadingDotBeforeDigit() {
+            StringBuilder sb = new StringBuilder(".5");
+            assertDoesNotThrow(() -> new WordSplitter(sb).splitWords());
+        }
+
+        /**
+         * notNumeric() read charAt(i - 1) and was only safe at i == 0 because
+         * isStringInteger("") answered true for the empty substring and skipped that
+         * iteration — a bounds check standing on an unrelated method's wrong answer.
+         * That method is now correct, so the guard has to be explicit.
+         */
+        @Test
+        @DisplayName("notNumeric at index 0 — no StringIndexOutOfBounds")
+        void notNumericFirstCharacter() {
+            assertDoesNotThrow(() -> new WordSplitter(new StringBuilder("5 apples")).notNumeric());
+            assertDoesNotThrow(() -> new WordSplitter(new StringBuilder("abc5")).notNumeric());
+            assertDoesNotThrow(() -> new WordSplitter(new StringBuilder("")).notNumeric());
+        }
+    }
+}

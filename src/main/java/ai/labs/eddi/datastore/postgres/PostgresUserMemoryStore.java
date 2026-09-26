@@ -1,0 +1,654 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.datastore.postgres;
+
+import ai.labs.eddi.configs.properties.IUserMemoryStore;
+import ai.labs.eddi.configs.properties.MemorySearchTerms;
+import ai.labs.eddi.configs.properties.model.Properties;
+import ai.labs.eddi.configs.properties.model.Property.Visibility;
+import ai.labs.eddi.configs.properties.model.UserMemoryEntry;
+import ai.labs.eddi.utils.LogSanitizer;
+import ai.labs.eddi.datastore.IResourceStore;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.quarkus.arc.DefaultBean;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import jakarta.enterprise.inject.Instance;
+import javax.sql.DataSource;
+import java.sql.*;
+import java.util.*;
+import ai.labs.eddi.engine.audit.AuditHmac;
+import ai.labs.eddi.utils.RuntimeUtilities;
+
+/**
+ * PostgreSQL implementation of {@link IUserMemoryStore}. All data lives in a
+ * single {@code usermemories} table with JSONB value column. Flat property
+ * methods operate on {@code global} entries.
+ *
+ * @author ginccc
+ * @since 6.0.0
+ */
+@ApplicationScoped
+@DefaultBean
+public class PostgresUserMemoryStore implements IUserMemoryStore {
+
+    private static final Logger LOGGER = Logger.getLogger(PostgresUserMemoryStore.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private static final String CREATE_TABLE = """
+            CREATE TABLE IF NOT EXISTS usermemories (
+                id VARCHAR(64) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                user_id VARCHAR(255) NOT NULL,
+                key VARCHAR(255) NOT NULL,
+                value JSONB,
+                category VARCHAR(50) NOT NULL DEFAULT 'fact',
+                visibility VARCHAR(20) NOT NULL DEFAULT 'self',
+                source_agent_id VARCHAR(255),
+                group_ids JSONB DEFAULT '[]'::jsonb,
+                source_conversation_id VARCHAR(255),
+                conflicted BOOLEAN DEFAULT FALSE,
+                access_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """;
+
+    private static final String CREATE_INDEXES = """
+            CREATE INDEX IF NOT EXISTS idx_um_user_vis_agent_key
+                ON usermemories (user_id, visibility, source_agent_id, key);
+            CREATE INDEX IF NOT EXISTS idx_um_user_updated
+                ON usermemories (user_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_um_user_category
+                ON usermemories (user_id, category);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_um_upsert_global
+                ON usermemories (user_id, key) WHERE visibility = 'global';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_um_upsert_agent
+                ON usermemories (user_id, key, source_agent_id) WHERE visibility != 'global';
+            CREATE INDEX IF NOT EXISTS idx_um_user_access_count
+                ON usermemories (user_id, access_count DESC);
+            """;
+
+    /**
+     * Visibility-filtered SELECT, left deliberately un-closed: callers append the
+     * optional group clause, the closing parenthesis, an ORDER BY and a LIMIT.
+     */
+    private static final String VISIBILITY_SELECT = """
+            SELECT * FROM usermemories WHERE ((user_id = ? AND (
+                (visibility = 'self' AND source_agent_id = ?)
+                OR (visibility = 'global')
+            """;
+
+    private static final String ORDER_BY_ACCESS_COUNT = " ORDER BY access_count DESC";
+    private static final String ORDER_BY_RECENCY = " ORDER BY updated_at DESC";
+
+    /** Recall order that ranks entries by how often they have been recalled. */
+    private static final String RECALL_ORDER_MOST_ACCESSED = "most_accessed";
+
+    private final Instance<DataSource> dataSourceInstance;
+    private volatile boolean schemaInitialized = false;
+
+    @Inject
+    public PostgresUserMemoryStore(Instance<DataSource> dataSourceInstance) {
+        this.dataSourceInstance = dataSourceInstance;
+    }
+
+    private synchronized void ensureSchema() {
+        if (schemaInitialized)
+            return;
+        try (Connection conn = dataSourceInstance.get().getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute(CREATE_TABLE);
+            for (String sql : CREATE_INDEXES.split(";")) {
+                sql = sql.trim();
+                if (!sql.isEmpty()) {
+                    stmt.execute(sql);
+                }
+            }
+            schemaInitialized = true;
+        } catch (SQLException e) {
+            LOGGER.error("Failed to initialize usermemories table", e);
+        }
+    }
+
+    // === Flat property view (reads/writes global entries in usermemories) ===
+
+    @Override
+    public Properties readProperties(String userId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT key, value FROM usermemories WHERE user_id = ? AND visibility = 'global'";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            Properties props = new Properties();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String key = rs.getString("key");
+                    String valueJson = rs.getString("value");
+                    if (key != null && valueJson != null) {
+                        Object value = MAPPER.readValue(valueJson, Object.class);
+                        props.put(key, value);
+                    }
+                }
+            }
+            return props.isEmpty() ? null : props;
+        } catch (Exception e) {
+            throw new IResourceStore.ResourceStoreException("Failed to read properties for userId=" + userId, e);
+        }
+    }
+
+    @Override
+    public void mergeProperties(String userId, Properties properties) throws IResourceStore.ResourceStoreException {
+        if (properties == null || properties.isEmpty())
+            return;
+        ensureSchema();
+
+        // Upsert each key-value pair as a global entry
+        String sql = """
+                INSERT INTO usermemories (user_id, key, value, category, visibility)
+                VALUES (?, ?, ?::jsonb, 'property', 'global')
+                ON CONFLICT (user_id, key) WHERE visibility = 'global'
+                DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+                """;
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (Map.Entry<String, Object> entry : properties.entrySet()) {
+                String key = entry.getKey();
+                if ("_id".equals(key) || "userId".equals(key))
+                    continue;
+                ps.setString(1, userId);
+                ps.setString(2, key);
+                ps.setString(3, MAPPER.writeValueAsString(entry.getValue()));
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        } catch (Exception e) {
+            throw new IResourceStore.ResourceStoreException("Failed to merge properties for userId=" + userId, e);
+        }
+    }
+
+    @Override
+    public void deleteProperties(String userId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "DELETE FROM usermemories WHERE user_id = ? AND visibility = 'global'";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to delete properties for userId=" + userId, e);
+        }
+    }
+
+    // === Structured entries ===
+
+    @Override
+    public String upsert(UserMemoryEntry entry) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String visibility = entry.visibility() != null ? entry.visibility().name() : "self";
+
+        // Check for cross-agent global overwrite
+        if (entry.visibility() == Visibility.global) {
+            String checkSql = "SELECT source_agent_id FROM usermemories WHERE user_id = ? AND key = ? AND visibility = 'global'";
+            try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(checkSql)) {
+                ps.setString(1, entry.userId());
+                ps.setString(2, entry.key());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        String existingAgent = rs.getString("source_agent_id");
+                        if (existingAgent != null && !existingAgent.equals(entry.sourceAgentId())) {
+                            LOGGER.infof(
+                                    "[MEMORY] Cross-agent global write: key='%s', user='%s', "
+                                            + "owning agent='%s' (preserved), writing agent='%s'",
+                                    LogSanitizer.sanitize(entry.key()), LogSanitizer.sanitize(entry.userId()),
+                                    LogSanitizer.sanitize(existingAgent), LogSanitizer.sanitize(entry.sourceAgentId()));
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                throw new IResourceStore.ResourceStoreException("Failed to check global override", e);
+            }
+        }
+
+        // Build upsert SQL based on visibility
+        String upsertSql;
+        if (entry.visibility() == Visibility.global) {
+            // A global entry is keyed on (user_id, key) ONLY — it is shared across
+            // agents, so any agent that merely RECALLS and rewrites it would otherwise
+            // take over source_agent_id and silently steal ownership. Leaving
+            // source_agent_id out of the DO UPDATE SET list is the SQL equivalent of
+            // MongoDB's $setOnInsert: the INSERT still stamps the creating agent, later
+            // updates keep it. Self/group entries are keyed per agent, so there
+            // source_agent_id is part of the identity and updating it is correct.
+            upsertSql = """
+                    INSERT INTO usermemories (user_id, key, value, category, visibility, source_agent_id,
+                        group_ids, source_conversation_id, conflicted)
+                    VALUES (?, ?, ?::jsonb, ?, ?, ?, ?::jsonb, ?, ?)
+                    ON CONFLICT (user_id, key) WHERE visibility = 'global'
+                    DO UPDATE SET value = EXCLUDED.value, category = EXCLUDED.category,
+                        group_ids = EXCLUDED.group_ids,
+                        source_conversation_id = EXCLUDED.source_conversation_id,
+                        conflicted = EXCLUDED.conflicted, updated_at = CURRENT_TIMESTAMP
+                    RETURNING id
+                    """;
+        } else {
+            upsertSql = """
+                    INSERT INTO usermemories (user_id, key, value, category, visibility, source_agent_id,
+                        group_ids, source_conversation_id, conflicted)
+                    VALUES (?, ?, ?::jsonb, ?, ?, ?, ?::jsonb, ?, ?)
+                    ON CONFLICT (user_id, key, source_agent_id) WHERE visibility != 'global'
+                    DO UPDATE SET value = EXCLUDED.value, category = EXCLUDED.category,
+                        visibility = EXCLUDED.visibility, group_ids = EXCLUDED.group_ids,
+                        source_conversation_id = EXCLUDED.source_conversation_id,
+                        conflicted = EXCLUDED.conflicted, updated_at = CURRENT_TIMESTAMP
+                    RETURNING id
+                    """;
+        }
+
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(upsertSql)) {
+            ps.setString(1, entry.userId());
+            ps.setString(2, entry.key());
+            ps.setString(3, MAPPER.writeValueAsString(entry.value()));
+            ps.setString(4, entry.category());
+            ps.setString(5, visibility);
+            ps.setString(6, entry.sourceAgentId());
+            ps.setString(7, MAPPER.writeValueAsString(entry.groupIds()));
+            ps.setString(8, entry.sourceConversationId());
+            ps.setBoolean(9, entry.conflicted());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("id");
+                }
+            }
+        } catch (Exception e) {
+            throw new IResourceStore.ResourceStoreException("Failed to upsert memory entry", e);
+        }
+        return null;
+    }
+
+    @Override
+    public void deleteEntry(String entryId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "DELETE FROM usermemories WHERE id = ?";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, entryId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to delete memory entry", e);
+        }
+    }
+
+    @Override
+    public Optional<UserMemoryEntry> findEntryById(String entryId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT * FROM usermemories WHERE id = ?";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, entryId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(resultSetToEntry(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to find memory entry by id", e);
+        }
+        return Optional.empty();
+    }
+
+    // === Queries ===
+
+    @Override
+    public List<UserMemoryEntry> getVisibleEntries(String userId, String agentId, List<String> groupIds, String recallOrder, int maxEntries)
+            throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String visibilityQuery = buildVisibilityQuery(groupIds);
+
+        try (Connection conn = dataSourceInstance.get().getConnection()) {
+            if (!RECALL_ORDER_MOST_ACCESSED.equals(recallOrder)) {
+                List<UserMemoryEntry> entries = new ArrayList<>();
+                collectInto(conn, new LinkedHashSet<>(), entries, visibilityQuery, userId, agentId, groupIds, ORDER_BY_RECENCY,
+                        maxEntries > 0 ? maxEntries : -1);
+                return entries;
+            }
+
+            return mostAccessedWithRecencyReservation(conn, visibilityQuery, userId, agentId, groupIds, maxEntries);
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to get visible entries", e);
+        }
+    }
+
+    /**
+     * Visibility filter for a recall: the user's own scope — self(agentId) OR
+     * group(groupIds) OR global — plus, additively, the TEAM-OWNED scope (I8):
+     * entries whose owner is the synthetic {@code "group:"+groupId} user with
+     * {@code group} visibility. Mirrors the Mongo store's
+     * {@code buildVisibilityFilter} exactly; the two must not drift.
+     * Package-private static so the SQL shape is directly assertable.
+     * <p>
+     * The {@code ??|} is the JDBC escape for PostgreSQL's {@code ?|} JSONB overlap
+     * operator — a single {@code ?} would be parsed as a bind parameter. Bind order
+     * (see {@code collectInto}): userId, agentId, then — only when groups are
+     * supplied — the group ids (user scope), the derived team owner ids, and the
+     * group ids again (team overlap).
+     */
+    static String buildVisibilityQuery(List<String> groupIds) {
+        StringBuilder sql = new StringBuilder(VISIBILITY_SELECT);
+        boolean hasGroups = groupIds != null && !groupIds.isEmpty();
+        if (hasGroups) {
+            // `??|` is pgjdbc's escape for the jsonb `?|` overlap operator — a bare `?`
+            // would be parsed by the driver as a bind placeholder.
+            sql.append(" OR (visibility = 'group' AND group_ids ??| ARRAY[");
+            appendPlaceholders(sql, groupIds.size());
+            sql.append("])");
+        }
+        sql.append("))");
+        if (hasGroups) {
+            // I8: team-owned lessons. Owner ids are DERIVED from the supplied
+            // group ids at bind time, never caller-supplied strings.
+            sql.append(" OR (visibility = 'group' AND user_id IN (");
+            appendPlaceholders(sql, groupIds.size());
+            sql.append(") AND group_ids ??| ARRAY[");
+            appendPlaceholders(sql, groupIds.size());
+            sql.append("])");
+        }
+        return sql.append(")").toString();
+    }
+
+    private static void appendPlaceholders(StringBuilder sql, int count) {
+        for (int i = 0; i < count; i++) {
+            sql.append(i > 0 ? ",?" : "?");
+        }
+    }
+
+    /**
+     * {@code most_accessed} recall: the bulk of the window is filled by access
+     * count, a reserved slice by recency (the split is computed by the shared
+     * {@link RecallWindow}, so both backends mean the same thing by the recall
+     * order), and the {@code access_count} increments are applied in ONE set-based
+     * statement AFTER both result sets are drained.
+     * <p>
+     * The reserved recency slice stops {@code most_accessed} from being
+     * self-reinforcing: without it only entries already inside the window ever get
+     * incremented, so a freshly written entry (count 0) could never climb in once
+     * the window is full. Mirrors
+     * {@code MongoUserMemoryStore.mostAccessedWithRecencyReservation}.
+     */
+    private List<UserMemoryEntry> mostAccessedWithRecencyReservation(Connection conn, String visibilityQuery, String userId, String agentId,
+                                                                     List<String> groupIds, int maxEntries)
+            throws SQLException {
+        var window = RecallWindow.forMaxEntries(maxEntries);
+
+        Set<String> recalled = new LinkedHashSet<>();
+        List<UserMemoryEntry> ordered = new ArrayList<>();
+        collectInto(conn, recalled, ordered, visibilityQuery, userId, agentId, groupIds, ORDER_BY_ACCESS_COUNT, window.accessSlots());
+        collectInto(conn, recalled, ordered, visibilityQuery, userId, agentId, groupIds, ORDER_BY_RECENCY, window.recencySlots());
+        incrementAccessCounts(conn, recalled);
+
+        return ordered;
+    }
+
+    /**
+     * One set-based write for the whole recall — never a per-row update issued
+     * while a result set is still open.
+     */
+    private void incrementAccessCounts(Connection conn, Collection<String> entryIds) throws SQLException {
+        if (entryIds.isEmpty()) {
+            return;
+        }
+        String updateSql = "UPDATE usermemories SET access_count = access_count + 1 WHERE id = ANY (?)";
+        try (PreparedStatement up = conn.prepareStatement(updateSql)) {
+            up.setArray(1, conn.createArrayOf("varchar", entryIds.toArray(new String[0])));
+            up.executeUpdate();
+        }
+    }
+
+    /**
+     * Drains one sorted query into {@code ordered}, de-duplicating against
+     * {@code seen} (keyed by row id).
+     *
+     * @param limit
+     *            {@code < 0} means "no limit" — the {@code LIMIT} clause is left
+     *            off entirely, because neither {@code LIMIT 0} (returns nothing)
+     *            nor a negative {@code LIMIT} (an outright error) can carry the
+     *            "unlimited" sentinel the MongoDB store honours for
+     *            {@code maxEntries <= 0}. {@code limit == 0} skips the query
+     *            entirely — a zero-slot budget means there is no work to do.
+     */
+    private void collectInto(Connection conn, Set<String> seen, List<UserMemoryEntry> ordered, String visibilityQuery, String userId,
+                             String agentId, List<String> groupIds, String orderBy, int limit)
+            throws SQLException {
+        if (limit == 0) {
+            return;
+        }
+        String sql = visibilityQuery + orderBy + (limit > 0 ? " LIMIT ?" : "");
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            int paramIndex = 1;
+            ps.setString(paramIndex++, userId);
+            ps.setString(paramIndex++, agentId);
+            if (groupIds != null && !groupIds.isEmpty()) {
+                // Bind order must mirror buildVisibilityQuery exactly: the user
+                // scope's group overlap, then the derived team owners (I8), then
+                // the team scope's group overlap.
+                for (String gid : groupIds) {
+                    ps.setString(paramIndex++, gid);
+                }
+                for (String gid : groupIds) {
+                    ps.setString(paramIndex++, IUserMemoryStore.TEAM_OWNER_PREFIX + gid);
+                }
+                for (String gid : groupIds) {
+                    ps.setString(paramIndex++, gid);
+                }
+            }
+            if (limit > 0) {
+                ps.setInt(paramIndex, limit);
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var entry = resultSetToEntry(rs);
+                    if (entry.id() == null || seen.add(entry.id())) {
+                        ordered.add(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    @Override
+    public List<UserMemoryEntry> filterEntries(String userId, String query) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        if (query == null || query.isBlank()) {
+            return getAllEntries(userId);
+        }
+        // Every term must appear in the key or the value — see MemorySearchTerms. The
+        // raw query used to be the LIKE pattern, so "dog name" missed "dog_name" and a
+        // "%" or "_" typed by the model acted as a wildcard. Terms are letters and
+        // digits only, so nothing in them needs escaping.
+        List<String> terms = MemorySearchTerms.tokenize(query);
+        if (terms.isEmpty()) {
+            return new ArrayList<>();
+        }
+        String sql = "SELECT * FROM usermemories WHERE user_id = ?"
+                + " AND (key ILIKE ? OR value::text ILIKE ?)".repeat(terms.size())
+                + " ORDER BY updated_at DESC";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            int parameterIndex = 2;
+            for (String term : terms) {
+                String pattern = "%" + term + "%";
+                ps.setString(parameterIndex++, pattern);
+                ps.setString(parameterIndex++, pattern);
+            }
+            List<UserMemoryEntry> entries = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(resultSetToEntry(rs));
+                }
+            }
+            return entries;
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to filter entries", e);
+        }
+    }
+
+    @Override
+    public List<UserMemoryEntry> getEntriesByCategory(String userId, String category) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT * FROM usermemories WHERE user_id = ? AND category = ? ORDER BY updated_at DESC";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            ps.setString(2, category);
+            List<UserMemoryEntry> entries = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(resultSetToEntry(rs));
+                }
+            }
+            return entries;
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to get entries by category", e);
+        }
+    }
+
+    @Override
+    public Optional<UserMemoryEntry> getByKey(String userId, String key) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT * FROM usermemories WHERE user_id = ? AND key = ? LIMIT 1";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            ps.setString(2, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return Optional.of(resultSetToEntry(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to get entry by key", e);
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public List<UserMemoryEntry> getAllEntries(String userId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT * FROM usermemories WHERE user_id = ? ORDER BY updated_at DESC";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            List<UserMemoryEntry> entries = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(resultSetToEntry(rs));
+                }
+            }
+            return entries;
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to get all entries", e);
+        }
+    }
+
+    // === GDPR ===
+
+    @Override
+    public void deleteAllForUser(String userId) throws IResourceStore.ResourceStoreException {
+        // Parity with MongoUserMemoryStore, which has always guarded this. Erasing
+        // "all entries for user null" is not a request anyone means, and the pseudonym
+        // derived below refuses a null identifier rather than hashing one.
+        RuntimeUtilities.checkNotNull(userId, "userId");
+        ensureSchema();
+        try (Connection conn = dataSourceInstance.get().getConnection()) {
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM usermemories WHERE user_id = ?")) {
+                ps.setString(1, userId);
+                int count = ps.executeUpdate();
+                // The pseudonym, not the identifier. This line records an ERASURE, so
+                // writing the raw userId would leave in the log exactly the identifier
+                // the erasure exists to remove (CWE-532) - and logs outlive the database
+                // and travel further. AuditHmac.pseudonymFor is the same deterministic
+                // SHA-256 the erasure cascade substitutes into the audit ledger, so an
+                // operator can still correlate the two without either holding the id.
+                LOGGER.infof("[MEMORY] GDPR delete-all for user '%s': %d entries removed",
+                        AuditHmac.pseudonymFor(userId), count);
+            }
+        } catch (SQLException e) {
+            // Pseudonymised for the same reason as the success log above: a caller that
+            // logs or serialises this exception would otherwise persist the identifier
+            // the erasure exists to remove (CWE-532).
+            //
+            // The sibling methods above deliberately keep the raw userId in their
+            // messages. On a read, merge or property delete the user's data legitimately
+            // exists and their identifier appears throughout the system, so the
+            // identifier is diagnostics rather than a leak. Erasure is the one path where
+            // the whole point is that the identifier stops existing - do not "even these
+            // up" without that distinction in mind.
+            throw new IResourceStore.ResourceStoreException(
+                    "Failed to delete all data for user=" + AuditHmac.pseudonymFor(userId), e);
+        }
+    }
+
+    @Override
+    public long countEntries(String userId) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        String sql = "SELECT COUNT(*) FROM usermemories WHERE user_id = ?";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next())
+                    return rs.getLong(1);
+            }
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to count entries", e);
+        }
+        return 0;
+    }
+
+    @Override
+    public long deleteOlderThan(int olderThanDays) throws IResourceStore.ResourceStoreException {
+        ensureSchema();
+        // Exclude GDPR system keys (e.g. _gdpr_processing_restricted) from retention
+        // cleanup
+        String sql = "DELETE FROM usermemories WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '1 day' * ? AND key NOT LIKE '_gdpr_%'";
+        try (Connection conn = dataSourceInstance.get().getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, olderThanDays);
+            return ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IResourceStore.ResourceStoreException("Failed to delete old memory entries", e);
+        }
+    }
+
+    // === ResultSet conversion ===
+
+    @SuppressWarnings("unchecked")
+    private UserMemoryEntry resultSetToEntry(ResultSet rs) throws SQLException {
+        String visStr = rs.getString("visibility");
+        Visibility vis;
+        try {
+            vis = visStr != null ? Visibility.valueOf(visStr) : Visibility.self;
+        } catch (IllegalArgumentException e) {
+            vis = Visibility.self;
+        }
+
+        Object value = null;
+        String valueJson = rs.getString("value");
+        if (valueJson != null) {
+            try {
+                value = MAPPER.readValue(valueJson, Object.class);
+            } catch (Exception ignored) {
+                value = valueJson;
+            }
+        }
+
+        List<String> groupIds = List.of();
+        String groupIdsJson = rs.getString("group_ids");
+        if (groupIdsJson != null) {
+            try {
+                groupIds = MAPPER.readValue(groupIdsJson, List.class);
+            } catch (Exception ignored) {
+                // keep empty
+            }
+        }
+
+        Timestamp createdTs = rs.getTimestamp("created_at");
+        Timestamp updatedTs = rs.getTimestamp("updated_at");
+
+        return new UserMemoryEntry(rs.getString("id"), rs.getString("user_id"), rs.getString("key"), value, rs.getString("category"), vis,
+                rs.getString("source_agent_id"), groupIds, rs.getString("source_conversation_id"), rs.getBoolean("conflicted"),
+                rs.getInt("access_count"), createdTs != null ? createdTs.toInstant() : null, updatedTs != null ? updatedTs.toInstant() : null);
+    }
+}

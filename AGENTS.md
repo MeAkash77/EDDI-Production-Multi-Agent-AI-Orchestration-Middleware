@@ -1,0 +1,1012 @@
+# EDDI Backend — AI Agent Instructions
+
+> **This file is automatically loaded by AI coding assistants. Follow ALL rules below.**
+>
+> **New here?** Read the [README](README.md) first — it has setup, the quick start, and a feature tour. This file is the working guide for building *in* the codebase: architecture, code patterns, and conventions.
+
+**Contents:** [1. Project Context](#1-project-context) · [2. Workflow Protocol](#2-mandatory-workflow-protocol) · [3. Roadmap](#3-development-roadmap) · [4. Backend Java Guidelines](#4-backend-java-guidelines) · [5. Agent Config Authoring](#5-agent-config-authoring-reference) · [6. Session Protocol](#6-session-protocol)
+
+## 1. Project Context
+
+**EDDI** (Enhanced Dialog Driven Interface) is a multi-agent orchestration middleware for conversational AI. This repo is the **Java/Quarkus backend**.
+
+EDDI is a **config-driven engine**, not a monolithic application. Agent behavior lives in JSON configurations; Java code builds the _components_ and _infrastructure_ (the "engine") that reads and executes those configurations.
+
+### Ecosystem
+
+| Repo                                                            | Tech                       | Purpose                                                      |
+| --------------------------------------------------------------- | -------------------------- | ------------------------------------------------------------ |
+| **EDDI** (this repo)                                            | Java 25, Quarkus, MongoDB  | Backend engine, REST API, lifecycle pipeline                 |
+| **[quarkus-eddi](https://github.com/quarkiverse/quarkus-eddi)** | Java 21, Quarkus Extension | Quarkus SDK — `@Inject EddiClient`, Dev Services, MCP bridge |
+| **Manager** — [`ui/manager/`](ui/manager/) in this repo                                                | React 19, Vite, Tailwind   | Admin dashboard (served from EDDI at `/manage`; `/` redirects to the `/welcome` chooser, `/workforce` is the group-conversation workspace) |
+| **Chat UI** — [`ui/chat/`](ui/chat/) in this repo | React, TypeScript | Standalone chat widget, served at `/chat` |
+| **eddi-website**                                                | Astro, Starlight           | Marketing site + documentation at eddi.labs.ai               |
+
+> **The Manager and the Chat UI are directories of this repository** (`ui/manager`, `ui/chat`), not separate repos. They were `labsai/EDDI-Manager` and `labsai/EDDI-Chat-UI` until 2026-09-15; both histories were imported with their commits intact (`git log -- ui/manager`). Maven builds both into the jar — see Build & Test Commands.
+
+> **Versions live in `pom.xml`** (Java, Quarkus, every dependency) — treat it as the single source of truth. This file names the Java baseline for context but deliberately does not restate specific Quarkus/library versions, which drift. See §2 rule 7.
+
+### Key Architecture
+
+- **Config-driven engine**: Agent logic is JSON configs, Java is the processing engine. When designing a new feature, always ask: "should this be configurable by the agent designer?" If yes, expose it as a config field with sensible defaults — don't hardcode behavior or pick a single "best" approach.
+- **Lifecycle pipeline**: Input → Parse → Behavior Rules → Actions → Tasks → Output
+- **Stateless tasks, stateful memory**: `ILifecycleTask` implementations are singletons; all state lives in `IConversationMemory`
+- **Action-based orchestration**: Tasks emit/listen for string-based actions, never call each other directly
+- **Self-contained platform**: EDDI is a closed platform, not a library consumed by third-party code. Internal interfaces (`IUserMemoryStore`, `IResourceStore`, etc.) have no external consumers. Deprecation and replacement of internal APIs is safe — the only backward-compat concern is old JSON configs stored in MongoDB or imported via ZIP.
+- **CI/CD**: GitHub Actions (compile → test → Docker build → smoke test → push to Docker Hub). `[skip docker]` in commit message skips image builds. Tag-based releases (`6.2.0` → `labsai/eddi:6.2.0`) — the release job triggers on tags matching `[0-9]*`, so the tag must **not** be `v`-prefixed or nothing fires. Separate security workflows run CodeQL, Trivy, Gitleaks, ZAP, CycloneDX (SBOM), and Jazzer fuzzing.
+
+### Build & Test Commands
+
+**Prerequisites & first run:** you need **JDK 25**, **Docker**, and a **MongoDB** instance. Full setup is in [README → Development](README.md#️-development); the quickest path is `docker run -d -p 27017:27017 mongo:7`, then `./mvnw compile quarkus:dev` (app on port **7070**, Dev UI at `/q/dev`).
+
+**Toolchain:** commands use the bundled Maven wrapper — no local Maven needed. **On Windows, substitute `.\mvnw.cmd` for `./mvnw` below.** If you use [mise](https://mise.jdx.dev), `mise.toml` pins the exact JDK 25 + Maven and mirrors these as tasks (`mise run dev`, `mise run test`, …) that auto-install the toolchain — the lowest-friction path; treat `mise.toml` as canonical for tool *versions*.
+
+**Once per clone:** run `git config core.hooksPath .githooks` to activate the pre-push safety hook (§2 rule 4) — a fresh clone does not enable it automatically.
+
+The [README "Maven Command Reference"](README.md#maven-command-reference) is the canonical full command list (verify against it if a command changes); the essentials:
+
+| Command | What it does |
+| ------- | ------------ |
+| `./mvnw compile quarkus:dev` | Start dev mode with live reload — app on port **7070**, Dev UI at `/q/dev` |
+| `./mvnw package -DskipTests -DskipUi=true` | Build the jar **without** the Manager and Chat UIs (the jar then serves no UI). `compile` and `test` never build the UIs anyway — see the note below the table |
+| `./mvnw compile` | Compile only (fast feedback) — run before every commit per §2 rule 6. It is also where the style gates fire: Checkstyle's import rules and `formatter:validate` are both bound to the `validate` phase, which `compile` runs through, so an unused import or an unformatted file **fails the build here** rather than being silently rewritten. Fix with `./mvnw formatter:format` (formatting) or by deleting the import (Checkstyle) |
+| `./mvnw test` | Unit tests (excludes `*IT.java`); JaCoCo report at `target/site/jacoco/index.html` |
+| `./mvnw test -Dtest=ClassName` | Run a single test class |
+| `./mvnw verify` | Compile + unit tests + package. **Integration tests do NOT run** — `skipITs` defaults to `true` |
+| `./mvnw verify -DskipITs=false` | Full build **including** integration tests — requires Docker. The command CI runs |
+| `./mvnw validate` · `./mvnw formatter:format` | The two blocking style gates — Checkstyle (`UnusedImports`/`RedundantImport` are `severity="error"`; `FileLength`/`LineLength` stay advisory) and `formatter:validate`, which **reports** drift and never edits your files · auto-format with the project Eclipse formatter, i.e. the fix for a `formatter:validate` failure |
+
+> **The UIs build with Maven, at packaging time.** `ui/manager` and `ui/chat` are built in `prepare-package` and copied into the jar just before it is assembled (`frontend-maven-plugin` + `maven-resources-plugin` in `pom.xml`). So `compile`, `test` and `quarkus:dev` never run npm, while `package`, `verify` and `install` run `npm ci` and `npm run build` for both, about two minutes, unless you pass `-DskipUi=true`. No local Node is needed: Maven downloads Node 22 into `ui/node/` (gitignored). Dev mode serves `/manage` only if an earlier `./mvnw package` left the UI in `target/classes`; for frontend work run `npm run dev` in `ui/manager` (port 3000, proxies the API to :7070) or `ui/chat` (port 5174). Generated output is never committed any more — `src/main/resources/META-INF/resources` holds only `index.html`, `robots.txt` and `scripts/js/landing-redirect.js`. **Once, after pulling the migration into an older checkout, run `./mvnw clean`**: its fileset deletes the formerly committed bundles still on disk, which `quarkus:dev` would otherwise serve from the source tree.
+
+> **Sandbox caveat:** integration tests (`*IT.java`) and any test that binds a loopback/HTTP socket need Docker and frequently cannot run in sandboxed agent environments — CI verifies those. Locally, rely on `./mvnw test` (unit tests) and treat a green CI run as the source of truth for the rest.
+
+---
+
+## 2. Mandatory Workflow Protocol
+
+### Before Starting Any Work
+
+1. **Read the key docs**:
+   - [`docs/project-philosophy.md`](docs/project-philosophy.md) — **Supreme directive.** 9 architectural pillars governing all EDDI development
+   - [`docs/changelog.md`](docs/changelog.md) — **Read the most recent entries first** (newest are at the top). Running log of changes, decisions, and reasoning across all repos and sessions. It holds only recent work, capped at 250 KB; older entries are archived per month under [`docs/changelog/`](docs/changelog/) and are indexed in an Archive table at the top of the live file. Skim the top 2–3 entries for current context — do not read the archives unless you are chasing a specific past decision.
+   - [`docs/changelog.d/`](docs/changelog.d/README.md) — **entries newer than the live file.** A branch writes its entry here as its own file so that concurrent PRs do not conflict over one; a nightly job folds them into `changelog.md`. Anything sitting here is more recent than the top of that file, so list this directory too.
+   - [`docs/architecture.md`](docs/architecture.md) — Architecture overview, configuration model, pipeline, and DB-agnostic design
+   - If working on the **Manager** (`ui/manager/`): also read [`ui/manager/AGENTS.md`](ui/manager/AGENTS.md) and its `CLAUDE.md`. For the **Chat UI**: [`ui/chat/AGENTS.md`](ui/chat/AGENTS.md)
+2. **Check git status**: Run `git status` and `git log -5 --oneline` to see current branch state and recent work.
+
+### During Work
+
+3. **Branching**: Check `git branch --show-current` and `git log -5 --oneline` to understand the current branch context. **Do NOT commit directly to `main`.** If unsure which branch to use, ask the user.
+   - **Always branch from `origin/main`**, never from another feature branch. Run `git fetch origin main` then `git checkout -b my-branch origin/main` to guarantee a clean base.
+   - **External contributors** (no push access to `labsai/EDDI`): fork first, point `origin` at your fork and `upstream` at `labsai/EDDI`, and branch from `upstream/main`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full fork-and-PR workflow.
+4. **Push discipline — ask before pushing, never force-push**: Committing locally is free, but **pushing to the remote requires explicit human approval — always ask first** (separate from, and in addition to, the force-push ban). `git push --force` and `git push --force-with-lease` are **forbidden**. To avoid ever needing a force-push, follow these sub-rules:
+   - **Never `git commit --amend` after pushing.** Amend only works on unpushed commits. If you already pushed, make a new commit instead.
+   - **Never `git rebase -i` on a pushed branch.** Interactive rebase rewrites history. If the branch is pushed, history is immutable.
+   - **Never `git reset` on a pushed branch.** Use `git revert` to undo pushed commits (it creates a new forward commit).
+   - **Always `git pull --rebase` before pushing** if the remote has new commits.
+   - A `.githooks/pre-push` hook blocks non-fast-forward pushes as a safety net — **opt-in per clone**: activate it once with `git config core.hooksPath .githooks` (see [Build & Test Commands](#build--test-commands)).
+5. **Commit often and selectively**: Every working unit gets a commit. Use conventional commits:
+   ```
+   feat(scope): description
+   fix(scope): description
+   chore(scope): description
+   refactor(scope): description
+   ```
+   **Commits and PRs are attributed to the human author.** Do NOT add AI co-authorship trailers (e.g. `Co-Authored-By: <assistant>`) or tool-advertising footers (e.g. `Generated with…`, `🤖 …`) to commit messages or PR descriptions — keep the history human-attributed.
+   **Only stage files you actually worked on.** Never use `git add .` or `git add -A`. The working tree may contain changes from other people, other branches, or other tools — those are not yours to commit. Always:
+   - Stage files individually: `git add path/to/file1 path/to/file2`
+   - Run `git status` before committing — if any staged file is not part of your task, unstage it
+   - Run `git log --stat -1` after committing to confirm the commit only contains your files
+6. **Each commit must build**: Run `./mvnw compile` (or `./mvnw test` for backend) before committing. Never commit broken code. `compile` passes through the `validate` phase, so it also enforces the two style gates — an unused import fails Checkstyle and an unformatted file fails `formatter:validate`. Neither rewrites your sources: run `./mvnw formatter:format` to fix formatting, and delete the import Checkstyle names. (The formatter used to run its `format` goal on every build, which edited tracked files behind your back and put them in `git status` next to your real work — the reason rule 5 forbids `git add .`.)
+7. **Verify factual claims against authoritative sources**: When writing documentation about the project's technology stack, dependencies, or CI configuration, **always verify against the canonical source** (`pom.xml` for dependencies, `ci.yml` for CI behavior, `Dockerfile` for container config). **Never infer from codebase grep results** — migration code, comments about "previous implementations," and backward-compatibility references describe what the project *used to* use, not what it currently uses. If a term appears 40 times in the codebase but zero times in `pom.xml`, the project does not use it.
+8. **Update the changelog immediately before committing**: write a **new file** under [`docs/changelog.d/`](docs/changelog.d/README.md) and include it in the commit that contains the changes being documented. The entry must land on the **same branch** as the work it documents — never on a different branch after the fact.
+   - **Never edit [`docs/changelog.md`](docs/changelog.md) by hand**, and never append to a file under `docs/changelog/` — those are archives. Entries used to go at the top of the live file, which meant every open PR inserting at the same point in the same file: git cannot merge that, so with several PRs in flight each one conflicted with every other over a document unrelated to the code under review. A fragment is a new file under a name no other branch picks, so the same two PRs merge without touching each other.
+   - **Name it `docs/changelog.d/YYYY-MM-DD-<slug>.md`**, today's date with a lower-case slug unique to your branch (the branch name usually works). Inside it, write exactly what used to go into the live file — one or more `## <title> (YYYY-MM-DD)` entries — but give every relative link **one extra `../`**, because a fragment sits a directory deeper than `docs/changelog.md`. `ChangelogFragmentTest` enforces all of this, so a malformed fragment fails your build rather than the nightly job's.
+   - **`## Decision Log` and `## Regression Notes` are running registers, not entries.** They live at the bottom of the live file, are never rotated out, and are appended to at a fixed point — so they conflicted for the same reason. Put your rows in a fenced ` ```decision-log ` or ` ```regression-note ` block inside your fragment and the collator files them.
+   - **[`.github/workflows/changelog-collate.yml`](.github/workflows/changelog-collate.yml) runs nightly**: it merges every fragment into `docs/changelog.md` **by date** (a PR that sat open for weeks carries an old date and lands among its contemporaries, not on top), trims the live file back to **200 KB** whenever it is over that, regenerates the Archive table and `docs/SUMMARY.md`, and opens a PR. To do it by hand: `python scripts/collate-changelog.py` then `python scripts/rotate-changelog.py`. `ChangelogRotationTest` fails the build at **250 KB**; the 50 KB gap is headroom, so the session that tips the file over is not the one made to rotate it. **Never raise the cap** — it exists because a single file once reached 1.9 MB (~500k tokens) under a rule that obliges every session to add and never to remove.
+   - **CI enforces this.** The `Changelog Discipline` job fails any PR that *adds* an entry heading or a dated register row to `docs/changelog.md` — counting added against removed, so editing the header, fixing a typo in a past entry's heading, correcting a register row and rotating an archive all net to zero and stay allowed. Adding an entry in place is the one thing that raises the count, and the one thing that conflicts. (It is not a required check, so it reports rather than blocks.)
+
+   Each entry should include:
+   - Date and short title
+   - Repo and branch
+   - What changed (files + reasoning)
+   - Design decisions made
+   - What's in progress / what's next (if interrupted mid-task)
+
+#### Git Recovery — What To Do Instead of Force-Push
+
+| Situation | ❌ Wrong (rewrites history) | ✅ Correct (moves forward) |
+|-----------|---------------------------|---------------------------|
+| Committed to wrong branch, **not yet pushed** | — | `git branch fix/my-work` → `git checkout main` → `git reset --hard origin/main` (safe: nothing was pushed) |
+| Committed to wrong branch, **already pushed** | `git reset && git push --force` | `git revert <sha>` on wrong branch, then cherry-pick onto correct branch |
+| Need to undo a pushed commit | `git reset --hard HEAD~1 && git push --force` | `git revert <sha> && git push` (new commit that undoes the change) |
+| Local branch diverged from remote | `git push --force` | `git pull --rebase` then `git push` |
+| Want to clean up commits before merge | `git rebase -i && git push --force` | Use GitHub's "Squash and merge" button on the PR instead |
+
+### After Completing Work (or if interrupted/switching sessions)
+
+9. **Verify branch hygiene**: Before switching branches, run `git status` and `git stash` any uncommitted work. When returning to a branch, run `git stash pop` and verify the restored changes belong to that branch.
+
+---
+
+## 3. Development Roadmap
+
+Follow this order unless the user explicitly requests something different.
+**Backend first, then testing, then frontend. Website last.**
+
+> This roadmap is indicative and hand-maintained — it may lag reality. [`docs/changelog.md`](docs/changelog.md) is the source of truth for what has actually landed.
+
+### Completed ✅
+
+| Phase | Area                     | Highlights                                                                                          |
+| ----- | ------------------------ | --------------------------------------------------------------------------------------------------- |
+| 0     | Security Quick Wins      | CORS lockdown, PathNavigator (replaced OGNL)                                                        |
+| 1     | Backend Foundation       | ConversationService extraction, SSE streaming, typed memory, LlmTask decomposition                  |
+| 2     | Testing Infrastructure   | Integration tests migrated to main repo, Testcontainers, API contract tests                         |
+| 3     | Manager UI               | Greenfield React 19 + Vite + Tailwind rewrite                                                       |
+| 4     | Chat-UI                  | CRA→Vite, SSE streaming, Keycloak auth                                                              |
+| 5     | NATS JetStream           | Event bus abstraction, async processing, coordinator dashboard                                      |
+| 6     | DB-Agnostic Architecture | PostgreSQL adapter, MongoDB sync driver, Caffeine cache, Lombok removal, langchain4j core migration |
+| 7     | Security & Compliance    | Secrets Vault, Audit Ledger (EU AI Act), tenant quota stub                                          |
+| 8     | MCP Integration          | MCP Server (80+ tools), MCP Client, agent discovery, managed conversations                           |
+| 8c    | RAG Foundation           | Config-driven vector store retrieval, pgvector, httpCall RAG                                        |
+| 10    | Group Conversations      | Multi-agent debate orchestration, 7 styles (incl. Task Force, Negotiation), group-of-groups         |
+| 10b   | Dynamic Agents           | Runtime agent creation/recruitment/delegation, DynamicAgentConfig guardrails, lifecycle policies, SharedTaskList |
+| 10c   | Group Deliberation       | `VOTE` phases + VoteTallyEngine (quorum, weights, tie policies), NEGOTIATION style + NegotiationEngine, facilitator with bounded moves, humans as group members, dissent recording, transcript windowing |
+| 10d   | Group Work Products      | Shared artifacts (CAS + declarative validators), bid-based task assignment (CNP-lite), `RETRO` → team-owned group memory, standing teams (backlog + cron cadences + metrics), 5 preset group templates |
+| —     | A2A Protocol             | Agent-to-Agent peer communication, Agent Cards, skill discovery                                     |
+| —     | Multi-Model Cascading    | Sequential model escalation with confidence routing                                                 |
+| —     | LLM Provider Expansion   | Added Mistral, Azure OpenAI, Bedrock, Oracle GenAI (12 providers; see `docs/langchain.md`)                                     |
+| —     | Quarkus LTS              | LTS platform upgrade, Java 25 module fix (version pinned in `pom.xml`)                              |
+| 12    | CI/CD                    | GitHub Actions unified pipeline, Docker Hub push, CircleCI removed                                  |
+| —     | OpenTelemetry Tracing    | Per-task `eddi.pipeline.task` spans from `LifecycleManager`, MCP circuit breakers — see [`docs/monitoring/monitoring-guide.md`](docs/monitoring/monitoring-guide.md) |
+| 11a   | Persistent Memory        | IUserMemoryStore, UserMemoryTool, DreamService, McpMemoryTools, Property.Visibility                 |
+| —     | Conversation Windows     | Token-aware windowing, rolling summary, ConversationRecallTool                                      |
+| —     | Agentic Improvements 1–5 | Counterweights, MCP governance, capability registry, multimodal attachments, agent signing          |
+| —     | Compliance Hardening     | HIPAA, EU AI Act, international privacy docs + ComplianceStartupChecks                              |
+| —     | Prompt Snippets          | Config-driven system prompt building blocks, Caffeine-cached, REST CRUD                             |
+| —     | Agent Sync               | Granular export/import, structural matching, live instance-to-instance sync                         |
+| —     | GDPR/CCPA Framework      | Cascading erasure, data portability, Art. 18 restriction, per-category retention                    |
+| —     | Commit Flags             | Strict write discipline for memory — uncommit failed task data, error digest injection              |
+| —     | Template Preview         | REST endpoint for previewing resolved system prompts with sample/live data                          |
+| —     | Test Coverage            | 14,000+ tests, >90% instruction / >80% branch coverage, OpenSSF Gold compliance                     |
+| —     | Security Hardening v6.0.2 | SSRF prevention, SafeHttpClient, auth guard, vault salt, security headers, CodeQL + Trivy CI       |
+| 9b    | HITL Framework           | Two human-approval gates (turn-level `PAUSE_CONVERSATION` + per-tool-call gating), timeout/no-progress policies, audit ledger, Slack + MCP approval surfaces, crash recovery — see [`docs/hitl.md`](docs/hitl.md) |
+| —     | OpenAI-Compatible API    | `/v1` adapter presenting deployed agents as OpenAI models for Open WebUI and OpenAI SDK clients; per-chat conversation isolation, streaming, multimodal, HITL-aware — see [`docs/open-webui-integration.md`](docs/open-webui-integration.md) |
+
+### In Progress / Upcoming
+
+| Phase | Area                      | Description                                                                                                                               |
+| ----- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| —     | Memory Architecture       | Commit flags, RAG threshold, context selection, auto-compaction, property consolidation (see `planning/memory-architecture-plan.md`) |
+| —     | Session Forking           | State snapshotting, conversation forking (see `planning/agentic-improvements-plan.md` §7)                                                 |
+| —     | Conversation Chaining     | Cross-session context carry-over (see `planning/conversation-window-management.md` Strategy 3)                                       |
+| 9     | DAG Pipeline              | Parallel task execution and the dependency graph. OpenTelemetry tracing and MCP circuit breakers already shipped — see Completed          |
+| —     | HITL — remaining          | Manager approvals UI (`ui/manager`) and the reserved `inGroupTurns: INBOX` mode for member *tool-call* pauses. Core framework shipped; humans as group *members* shipped in 10c — see Completed. `VoteConfig.tiePolicy: HUMAN_DECIDES` is likewise still save-time rejected pending its own resume machinery |
+| —     | Guardrails                | Config-driven input/output guardrails in LlmTask (see `planning/guardrails-architecture.md`)                                         |
+| 11b   | Multi-Channel             | Teams adapter (Slack already ships via HITL approval channels; see `planning/multi-agent-ux-improvements.md`)                        |
+| 13    | Debugging & Visualization | Time-traveling debugger, visual pipeline builder                                                                                          |
+| 14    | Website                   | Astro + Starlight documentation site                                                                                                      |
+| —     | Native Image              | GraalVM native compilation (see `planning/native-image-migration.md`)                                                                |
+
+---
+
+## 4. Backend Java Guidelines
+
+### 4.1 Golden Rules (Non-Negotiable)
+
+1. **Logic is Configuration, Java is the Engine** — Agent behavior (e.g., "if user says 'hello', call API 'X'") MUST NOT be hard-coded in Java. Agent logic belongs in **JSON configurations** (`behavior.json`, `httpcalls.json`, `langchain.json`). Java code creates the `ILifecycleTask` components that _read and execute_ this configuration. (Note: the config file is still named `langchain.json` but the implementing class is `LlmTask`.)
+2. **Stateless Tasks, Stateful Memory** — `ILifecycleTask` implementations MUST be stateless. They are singletons shared by all conversations. All conversational state MUST be read from and written to the `IConversationMemory` object passed into the `execute` method.
+3. **Action-Based Orchestration** — Tasks MUST NOT call other tasks directly. The system is event-driven. Tasks are orchestrated by string-based **actions**. A task (like `RulesEvaluationTask`) emits actions, and other tasks (like `OutputGenerationTask` or `ApiCallsTask`) listen for them.
+4. **Dependency Injection via Quarkus CDI** — All components (`ILifecycleTask`s, `IResourceStore`s) use `@ApplicationScoped` and `@Inject`. No manual module registration — Quarkus auto-discovers beans.
+5. **Thread Safety** — The `ConversationCoordinator` handles concurrency _between_ conversations. Code must be thread-safe and non-blocking. REST endpoints use JAX-RS `AsyncResponse`. Tasks execute synchronously but must not block for extended periods.
+
+> These five rules operationalize Pillars 1, 3, and 5 of the [nine architectural pillars](docs/project-philosophy.md) (the supreme directive). The other pillars — deterministic governance (2), security-as-architecture (4), observability (6), progressive disclosure (7), persistent memory (8), portability (9) — are applied in §4.2, §4.4, and §4.7; read `project-philosophy.md` for the full set and the _why_ behind each.
+
+### 4.2 Core Architecture
+
+#### The Conversation Lifecycle
+
+The `LifecycleManager` is the heart of EDDI. It processes a conversation turn by running a pipeline of `ILifecycleTask` implementations.
+
+A **new feature** (e.g., "LLM Agents") is implemented as a **new `ILifecycleTask`**:
+
+1. Create the task class implementing `ILifecycleTask`
+2. Implement `execute(IConversationMemory memory)`
+3. Read from `memory` (e.g., `memory.getCurrentData("input")`)
+4. Perform task logic (e.g., call an LLM)
+5. Write results back to memory (e.g., `memory.getCurrentStep().addConversationOutput(...)`)
+
+#### The Conversation Memory (`IConversationMemory`)
+
+The **single source of truth** for a conversation:
+
+- **`IConversationMemoryStore`** — loads/saves memory from MongoDB
+- **`IConversationMemory`** — the "live" object for a conversation
+- **`ConversationStep`** — an entry in the stack, holding `IData` objects for that turn
+- **`IData<T>`** — generic wrapper for data in a step. Use `Data<T>` to create new objects
+- **Reading**: `currentStep.getLatestData("key")` → check for null → `.getResult()`
+- **Writing**: `currentStep.storeData(new Data<>("key", value))`. Set `data.setPublic(true)` for output-visible data
+- **`ConversationProperties`** — long-term state (e.g., `agentName`, `userId`). Slot-filling uses `PropertySetterTask`
+
+> **Critical distinction**: Conversation memory has **two audiences**. (1) **Pipeline tasks** (BehaviorRules, PropertySetter, etc.) see the **full memory** — all steps, all data keys. (2) **The LLM** sees only a **windowed view** assembled by `ConversationHistoryBuilder` — last N conversationOutputs converted to ChatMessages. When you think about "conversation too long," these are two different problems: the LLM context window (what the model sees) and the MongoDB document size (storage/load time). Most context management strategies only affect #1.
+
+#### The Configuration-as-Code Model
+
+Agent definitions are versioned MongoDB documents. A "Agent" is a list of "Workflows". A "Workflow" bundles "Workflow Extensions" (JSON configs).
+
+#### Core Workflow Extensions
+
+- **`behavior.json`** → `RulesEvaluationTask` — the **primary orchestrator**. Its `actions` list is the event that triggers other tasks.
+- **`httpcalls.json`** → `ApiCallsTask` — **Tool Definitions** with templated API calls.
+- **`property.json`** → `PropertySetterTask` — **EDDI's importance extraction mechanism.** Config-driven slot-filling that explicitly selects which data to preserve as `longTerm` properties. These properties survive the LLM context window boundary — they're loaded at conversation init and available in all templates regardless of how many turns have passed. When designing context management or memory features, PropertySetter is **not just slot-filling** — it's how EDDI ensures critical facts outlive the conversation window.
+- **`langchain.json`** → `LlmTask` — **Agent Definition** (prompt, model, tools, or legacy chat). (Config file retains the `langchain` name for backward compatibility.)
+
+#### The Template Data Model
+
+When tasks process templates (system prompts, HTTP call bodies, property instructions), `MemoryItemConverter.convert(memory)` produces a map with these top-level keys:
+
+| Key                | Type                                         | Source                                                                     | Example Access                                   |
+| ------------------ | -------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------ |
+| `context`          | `Map<String, Object>`                        | Input context variables set per turn                                       | `{context.language}`                           |
+| `properties`       | `Map<String, Object>`                        | Conversation properties — raw values from `ConversationProperties.toMap()` | `{properties.preferred_language}`                |
+| `memory`           | `Map` with `current`, `last`, `past`         | Conversation step data from the pipeline                                   | `{memory.current.output}`, `{memory.last.input}` |
+| `snippets`         | `Map<String, Object>`                        | Prompt Snippets — auto-injected from `PromptSnippetService`                | `{snippets.cautious_mode}`                     |
+| `vars`             | `Map<String, Object>`                        | Global Variables — deployment-wide config from `GlobalVariableResolver`    | `{vars.default-model}`                         |
+| `userInfo`         | `Map` with `userId`                          | Authenticated user identity                                                | `{userInfo.userId}`                            |
+| `conversationInfo` | `Map` with `conversationId`, `agentId`, etc. | Conversation metadata                                                      | `{conversationInfo.agentId}`                   |
+| `conversationLog`  | `String`                                     | Formatted conversation history                                             | `{conversationLog}`                            |
+
+> **Key insight**: `longTerm` properties are loaded into `conversationProperties` at conversation init and are immediately available via `{properties.key}` in any template. You do NOT need a separate template namespace for persistent data — properties IS the namespace.
+
+#### The Property Lifecycle
+
+Properties have a well-defined lifecycle managed by `Conversation.java`:
+
+```
+1. Conversation.init()
+   └─→ loadUserProperties()
+       └─→ IUserMemoryStore.getVisibleEntries(userId, agentId, groupIds, recallOrder, maxEntries)
+       └─→ Visibility scoping: self + group + global entries are loaded
+       └─→ Converted to Property objects with scope=longTerm
+       └─→ Available as {properties.key} in all templates
+
+2. Pipeline runs
+   └─→ PropertySetterTask sets properties based on actions
+       └─→ scope=step (cleared per turn)
+       └─→ scope=conversation (lives for session)
+       └─→ scope=longTerm (persisted across conversations)
+       └─→ scope=secret (auto-vaulted via SecretsVault)
+
+3. Conversation turn ends
+   └─→ storePropertiesPermanently()
+       └─→ All longTerm properties saved via IUserMemoryStore.upsert()
+       └─→ Visibility applied at persistence boundary (explicit or config default)
+```
+
+> **Key insight**: Persistent state is a **session concern** handled in `Conversation.java` init/teardown — NOT a pipeline task. If your feature needs to load/save cross-conversation state, extend the Conversation init/teardown logic. Do NOT create a new `ILifecycleTask` for session-level concerns.
+
+#### Built-in Tool Execution Context
+
+LLM tools (annotated with `@Tool` from langchain4j) always execute **inside a conversation pipeline**. The execution path is:
+
+```
+LlmTask.execute(memory)
+  └─→ AgentOrchestrator.buildToolList(memory, config)
+      └─→ Constructs tool instances with conversation context
+  └─→ LLM invokes tool
+  └─→ ToolExecutionService.executeToolWrapped()
+      └─→ Rate Limiter → Cache Check → Execute → Cost Tracker → Result
+```
+
+`IConversationMemory` is always available when tools execute. Tools that need conversation state (e.g., `userId`, `agentId`) can receive it via constructor injection from `AgentOrchestrator`, which has the memory object at tool-list build time. There is no need for `ThreadLocal`, request-scoped beans, or tool parameters for implicit context.
+
+> **Key insight**: LLM tools operate inside a conversation — they should NEVER take `userId` as a parameter. The conversation always knows who the user is. Only external interfaces (MCP, REST) that operate outside a conversation need explicit user identification.
+
+#### Not Everything Is a Lifecycle Task
+
+A common mistake when adding new features is to reflexively create a new `ILifecycleTask`. Before doing so, ask:
+
+| Question                                                 | If yes →                                             | If no →    |
+| -------------------------------------------------------- | ---------------------------------------------------- | ---------- |
+| Does it process data **during** a pipeline turn?         | `ILifecycleTask`                                     | Not a task |
+| Does it need to react to **actions** from BehaviorRules? | `ILifecycleTask`                                     | Not a task |
+| Does it load/save state at **session boundaries**?       | Extend `Conversation.java` init/teardown             | —          |
+| Is it background/scheduled work?                         | Use `ScheduleFireExecutor`                           | —          |
+| Is it a new LLM capability?                              | Add to `builtInTools` in existing `LlmConfiguration` | —          |
+| Is it a new REST/MCP endpoint?                           | Add REST resource or MCP tool class                  | —          |
+| Does it add a new agent-level setting?                   | Add field to `AgentConfiguration`                    | —          |
+
+#### Reusable Infrastructure — Use Before Building
+
+Several infrastructure components are already built and should be reused, not duplicated:
+
+| Infrastructure                                           | What it does                                                                                                                    | Use it for                                                                                                                                                                                                   |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`ScheduleFireExecutor`** + **`SchedulePollerService`** | Cluster-aware scheduled task execution with fire logging, retries, and configurable conversation strategies (persistent vs new) | ANY background/scheduled work: Dream consolidation, async summarization, maintenance jobs. Never build custom schedulers.                                                                                    |
+| **`ToolExecutionService.executeToolWrapped()`**          | Rate limiting → cache check → execute → cost tracking pipeline for LLM tool calls                                               | Any operation that needs rate limiting, caching, or cost tracking.                                                                                                                                           |
+| **`ToolCostTracker`** (via ToolExecutionService)         | Dollar-based LLM cost tracking per conversation                                                                                 | Cost ceilings for background LLM jobs (use `maxCostPerRun` instead of `maxLlmCallsPerRun` — dollar amounts are more meaningful than call counts because different operations cost vastly different amounts). |
+| **`SecretResolver`**                                     | Vault-based secret resolution for API keys and credentials                                                                      | Any feature that needs secrets (LLM providers, external APIs).                                                                                                                                               |
+| **Micrometer `MeterRegistry`**                           | Metrics collection (counters, timers, gauges) exposed at `/q/metrics`                                                           | Always add metrics to new features for observability.                                                                                                                                                        |
+| **`SafeHttpClient`**                                     | SSRF-safe HTTP wrapper — `Redirect.NEVER` + per-hop validated redirects, configurable timeout                                   | ALL outbound HTTP from LLM tools and integrations. Never create `HttpClient.newBuilder()` in tool code.                                                                                                      |
+| **`UrlValidationUtils`**                                 | Blocks private IPs, loopback, link-local, cloud metadata, non-HTTP schemes                                                     | Always call before fetching user-controlled URLs.                                                                                                                                                            |
+| **`AuthStartupGuard`**                                   | Fails startup if OIDC disabled in prod without explicit opt-out                                                                 | Automatic — operators only need `QUARKUS_OIDC_TENANT_ENABLED=true`.                                                                                                                                          |
+| **`VaultSaltManager`**                                   | Per-deployment PBKDF2 salt for KEK derivation                                                                                   | Managed by `VaultSecretProvider` — no direct usage needed.                                                                                                                                                   |
+
+#### Group Conversations — Context Flow
+
+`GroupConversationService` orchestrates multi-agent discussions. When an agent participates in a group, the group context flows into its conversation:
+
+- `AgentGroupConfiguration` defines members (agents or nested groups), discussion style, and phases
+- `GroupConversationService.discuss()` creates individual conversations for each member agent
+- Group context (groupId, discussion phase, peer responses) is injected via the conversation's `Context` map
+- `GroupConversationEventSink` streams SSE events for real-time group discussion visibility
+- **Collaboration surfaces are opt-in by absence — but check which kind of absence.** For the two that expose **tools**, `artifactConfig` and `taskListConfig`, a null config means the tools are never *assembled*: they cost no prompt tokens and cannot be argued with, whereas a tool that exists and always says no invites retries. For `contextWindow` and `facilitator`, null means the behaviour does not run at all — no windowing pass, no checkpoint. But `retroConfig` and `humanMemberConfig` are **defaults, not switches**: a null `retroConfig` runs a RETRO phase with the default caps, and a null `humanMemberConfig` still pauses for a HUMAN member's turn — it just waits indefinitely. When adding a group capability, decide which of the three shapes you mean and say so in the field's Javadoc.
+
+When a feature needs to know which group an agent belongs to (e.g., persistent memory with `group` visibility), the groupId comes from the `GroupConversation` context — not from `AgentConfiguration`. The group is a runtime concern, not a static configuration.
+
+Adding a new `ILifecycleTask` is the **heaviest** option — it requires a configuration POJO, store interface, MongoDB store, REST interface, REST implementation, ExtensionDescriptor, and unit tests. Many features fit better as extensions to existing infrastructure.
+
+### 4.3 New Feature Checklist
+
+A new `ILifecycleTask` requires ALL of:
+
+- [ ] Configuration POJO (`*Configuration.java`, use Java records)
+- [ ] Store interface (`IResourceStore<T>`)
+- [ ] MongoDB store (`@ApplicationScoped`, `@ConfigurationUpdate` on update/delete)
+- [ ] REST interface (JAX-RS, extends `IRestVersionInfo`)
+- [ ] REST implementation (`@ApplicationScoped`)
+- [ ] `ExtensionDescriptor` (UI field definitions via `getExtensionDescriptor()`)
+- [ ] Unit test with Mockito
+
+> **Note on `@ConfigurationUpdate`:** it is declared in `IResourceStore` as an `@InterceptorBinding`, but **no `@Interceptor` class currently implements it** — today the annotation has no runtime behaviour and is purely a marker documenting "this method mutates stored configuration". Keep applying it for consistency with the existing stores, but do **not** rely on it to invalidate caches or fire events; caches such as `PromptSnippetService` use an explicit `invalidateCache()` plus a Caffeine TTL instead. Whether to implement the interceptor or drop the annotation is still open.
+
+All task implementations MUST implement: `getId()` (returns `TaskId`), `getType()`, `execute()`, `configure()`, `getExtensionDescriptor()`.
+
+### 4.4 Code Patterns
+
+#### Action Matching
+
+```java
+IData<List<String>> latestData = currentStep.getLatestData("actions");
+if (latestData == null) return;
+
+List<String> actions = latestData.getResult();
+for (MyTask task : configuration.tasks()) {
+    if (task.getActions().contains("*") ||
+        task.getActions().stream().anyMatch(actions::contains)) {
+        executeTask(memory, task, currentStep, templateDataObjects);
+    }
+}
+```
+
+#### Configuration Loading
+
+```java
+@Override
+public Object configure(Map<String, Object> configuration, Map<String, Object> extensions)
+        throws WorkflowConfigurationException {
+    Object uriObj = configuration.get("uri");
+    if (isNullOrEmpty(uriObj)) {
+        throw new WorkflowConfigurationException("No resource URI has been defined!");
+    }
+    URI uri = URI.create(uriObj.toString());
+    try {
+        return resourceClientLibrary.getResource(uri, MyFeatureConfiguration.class);
+    } catch (ServiceException e) {
+        throw new WorkflowConfigurationException(e.getLocalizedMessage(), e);
+    }
+}
+```
+
+#### Template Data Conversion
+
+```java
+@Inject IMemoryItemConverter memoryItemConverter;
+
+public void execute(IConversationMemory memory, Object component) {
+    Map<String, Object> templateDataObjects = memoryItemConverter.convert(memory);
+    // Use templateDataObjects with templating engine
+}
+```
+
+#### PrePostUtils
+
+```java
+@Inject PrePostUtils prePostUtils;
+
+// Before main logic
+prePostUtils.executePreRequestPropertyInstructions(memory, templateDataObjects, task.getPreRequest());
+// After main logic
+prePostUtils.executePostResponse(memory, templateDataObjects, response, task.getPostResponse());
+```
+
+#### Metrics (Micrometer)
+
+```java
+@Inject MeterRegistry meterRegistry;
+private Counter executionCounter;
+private Timer executionTimer;
+
+@PostConstruct
+void initMetrics() {
+    executionCounter = meterRegistry.counter("myfeature.execution.count");
+    executionTimer = meterRegistry.timer("myfeature.execution.time");
+}
+```
+
+#### Built-in Tool System
+
+Tools are injected via constructor, annotated with `@Tool` from langchain4j, and executed through `ToolExecutionService.executeToolWrapped()` (applies rate limiting, caching, cost tracking).
+
+```java
+@ApplicationScoped
+public class MyTool {
+    @Tool("Performs a specific operation")
+    public String doSomething(String input) {
+        return result;
+    }
+}
+```
+
+Pipeline: `Tool Call → Rate Limiter → Cache Check → Execute → Cost Tracker → Result`
+
+#### Tool Security
+
+- **Use `SafeHttpClient`** (`@Inject SafeHttpClient`) for ALL outbound HTTP — never create `HttpClient.newBuilder()` directly
+- **Always validate URLs** with `UrlValidationUtils.validateUrl(url)` before fetching user-controlled input
+- **Only allow `http`/`https`** — never `file://`, `ftp://`, etc.
+- **Block private/internal addresses** — handled automatically by `SafeHttpClient.sendValidated()`
+- **Never use `ScriptEngine`** — use a recursive-descent parser (e.g. `SafeMathParser`, a static inner class of `CalculatorTool` — inject `CalculatorTool`, not the parser)
+
+```java
+@Inject SafeHttpClient httpClient;
+
+@Tool("Fetches data from a URL")
+public String fetchData(@P("URL (http or https)") String url) {
+    try {
+        var request = HttpRequest.newBuilder().uri(URI.create(url)).GET().build();
+        var response = httpClient.sendValidated(request, HttpResponse.BodyHandlers.ofString());
+        return response.body();
+    } catch (Exception e) {
+        return "Error fetching URL: " + e.getMessage();
+    }
+}
+```
+
+### 4.5 Complete Task Example
+
+```java
+@ApplicationScoped
+public class MyFeatureTask implements ILifecycleTask {
+    public static final String ID = "ai.labs.myfeature";
+    private static final String KEY_ACTIONS = "actions";
+    private static final String KEY_MYFEATURE = "myfeature";
+
+    private final IResourceClientLibrary resourceClientLibrary;
+    private final IMemoryItemConverter memoryItemConverter;
+    private final IDataFactory dataFactory;
+    private static final Logger LOGGER = Logger.getLogger(MyFeatureTask.class);
+
+    @Inject
+    public MyFeatureTask(IResourceClientLibrary resourceClientLibrary,
+                         IMemoryItemConverter memoryItemConverter,
+                         IDataFactory dataFactory) {
+        this.resourceClientLibrary = resourceClientLibrary;
+        this.memoryItemConverter = memoryItemConverter;
+        this.dataFactory = dataFactory;
+    }
+
+    @Override public TaskId getId() { return new TaskId(ID); }
+    @Override public String getType() { return KEY_MYFEATURE; }
+
+    @Override
+    public void execute(IConversationMemory memory, Object component) throws LifecycleException {
+        final var config = (MyFeatureConfiguration) component;
+        IWritableConversationStep currentStep = memory.getCurrentStep();
+        IData<List<String>> latestData = currentStep.getLatestData(KEY_ACTIONS);
+        if (latestData == null) return;
+
+        var templateDataObjects = memoryItemConverter.convert(memory);
+        var actions = latestData.getResult();
+
+        for (var task : config.tasks()) {
+            if (task.getActions().contains("*") ||
+                task.getActions().stream().anyMatch(actions::contains)) {
+                executeTask(memory, task, currentStep, templateDataObjects);
+            }
+        }
+    }
+
+    private void executeTask(IConversationMemory memory, MyFeatureTask task,
+                            IWritableConversationStep currentStep,
+                            Map<String, Object> templateDataObjects) {
+        String result = performOperation(task);
+        var data = new Data<>(KEY_MYFEATURE + ":result", result);
+        data.setPublic(true);
+        currentStep.storeData(data);
+        currentStep.addConversationOutputString(KEY_MYFEATURE, result);
+    }
+
+    @Override
+    public Object configure(Map<String, Object> configuration, Map<String, Object> extensions)
+            throws WorkflowConfigurationException {
+        Object uriObj = configuration.get("uri");
+        if (isNullOrEmpty(uriObj)) throw new WorkflowConfigurationException("No resource URI defined!");
+        URI uri = URI.create(uriObj.toString());
+        try {
+            return resourceClientLibrary.getResource(uri, MyFeatureConfiguration.class);
+        } catch (ServiceException e) {
+            throw new WorkflowConfigurationException(e.getLocalizedMessage(), e);
+        }
+    }
+
+    @Override
+    public ExtensionDescriptor getExtensionDescriptor() {
+        ExtensionDescriptor descriptor = new ExtensionDescriptor(getId());
+        descriptor.setDisplayName("My Feature");
+        ConfigValue uriConfig = new ConfigValue("Resource URI", FieldType.URI, false, null);
+        descriptor.getConfigs().put("uri", uriConfig);
+        return descriptor;
+    }
+}
+```
+
+### 4.6 Output Format for New Features
+
+When implementing a new feature, provide:
+
+1. **Implementation plan** (2-3 bullet points)
+2. **Complete code** for ALL required files:
+   - `*Configuration.java` (POJO / record)
+   - `*Task.java` (`ILifecycleTask` implementation)
+   - `I*Store.java` (store interface)
+   - `*Store.java` (MongoDB implementation)
+   - `IRest*Store.java` (JAX-RS interface)
+   - `Rest*Store.java` (JAX-RS implementation)
+3. **Sample JSON config** showing how an agent developer uses the feature
+4. **Unit test** (`@QuarkusTest`, Mockito mocks, verify memory reads/writes)
+
+### 4.7 Best Practices & Common Pitfalls
+
+#### Thread Safety
+
+- Tasks are singletons — never store conversation data in instance variables
+- All state must be in `IConversationMemory`
+- When checking-then-acting on shared state, wrap in `synchronized` block
+
+#### Null Safety
+
+- Always check `getLatestData()` for null before `.getResult()`
+- Handle null/empty lists when reading actions
+- Use `isNullOrEmpty()` utility for string checks
+
+#### Error Handling
+
+- Wrap external API exceptions in `LifecycleException`
+- Log errors with context (conversation ID, agent ID)
+- Don't let exceptions kill the pipeline — handle gracefully
+
+#### Performance
+
+- Cache expensive resources (models, compiled templates)
+- Use `@PostConstruct` for one-time initialization
+- Track metrics to identify bottlenecks
+- Avoid blocking operations in task execution
+
+#### Memory Management
+
+- Use `data.setPublic(true)` only for output-visible data
+- Don't store large objects in conversation memory unnecessarily
+
+#### Configuration
+
+- Validate in `configure()` method
+- Provide sensible defaults
+- Use descriptive error messages in `WorkflowConfigurationException`
+
+#### Logging
+
+- Use JBoss Logger, not System.out
+- Include conversation context in logs
+- Use appropriate levels: DEBUG (verbose), INFO (important events), ERROR (failures)
+
+#### Imports
+
+- **Always reference types and annotations by their simple name with a top-level `import`** — never inline a fully-qualified name (e.g. write `@Inject IAttachmentStore store;` with the imports, not `@jakarta.inject.Inject ai.labs.eddi.engine.attachments.IAttachmentStore store;`). FQNs in field declarations, method signatures, annotations, and generics hurt readability and are a common review comment.
+- The **only** acceptable inline FQN is disambiguating two classes that share a simple name and are both used in the same file — and even then, prefer restructuring so only one is imported.
+- Don't leave unused imports behind after a refactor; run `./mvnw formatter:format` and `./mvnw validate` (Checkstyle) before committing. Both are enforced, not advisory: `UnusedImports` and `RedundantImport` carry `severity="error"` in `checkstyle.xml` and the plugin fails on them, and `formatter:validate` fails on unformatted sources instead of rewriting them — so any `./mvnw compile`, `test` or `verify` will stop on either. **Mind the scopes, they differ:** `formatter:validate` grades `src/main/java` *and* `src/test/java`, but the Checkstyle gate sets `includeTestSourceDirectory=false`, so its import rules grade **`src/main/java` only** — an unused import in a test still compiles and still merges. Keep test imports clean by hand; the flag stays off until the 163 pre-existing violations in `src/test/java` are cleared, and `BuildQualityGatesTest` fails if the flag and this sentence ever disagree.
+
+#### Production-Scale Thinking
+
+When designing any new feature, always consider these before finalizing the design:
+
+- **Race conditions**: If multiple agents/conversations can write the same data, what happens on concurrent writes? Use appropriate upsert key granularity.
+- **Unbounded growth**: Can users/LLMs create unlimited entries? Add configurable caps with clear UX for when limits are reached (actionable error messages, not silent failures).
+- **LLM abuse**: If an LLM can invoke a tool, it can invoke it 100 times in one turn with garbage data. Add per-turn write limits, value size limits, and input validation.
+- **Cost at scale**: If a feature uses LLM calls in background jobs, what happens with 10,000 users? Use dollar-based cost ceilings (`maxCostPerRun`) instead of call counts — call counts are meaningless because different operations cost vastly different amounts. Add incremental processing (only process what changed since last run) and round-robin fairness.
+- **Implicit context**: If code runs inside a conversation, don't pass `userId`/`agentId` as explicit parameters — the conversation always knows who the user is. Only external interfaces (REST, MCP) need explicit identification.
+- **Unification over duplication**: Before creating a parallel system (e.g., new store alongside old store), ask: can the new system replace the old one? Prefer unified systems with legacy compat methods over dual storage. When two features need similar infrastructure (e.g., LLM-based summarization for both Dream consolidation and conversation context), build one shared service, not two parallel implementations.
+- **Full data is never deleted by optimization**: Context management strategies (summarization, windowing) are about what the LLM _sees_, not what is _stored_. The full conversation is always preserved in MongoDB. Summaries are derived views, not destructive transformations. If an agent needs to access the full original, it should be able to (via tools, REST API, or debugger).
+
+### Key Files
+
+| File                                        | Purpose                                                     |
+| ------------------------------------------- | ----------------------------------------------------------- |
+| `src/main/docker/Dockerfile`                | Production JVM container image (digest-pinned base)         |
+| `src/main/resources/application.properties` | Quarkus config (CORS, health, OpenAPI, MongoDB)             |
+| `.github/workflows/ci.yml`                  | CI/CD pipeline (build, test, Docker push, smoke test)       |
+| `docs/`                                     | Markdown documentation, published at docs.labs.ai           |
+| `ui/manager/`, `ui/chat/` | The Manager and Chat UI sources (React, Vite, TypeScript). Each has its own `AGENTS.md`; CI runs them in `UI Manager Checks`, `UI Manager E2E (MSW)`, `UI Chat`, `Backend E2E` and `Auth E2E (Keycloak)` |
+| `docker-compose.yml`                        | EDDI + MongoDB local setup                                  |
+| `mise.toml`                                 | Optional [mise](https://mise.jdx.dev) toolchain (pinned JDK 25 + Maven) + task shortcuts |
+| `docs/agent-configs/`                       | Worked agent config sources — reference for AI; partially swept by two unit tests (scope in §5.6) |
+| `src/main/java/.../httpclient/SafeHttpClient.java` | Centralized SSRF-safe HTTP client wrapper              |
+| `src/main/java/.../security/AuthStartupGuard.java` | Production auth enforcement guard                      |
+| `.env.example`                              | Docker Compose env var reference (copy to `.env`; optional for basic local dev) |
+
+### Docker & Container Security
+
+#### Base Image Management
+
+The production image (`Dockerfile`) uses a Red Hat UBI 10 base pinned by **SHA256 digest** for OpenSSF supply-chain compliance. This means:
+
+- Every `FROM` line must include `@sha256:...` — never use a bare tag like `:1.24`
+- The build is multi-stage (`docs` and `runtime`) and **both stages carry the same pin**. Move them together: `base-image-check.yml` reads the last `FROM` but its `sed` rewrites every line carrying the pin, so bumping one leaves a stale base in the image and desynchronises the automation
+- Red Hat periodically republishes the same tag with security patches baked in
+- `ContainerBaseIT` builds its image from this file via `EddiImageDockerfile.forTestContext()`, so the pin cannot drift — never restate the image reference in test code
+
+RHEL 10 carries two constraints the `FROM` line documents in full and that any change here must preserve: a **x86-64-v3 host CPU floor** (glibc refuses to start below it) and a crypto policy that **disables the static-RSA TLS 1.2 suites** for the JVM as well as the OS.
+
+#### Trivy CVE Remediation Procedure
+
+When Trivy (CI container scan) flags a base image CVE:
+
+1. **Check for a newer digest first** — pull the latest image for the same tag and compare:
+   ```bash
+   docker pull registry.access.redhat.com/ubi10/openjdk-25-runtime:1.24
+   # Check the digest in the pull output
+   docker run --rm <image> rpm -q <vulnerable-package>
+   ```
+2. **If the newer digest includes the fix**: update the `@sha256:...` in `Dockerfile` — done
+3. **If no fixed digest exists yet**: use `microdnf update -y <package> && microdnf clean all` as a **temporary stopgap** in the `USER root` section, with a CVE comment. Remove it once a fixed base image is available
+4. **Never remove the digest pin** to "auto-fix" CVEs — this violates OpenSSF supply-chain requirements
+
+> **Key principle**: Digest update is the clean fix. `microdnf update` is the escape hatch.
+
+---
+
+## 5. Agent Config Authoring Reference
+
+> **This section prevents wrong assumptions when writing agent JSON configs.** Always consult this when building behavior rules, property setters, output configs, or HTTP calls.
+
+### 5.1 Template Syntax
+
+EDDI v6 uses **Qute templates** with `{expression}` syntax, NOT Thymeleaf `[[${expression}]]`.
+
+#### ⚠️ Critical: `properties` returns RAW values, NOT Property objects
+
+`MemoryItemConverter.convert()` puts `ConversationProperties.toMap()` into the template context. The `toMap()` method returns **raw Java values** (String, Integer, Map, etc.), NOT `Property` objects.
+
+```
+✅ CORRECT:   {properties.agentName}        → returns the String value
+❌ WRONG:     {properties.agentName.valueString}  → fails at runtime (String has no .valueString)
+```
+
+This is because `ConversationProperties.put()` stores `property.getValueString()` (or `getValueObject()`, etc.) directly into the internal `propertiesMap`. By the time templates see it, the Property wrapper is gone.
+
+#### Template variables available in all contexts
+
+| Variable                            | Returns                            | Example                                      |
+| ----------------------------------- | ---------------------------------- | -------------------------------------------- |
+| `{properties.key}`                  | Raw value (string, int, map)       | `{properties.agentName}`                     |
+| `{memory.current.input}`            | User's input text for current step | Used in property setter to capture free-text |
+| `{memory.current.output}`           | Output text for current step       |                                              |
+| `{memory.last.input}`               | Previous step's input              |                                              |
+| `{context.key}`                     | Context variable set by client     | `{context.language}`                         |
+| `{snippets.name}`                   | Prompt snippet content             | `{snippets.cautious_mode}`                   |
+| `{vars.key}`                        | Global variable value              | `{vars.default-model}`                       |
+| `{userInfo.userId}`                 | Authenticated user ID              |                                              |
+| `{conversationInfo.agentId}`        | Current agent ID                   |                                              |
+| `{conversationInfo.conversationId}` | Current conversation ID            |                                              |
+| `{conversationLog}`                 | Formatted conversation history     |                                              |
+
+### 5.2 Conversation Lifecycle for Rule-Based Agents
+
+```
+1. Conversation.init()
+   └─→ Step 0 created
+   └─→ CONVERSATION_START action added to step 0
+   └─→ Pipeline runs with empty input ("")
+   └─→ Output for CONVERSATION_START fires (greeting shown BEFORE user says anything)
+
+2. User sends first message → say(message)
+   └─→ Step 1 created (startNextStep)
+   └─→ User input stored in memory
+   └─→ Behavior rules evaluate:
+       • lastStep = Step 0 (has CONVERSATION_START action)
+       • currentStep = Step 1 (has user's input/expressions)
+   └─→ Output fires for matched actions
+
+3. User sends second message → say(message)
+   └─→ Step 2 created
+   └─→ lastStep = Step 1, currentStep = Step 2
+   └─→ ... and so on
+```
+
+> **Key insight**: The greeting output fires automatically at `init()` — the user doesn't need to type anything first.
+
+### 5.3 Behavior Rule Safety Rules
+
+#### Every rule MUST have an `actionmatcher` on `lastStep`
+
+Behavior rules within a group ALL fire if their conditions match. Rules with only `inputmatcher` conditions are dangerous — they match globally regardless of conversation state.
+
+```
+❌ DANGEROUS: Rule fires on ANY step if user somehow sends matching expression
+{
+  "name" : "Start over",
+  "actions" : [ "ask_for_agent_name" ],
+  "conditions" : [ {
+    "type" : "inputmatcher",
+    "configs" : { "expressions" : "start_over", "occurrence" : "currentStep" }
+  } ]
+}
+
+✅ SAFE: Rule only fires when the confirmation step was the previous step
+{
+  "name" : "Start over",
+  "actions" : [ "ask_for_agent_name" ],
+  "conditions" : [ {
+    "type" : "actionmatcher",
+    "configs" : { "actions" : "confirm_creation", "occurrence" : "lastStep" }
+  }, {
+    "type" : "inputmatcher",
+    "configs" : { "expressions" : "start_over", "occurrence" : "currentStep" }
+  } ]
+}
+```
+
+#### Quick reply expressions must be unique identifiers
+
+Do NOT reuse system action names as quick reply expressions. The reserved actions are `CONVERSATION_START`, `CONVERSATION_END`, `STOP_CONVERSATION`, and `PAUSE_CONVERSATION` (the HITL human-approval gate — see [`docs/hitl.md`](docs/hitl.md)). Use dedicated identifiers:
+
+```
+❌ WRONG:  "expressions" : "CONVERSATION_START"   (system action name)
+✅ RIGHT:  "expressions" : "get_started"           (dedicated identifier)
+```
+
+> **HITL**: EDDI has two human-approval gates. (1) A behavior rule that emits `PAUSE_CONVERSATION` gates a **whole turn** — the conversation pauses (`AWAITING_HUMAN`) until a human approves or rejects via `POST /agents/{conversationId}/resume`. (2) `hitlConfig.toolApprovals` gates **individual LLM tool calls** — when the model invokes a tool matching a `requireApproval` pattern (any of the 7 tool sources: `builtin`, `http`, `mcp`, `a2a`, `dynamic`, `memory`, `recall`), the conversation pauses *before* the tool runs (`hitlPauseType: "TOOL_CALL"`, resumed through the same endpoint). Both share the same pause/timeout/audit/Slack machinery; timeout behavior is configured via `hitlConfig` on the agent (with a tool-level override). Full reference: [`docs/hitl.md`](docs/hitl.md).
+
+#### `actionmatcher` comma-separated values = AND (contiguous sublist), NOT OR
+
+When you specify `"actions" : "action_a,action_b"`, the engine checks if BOTH actions appear as a **contiguous sublist** of the step's action list (`Collections.indexOfSubList`). This means ALL listed actions must be present — it is AND semantics, not OR.
+
+```
+❌ WRONG — tries to match any of these, but actually requires ALL FIVE contiguously:
+"actions" : "ask_for_model,ask_for_model_ollama,ask_for_model_jlama,ask_for_model_bedrock,ask_for_model_oracle"
+
+✅ RIGHT — Option A: emit a common action alongside provider-specific ones:
+Rule actions: [ "set_provider_ollama", "ask_for_model", "ask_for_model_ollama" ]
+Matcher:      "actions" : "ask_for_model"
+
+✅ RIGHT — Option B: use a connector with OR operator:
+{
+  "type" : "connector",
+  "configs" : { "operator" : "OR" },
+  "conditions" : [ {
+    "type" : "actionmatcher",
+    "configs" : { "actions" : "ask_for_model", "occurrence" : "lastStep" }
+  }, {
+    "type" : "actionmatcher",
+    "configs" : { "actions" : "ask_for_model_ollama", "occurrence" : "lastStep" }
+  } ]
+}
+```
+
+### 5.4 Property Setter Patterns
+
+#### Scope values
+
+| Scope          | Behavior                                                                                                                                      |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `step`         | Cleared at end of turn                                                                                                                        |
+| `conversation` | Lives for the session (default for most agent-building properties)                                                                            |
+| `longTerm`     | Persisted to `usermemories` collection across conversations                                                                                   |
+| `secret`       | Auto-vaulted: plaintext stored in SecretsVault, raw input scrubbed from memory, vault reference (`${vault:...}`) stored as property value |
+
+> **Warning**: `scope: "secret"` requires the vault to be active (`EDDI_VAULT_MASTER_KEY` env var set). If the vault is disabled — which is the shipped default — `autoVaultSecret()` **fails closed**: it scrubs the plaintext from the conversation step, logs an ERROR, and throws a `LifecycleException` naming `EDDI_VAULT_MASTER_KEY`. The whole turn fails; the plaintext is never persisted. (An earlier release persisted the plaintext instead; that behaviour was removed deliberately — see the comment in `PropertySetterTask.autoVaultSecret` and `docs/properties.md`.) For wizard-style agents that collect API keys and pass them to an endpoint (see §5.6), prefer `scope: "conversation"` and delegate vaulting to the receiving service — a dev instance without a master key cannot complete a secret-scoped turn at all.
+
+#### Capturing user input vs. setting fixed values
+
+```json
+// Capture free-text input from user
+{ "name" : "agentName", "valueString" : "{memory.current.input}", "scope" : "conversation" }
+
+// Set a fixed value (from quick reply selection)
+{ "name" : "provider", "valueString" : "anthropic", "scope" : "conversation" }
+
+// When a quick reply has a default value, use a dedicated action + fixed value
+{ "name" : "baseUrl", "valueString" : "http://localhost:11434", "scope" : "conversation" }
+```
+
+#### Qute template safety in HTTP call bodies
+
+When embedding `{properties.x}` in HTTP call body templates, be aware:
+- A missing property renders as an **empty string**, in every profile. This takes *two* settings in `application.properties`, and both are deliberate:
+  - `quarkus.qute.strict-rendering=false` stops the render from throwing. There is no `%prod` override — dev, test and production must fail identically. (Earlier releases turned strict rendering **on** in prod only, which meant a missing property rendered blank in dev but leaked the raw `{properties.x}` literal to the end user in production.)
+  - `quarkus.qute.property-not-found-strategy=NOOP` decides what is written instead. Without it a missing value resolves to Qute's NotFound sentinel and the **literal string `NOT_FOUND`** reaches the output — system prompts, HTTP call bodies and user-visible replies alike ("Your favourite programming language is: NOT_FOUND."). Dev mode defaults to throwing instead, so the two did not even agree. This was a live defect, not a hypothetical.
+- Do NOT use `.orEmpty` on properties — it's for Qute iterables, not strings, and fails on `NOT_FOUND`. If you want an explicit fallback in the template itself, the Qute idiom is the elvis operator: `{properties.x ?: 'unknown'}`
+- User-entered text containing `{` or `}` will be interpreted as Qute expressions, potentially eating content
+
+#### Calling an API as the signed-in user
+
+An HTTP call **header** may reference the authenticated caller, so the agent
+calls the API with that user's credentials instead of a static one:
+
+| Reference | Resolves to |
+| --------- | ----------- |
+| `${caller:token}` | The caller's raw bearer token |
+| `${caller:userId}` | The caller's principal name (not a secret) |
+
+```json
+"headers": { "Authorization": "Bearer ${caller:token}" }
+```
+
+Use this whenever the agent calls **EDDI's own API**. A static credential there
+expires within the hour, cannot be least-privilege, and attributes every action
+to one synthetic principal.
+
+Resolution is narrow and fails loudly rather than degrading quietly:
+- **Same origin, or EDDI itself** — released only to the exact
+  `scheme://host:port` the caller addressed (read from the inbound request, not
+  config), or to this deployment's own address (`SelfUrlResolver`:
+  `eddi.self.base-url`, else `http://127.0.0.1:${quarkus.http.port}` — deployment
+  config only, never agent config or a request; on a random port
+  (`quarkus.http.port=0`) with no override it is *unresolved* and only the
+  caller's origin qualifies). A config naming a third-party
+  host cannot exfiltrate the token. The self address bypasses any reverse proxy,
+  so EDDI's own authorization is what guards it; a deployment that also relies on
+  proxy path rules sets `eddi.caller-identity.self-release.enabled=false`. A
+  caller whose origin could not be captured never gets the self release.
+- **Headers only** — `${caller:token}` in a query parameter, request body or
+  path is rejected. `${caller:userId}` is allowed in headers and query
+  parameters. An MCP server's `apiKey` may also carry it, which sends the tool
+  call as the chatting user (see [`docs/mcp-server.md`](docs/mcp-server.md)).
+- **Authenticated turns only** — scheduled jobs and triggers cannot satisfy it.
+- **Fails closed** — an unsatisfiable reference errors instead of sending
+  `"Bearer "` with an empty token.
+
+The token is never persisted: authorization headers are scrubbed before the
+request is written to conversation memory. Disable with
+`eddi.caller-identity.enabled=false`. Full reference: [`docs/httpcalls.md`](docs/httpcalls.md).
+
+#### Requesting specialized input fields from the UI
+
+The output system supports an `inputField` output type that tells the UI to switch its input control. Both the **Manager** (`SecretInputField` in `ui/manager`'s `chat-panel.tsx`) and the **Chat UI** (`SecretInput.tsx` in `ui/chat`) handle this natively.
+
+```json
+{
+  "valueAlternatives": [{
+    "type": "inputField",
+    "subType": "password",
+    "placeholder": "Paste your API key here",
+    "label": "API Key"
+  }]
+}
+```
+
+Supported `subType` values: `"password"`, `"text"`, `"email"`. When the UI receives an `inputField` in the output array, it replaces the standard text input with the appropriate specialized field for that turn. The field reverts to normal text input on the next response.
+
+> **Key pattern**: Add the `inputField` output item alongside regular `text` outputs in the same action's output set. The text explains what the user should enter, and the `inputField` controls how the input is rendered.
+
+### 5.5 ZIP Structure for Agent Import
+
+Agent ZIP files are imported via `RestImportService`. **All IDs in URIs and filenames must be valid hex identifiers** (24-char hex strings like MongoDB ObjectIds, or UUIDs). The import service validates IDs via `RestUtilities.isValidId()` which requires ≥18 hex characters (`0-9a-fA-F` and dashes). Semantic names like `my-agent-wf1` will be rejected.
+
+The file naming convention is `{id}.{type}.json` where `{id}` matches the last path segment of the resource URI:
+
+```
+{agentId}.agent.json              → Agent configuration
+{agentId}.descriptor.json         → Agent descriptor (name, description, version)
+{workflowId}/
+  1/
+    {workflowId}.workflow.json    → Workflow definition
+    {workflowId}.descriptor.json
+    {behaviorId}.behavior.json    → Behavior rules (file ext stays "behavior", URI uses "rules")
+    {behaviorId}.descriptor.json
+    {propertyId}.property.json    → Property setter
+    {propertyId}.descriptor.json
+    {httpcallsId}.httpcalls.json  → HTTP API calls (file ext stays "httpcalls", URI uses "apicalls")
+    {httpcallsId}.descriptor.json
+    {outputId}.output.json        → Output messages + quick replies
+    {outputId}.descriptor.json
+    {llmId}.langchain.json        → LLM configuration (file ext stays "langchain", URI uses "llm")
+    {llmId}.descriptor.json
+    {dictionaryId}.regulardictionary.json → Regular dictionary (URI uses "dictionary")
+    {dictionaryId}.descriptor.json
+    {mcpId}.mcpcalls.json         → MCP tool calls
+    {mcpId}.descriptor.json
+    {ragId}.rag.json              → RAG retrieval configuration
+    {ragId}.descriptor.json
+snippets/
+  {snippetId}.snippet.json        → Prompt snippets (root, agent, or version level)
+schedules/
+  {scheduleId}.schedule.json      → Agent schedules
+connections/
+  {connectionId}.connection.json  → Connections the configs reference as ${connection:name} (references only — never resolved secrets, never grants; skipped on import when the name already exists)
+```
+
+> The authoritative list of file extensions is `AbstractBackupService`'s `*_EXT` constants —
+> thirteen of them. Check against that file rather than against this block if the two ever disagree.
+
+> **Important**: File extensions use legacy names (`behavior`, `httpcalls`, `langchain`) while URIs use v6 names (`rules`, `apicalls`, `llm`). The import service maps between them via `AbstractBackupService` constants.
+
+> **Pipeline step**: If your output templates contain `{properties.x}` placeholders, you **must** include `eddi://ai.labs.templating` as the last workflow step. Without it, Qute expressions are not resolved.
+
+
+#### URI format (v6 canonical)
+
+Always use v6 canonical URIs in new configs:
+
+| Resource   | URI Pattern                                                                  |
+| ---------- | ---------------------------------------------------------------------------- |
+| Agent      | `eddi://ai.labs.agent/agentstore/agents/{id}?version=1`                      |
+| Workflow   | `eddi://ai.labs.workflow/workflowstore/workflows/{id}?version=1`             |
+| Rules      | `eddi://ai.labs.rules/rulestore/rulesets/{id}?version=1`                     |
+| ApiCalls   | `eddi://ai.labs.apicalls/apicallstore/apicalls/{id}?version=1`               |
+| Property   | `eddi://ai.labs.property/propertysetterstore/propertysetters/{id}?version=1` |
+| Output     | `eddi://ai.labs.output/outputstore/outputsets/{id}?version=1`                |
+| LLM        | `eddi://ai.labs.llm/llmstore/llms/{id}?version=1`                            |
+| Dictionary | `eddi://ai.labs.dictionary/dictionarystore/dictionaries/{id}?version=1`      |
+
+> Legacy URIs (e.g. `ai.labs.bot/botstore/bots/`) are auto-normalized by `AbstractBackupService.normalizeLegacyUris()` during import, but new configs should always use v6 format.
+
+#### Workflow step types
+
+| Step `type`                | Config URI prefix             | Required?                   |
+| -------------------------- | ----------------------------- | --------------------------- |
+| `eddi://ai.labs.parser`    | — (no config URI)             | Yes — always first          |
+| `eddi://ai.labs.behavior`  | `eddi://ai.labs.rules/...`    | Yes — the orchestrator      |
+| `eddi://ai.labs.property`  | `eddi://ai.labs.property/...` | Optional — slot-filling     |
+| `eddi://ai.labs.httpcalls` | `eddi://ai.labs.apicalls/...` | Optional — API calls        |
+| `eddi://ai.labs.output`    | `eddi://ai.labs.output/...`   | Usually yes — user messages |
+| `eddi://ai.labs.llm`       | `eddi://ai.labs.llm/...`      | Optional — LLM interaction  |
+| `eddi://ai.labs.mcpcalls`  | `eddi://ai.labs.mcpcalls/...` | Optional — MCP tool calls   |
+| `eddi://ai.labs.rag`       | `eddi://ai.labs.rag/...`      | Optional — binds a knowledge base; retrieval itself runs inside the LLM task |
+| `eddi://ai.labs.templating`| — (no config URI)             | Yes when any output or system prompt contains `{…}` placeholders — must be last |
+
+### 5.6 Reference Implementation
+
+`docs/agent-configs/rule-based-reference/` is a complete, working, rule-based agent config — a conversational wizard that provisions another agent over EDDI's own REST API. It is a **reference and test fixture only**: nothing ships or deploys it, and agents are created in practice through the Manager's Platform Operator, its agent wizard, or the setup API. Use it as the canonical reference for:
+
+- Behavior rule patterns with `actionmatcher` + `inputmatcher`
+- Property setter capturing free-text input via `{memory.current.input}` (it uses `scope: "conversation"` throughout and delegates secret vaulting to the receiving `create_agent` HTTP call — the wizard pattern from §5.4, deliberately **not** `scope: "secret"`)
+- HTTP call template syntax
+- Output with quick replies
+- Provider-aware branching (local vs. cloud LLM providers). Its chooser offers 11 options, which is not the same as the "12 providers" quoted elsewhere — the two are counted differently (the chooser splits `gemini` / `gemini_vertex`; the platform figure folds in OpenAI-compatible endpoints such as DeepSeek and Cohere). Don't reconcile them by editing this fixture: it is a worked example, not a provider catalogue. `docs/langchain.md` is the source of truth for what EDDI supports.
+
+Two unit tests sweep `docs/agent-configs`, so breaking this config fails the plain unit run — but mind what they actually check. `StrictBoundaryShippedConfigsTest` parses only files whose suffix is in its `BY_SUFFIX` map (descriptors, patches and unmapped names are counted as *skipped*, not passed), and `RuleSetStoreShippedRulesetsTest` validates only documents containing `behaviorGroups`. Neither opens a ZIP. So a green sweep means "the config documents this fixture supplies still parse and still save", not "every file here is valid".
+
+---
+
+## 6. Session Protocol
+
+**If picking up from a previous session:**
+
+1. Run `git log -5 --oneline` and `git branch --show-current` to see recent commits and the active branch
+2. Run `git status` to check for uncommitted changes
+3. Check which phase/item from Section 3 is currently in progress
+4. Read [`docs/changelog.md`](docs/changelog.md) — and list [`docs/changelog.d/`](docs/changelog.d/README.md), which holds anything newer — for latest changes and decisions
+
+**If ending a session (or at a natural break point):**
+
+1. Commit all working code (even partial) with `wip:` prefix if incomplete
+2. Add your entry under [`docs/changelog.d/`](docs/changelog.d/README.md) (§2 rule 8) with:
+   - What was completed (with commit hashes)
+   - What's next (the specific Phase/Item from Section 3)
+   - Any open questions or decisions needed
+3. **Suggest a new conversation** if:
+   - A phase is complete
+   - A major item (3+ SP) is done and tests pass
+   - Context is getting long (many files explored)

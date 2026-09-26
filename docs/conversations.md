@@ -1,0 +1,672 @@
+# Conversations
+
+## Overview
+
+**Conversations** are the primary interaction mechanism in EDDI. Each conversation represents a stateful dialog session between a user and an agent, maintaining complete history, context, and state throughout the interaction.
+
+### Key Concepts
+
+- **Stateful Sessions**: Each conversation maintains its own state (conversation memory) that persists across multiple interactions
+- **Conversation ID**: Unique identifier that references a specific conversation session
+- **Lifecycle States**: Conversations transition through states: `READY`, `IN_PROGRESS`, `ENDED`, `EXECUTION_INTERRUPTED`, `ERROR`, `AWAITING_HUMAN`
+- **History Management**: Full conversation history is maintained, with support for undo/redo operations
+- **Context Passing**: External context can be injected into conversations at any step
+
+### How Conversations Work in EDDI
+
+When you create a conversation:
+
+1. EDDI creates a new `IConversationMemory` object
+2. Assigns a unique conversation ID
+3. Links it to a specific agent and user
+4. Initializes the first conversation step
+5. Returns the conversation ID for subsequent interactions
+
+Each message sent to a conversation:
+
+1. Loads the conversation memory from MongoDB/cache
+2. Executes the agent's lifecycle pipeline
+3. Updates the conversation memory with results
+4. Saves the updated memory
+5. Returns the agent's response
+
+> **Time Travel Feature**: EDDI has a powerful feature for conversations—the ability to go back in time using the `/undo` and `/redo` API endpoints!
+
+## Working with Conversations
+
+In this section we will explain how to **send/receive messages** from an Agent. The first step is creating a `conversation`. Once you have the `conversation` `Id`, you can **send** messages via **`POST`** requests and **receive** responses via **`GET`** requests, while having the capacity to send context information through the body of the **POST** request.
+
+## Creating/initiating a conversation :
+
+### &#x20;Create a Conversation with an Agent REST API Endpoint
+
+| Element           | Tags                                                                                           |
+| ----------------- | ---------------------------------------------------------------------------------------------- |
+| **HTTP Method**   | `POST`                                                                                         |
+| **API endpoint**  | `/agents/{agentId}/start`                                                                     |
+| {**agentId**}     | (`Path` **parameter**):`String Id` of the agent that you wish to **start conversation with**.  |
+| environment       | (`Query` **parameter**, optional):`String` Deployment environment. **Default**: `production`.  |
+
+### Response Model
+
+`/start` itself returns `201` with a `location` header and **no body**. The model below is the conversation memory snapshot returned by the send (`POST /agents/{conversationId}`) and receive (`GET /agents/{conversationId}`) endpoints.
+
+```javascript
+{
+  "agentId": "string",
+  "agentVersion": Integer,
+  "userId": "string",
+  "environment": "string",
+  "conversationState": "string",
+  "undoAvailable": Boolean,
+  "redoAvailable": Boolean,
+  "conversationOutputs": [
+                "input"    :    "string",
+                "expressions"    :    <arrayOfString>,
+                "intents" :        <arrayOfString>,
+                "actions"    :    <arrayOfString>,
+                "httpCalls"    :    {JsonObject},
+                "properties" :    <arrayOfString>,
+                "output" : "string"
+    ],
+  "conversationProperties": {
+        "<nameOfProperty>" : {
+      "name" : "string",
+      "value" : "string" | {JsonObject},
+      "scope" : "string"
+    }},
+  "conversationSteps": [
+    {
+      "conversationStep": [
+        {
+          "key": "string",
+          "value": {}
+        }
+      ],
+      "timestamp": "dateTime"
+    }
+  ]
+}
+```
+
+### Description of the Conversation response model
+
+| Element                        | Tags                                                                                                                                                                                                                                                                               |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **agentId**                    | (`String`) The id of the agent that sent the reply.                                                                                                                                                                                                                                |
+| agentVersion                   | (`integer`) The version of the agent that sent the reply.                                                                                                                                                                                                                          |
+| userId                         | (`String`) The id of the user who interacted with the agent.                                                                                                                                                                                                                       |
+| environment                    | (`String`) the name of the environment where the agent is deployed                                                                                                                                                                                                                 |
+| conversationState              | <p>(<code>String</code>) The state of the current conversation, could be:</p><p><code>READY</code>, </p><p><code>IN_PROGRESS</code>, </p><p><code>ENDED</code>, </p><p><code>EXECUTION_INTERRUPTED</code>, </p><p><code>ERROR</code>, </p><p><code>AWAITING_HUMAN</code> (paused for human approval — resume via <code>POST /agents/{conversationId}/resume</code>)</p> |
+| undoAvailable                  | (`boolean`) `true` when at least one conversation step can be undone.                                                                                                                                                                                                             |
+| redoAvailable                  | (`boolean`) `true` when at least one undone step can be redone. It is a flag, not a depth — the redo cache can hold several steps.                                                                                                                                                |
+| conversationOutputs            | (`Array`: <`conversationOutput`>) Array of `conversationOutput`                                                                                                                                                                                                                    |
+| conversationOutput.input       | (`String`) The user's input.                                                                                                                                                                                                                                                       |
+| conversationOutput.expressions | (`Array`: <`String`>) an array of the `expressions` involved in the creation of this reply (output).                                                                                                                                                                               |
+| conversationOutput.intents     | (`Array`: <`String`>) an array of the `intents` involved in the creation of this reply (output).                                                                                                                                                                                   |
+| conversationOutput.actions     | (`Array`: <`String`>) an array of the `actions` involved in the creation of this reply (output).                                                                                                                                                                                   |
+| conversationOutput.httpCalls   | (`Array`: <`JsonObject`>) an array of the `httpCalls` objects involved in the creation of this reply (output).                                                                                                                                                                     |
+| conversationOutput.properties  | (`Array`: <`JsonObject`>) the list of available properties in the current conversation.                                                                                                                                                                                            |
+| conversationOutput.output      | (`String`) The final agent's output                                                                                                                                                                                                                                                |
+| conversationProperties         | (`Array`: <>) Array of `conversationProperty`, <`nameOfProperty`> is a dynamic value that represents the name of the property                                                                                                                                                      |
+| \<nameOfProperty>.name         | (`String`) name of the property.                                                                                                                                                                                                                                                   |
+| \<nameOfProperty>.value        | (`String`\|`JsonObject`) value of the property.                                                                                                                                                                                                                                    |
+| \<nameOfProperty>.scope        | <p>(<code>String</code>) scope can be </p><p><code>step</code> (=valid one interaction [user input to user output]), </p><p><code>conversation</code> (=valid for the entire conversation), </p><p><code>longTerm</code> (=valid across conversations [based on given userId])</p> |
+| conversationSteps              | (`Array`: <`conversationStep`>) Array of `conversationStep`.                                                                                                                                                                                                                       |
+| conversationStep.key           | (`String`) the element key in the conversationStep e.g key : input:initial, actions                                                                                                                                                                                                |
+| conversationStep.value         | (`String`) the element value of the conversationStep e.g in case of `actionq` as `key` it could be an array string `[ "current_weather_in_city" ]`.                                                                                                                                |
+| timestamp.timestamp            | (`dateTime`) the timestamp in (ISO 8601) format                                                                                                                                                                                                                                    |
+
+> **Note** `conversationProperties` can also be used in output templating e.g: `{properties.city}.`
+
+### Sample Response
+
+```javascript
+{
+  "agentId": "5bf5418c46e0fb000b7636d0",
+  "agentVersion": 10,
+  "userId": "anonymous-zj1p1GDtM5",
+  "environment": "production",
+  "conversationState": "READY",
+  "undoAvailable": false,
+  "redoAvailable": false,
+  "conversationOutputs": [
+    {
+      "input": "madrid",
+      "expressions": "unknown(madrid)",
+      "intents": [
+        "unknown"
+      ],
+      "actions": [
+        "current_weather_in_city"
+      ],
+      "httpCalls": {
+        "currentWeather": {
+          "coord": {
+            "lon": -3.7,
+            "lat": 40.42
+          },
+          "weather": [
+            {
+              "id": 800,
+              "main": "Clear",
+              "description": "clear sky",
+              "icon": "01n"
+            }
+          ],
+          "base": "stations",
+          "main": {
+            "temp": 10.86,
+            "pressure": 1019,
+            "humidity": 66,
+            "temp_min": 8.33,
+            "temp_max": 13.33
+          },
+          "visibility": 10000,
+          "wind": {
+            "speed": 5.7,
+            "deg": 240
+          },
+          "clouds": {
+            "all": 0
+          },
+          "dt": 1551735805,
+          "sys": {
+            "type": 1,
+            "id": 6443,
+            "message": 0.0049,
+            "country": "ES",
+            "sunrise": 1551681788,
+            "sunset": 1551723011
+          },
+          "id": 3117735,
+          "name": "Madrid",
+          "cod": 200
+        }
+      },
+      "properties": {
+        "currentWeather": {
+          "coord": {
+            "lon": -3.7,
+            "lat": 40.42
+          },
+          "weather": [
+            {
+              "id": 800,
+              "main": "Clear",
+              "description": "clear sky",
+              "icon": "01n"
+            }
+          ],
+          "base": "stations",
+          "main": {
+            "temp": 10.86,
+            "pressure": 1019,
+            "humidity": 66,
+            "temp_min": 8.33,
+            "temp_max": 13.33
+          },
+          "visibility": 10000,
+          "wind": {
+            "speed": 5.7,
+            "deg": 240
+          },
+          "clouds": {
+            "all": 0
+          },
+          "dt": 1551735805,
+          "sys": {
+            "type": 1,
+            "id": 6443,
+            "message": 0.0049,
+            "country": "ES",
+            "sunrise": 1551681788,
+            "sunset": 1551723011
+          },
+          "id": 3117735,
+          "name": "Madrid",
+          "cod": 200
+        },
+        "city": "madrid"
+      },
+      "output": [
+        "The current weather situation of madrid is clear sky at 10.86 °C"
+      ]
+    }
+  ],
+  "conversationProperties": {
+    "city": {
+      "name": "city",
+      "value": "madrid",
+      "scope": "conversation"
+    }
+  },
+  "conversationSteps": [
+    {
+      "conversationStep": [
+        {
+          "key": "input:initial",
+          "value": "madrid"
+        },
+        {
+          "key": "actions",
+          "value": [
+            "current_weather_in_city"
+          ]
+        },
+        {
+          "key": "output:text:current_weather_in_city",
+          "value": "The current weather situation of madrid is clear sky at 10.86 °C"
+        }
+      ],
+      "timestamp": 1551736024776
+    }
+  ]
+}
+```
+
+The `conversationId` will be provided through the **`location`** **HTTP Header** of the response, you will use that later to submit messages to the Agent to maintain a conversation.
+
+### Example _:_
+
+_Request URL:_
+
+`http://localhost:7070/agents/5ad2ab182de29719b44a792a/start`
+
+_Response Body_
+
+`no content`
+
+_Response Code_
+
+`201`
+
+## Send/receive messages
+
+### Send a message
+
+### Send message in a conversation with an Agent REST API Endpoint
+
+| Element               | Tags                                                                                                                                                                                                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP Method           | `POST`                                                                                                                                                                                                                                                                 |
+| API endpoint          | `/agents/{conversationId}`                                                                                                                                                                                                                     |
+| {conversationId}      | (`Path` **parameter**): `String Id` of the **conversation** that you wish to **send** the message to.                                                                                                                                                                  |
+| returnDetailed        | (`Query` **parameter**):`Boolean` - **Default** : `false`                                                                                                                                                                                                              |
+| returnCurrentStepOnly | (`Query` **parameter**):`Boolean` - **Default** : `true`                                                                                                                                                                                                               |
+| Request Body          | <p>JSON Object , example : <code>{ "input": "the message", "context": {} }</code></p><p>The <code>context</code> here is where you pass context variables that can be evaluated by EDDI, we will be explaining this in more details in Passing Context Information</p> |
+
+### Example :
+
+_Request URL_
+
+`http://localhost:7070/agents/5add1fe8a081a228a0588d1c?returnDetailed=false&returnCurrentStepOnly=true`
+
+_Request Body_
+
+```javascript
+{
+  "input": "Hi!",
+  "context": {}
+}
+```
+
+Response Code
+
+`200`
+
+Response Body
+
+```javascript
+{
+  "agentId": "5aaf90e29f7dd421ac3c7dd4",
+  "agentVersion": 1,
+  "environment": "production",
+  "conversationState": "READY",
+  "undoAvailable": false,
+  "redoAvailable": false,
+  "conversationSteps": [
+    {
+      "conversationStep": [
+        {
+          "key": "input:initial",
+          "value": "Hi!"
+        }
+      ],
+      "timestamp": 1524441253098
+    }
+  ]
+}
+```
+
+
+```
+
+### Receive a message
+
+### Receive message in a conversation with an Agent REST API Endpoint
+
+| Element          | Tags                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ |
+| HTTP Method      | `GET`                                                                                                        |
+| API endpoint     | `/agents/{conversationId}`                                                           |
+| {conversationId} | (`Path` **parameter**): `String Id` of the **conversation** that you wish to **receive** a the message from. |
+| returnDetailed   | (`Query` **parameter**):`Boolean` - **Default** : `false`                                                    |
+| returnCurrentStepOnly | (`Query` **parameter**):`Boolean` - **Default** : `true`. When `true`, only the latest conversation step is returned. Set it to `false` to get the full history. |
+| returningFields  | (`Query` **parameter**, repeatable):`String` - restricts the snapshot to the named fields.                   |
+
+### Example
+
+_Request URL:_
+
+`http://localhost:7070/agents/5add1fe8a081a228a0588d1c?returnDetailed=false&returnCurrentStepOnly=false`
+
+_Response Body_
+
+```javascript
+{
+  "agentId": "5aaf90e29f7dd421ac3c7dd4",
+  "agentVersion": 1,
+  "environment": "production",
+  "conversationState": "READY",
+  "undoAvailable": false,
+  "redoAvailable": false,
+  "conversationSteps": [
+    {
+      "conversationStep": [
+        {
+          "key": "actions",
+          "value": [
+            "global_menu"
+          ]
+        },
+        {
+          "key": "output:text:global_menu",
+          "value": "What do you want to do?"
+        },
+        {
+          "key": "quickReplies:global_menu",
+          "value": [
+            {
+              "value": "Show me your skillz",
+              "expressions": "confirmation(show_skills)",
+              "default": false
+            },
+            {
+              "value": "Tell me a joke",
+              "expressions": "trigger(tell_a_joke)",
+              "default": false
+            }
+          ]
+        }
+      ],
+      "timestamp": 1524441064450
+    },
+    {
+      "conversationStep": [
+        {
+          "key": "input:initial",
+          "value": "Hi!"
+        }
+      ],
+      "timestamp": 1524441253098
+    }
+  ]
+}
+```
+
+Response Code
+
+`200`
+
+
+## Time Travel: Undo and Redo
+
+One of EDDI's most powerful features is the ability to **go back in time** within a conversation. The undo/redo functionality allows you to step backward and forward through conversation history, perfect for:
+
+- **User Correction**: User made a mistake and wants to retry
+- **Testing**: Developers testing different conversation paths
+- **Debugging**: Analyzing agent behavior at specific steps
+- **User Experience**: Allowing users to explore different options
+
+### How It Works
+
+EDDI maintains a **redo cache** of undone conversation steps. When you undo a step, it's moved to this cache. You can then either:
+
+- Continue the conversation (the undone step stays in the cache)
+- Redo the step (restores it from cache)
+
+```
+Step 1 → Step 2 → Step 3 (current)
+         undo ↓
+Step 1 → Step 2 (current) | [Step 3 in redo cache]
+         redo ↓
+Step 1 → Step 2 → Step 3 (current)
+```
+
+### Undo API
+
+#### Check if Undo is Available
+
+| Element      | Value                                                   |
+| ------------ | ------------------------------------------------------- |
+| HTTP Method  | `GET`                                                   |
+| API Endpoint | `/agents/{conversationId}/undo` |
+| Response     | `true` if undo is available, `false` otherwise          |
+
+**Example:**
+
+```bash
+curl -X GET "http://localhost:7070/agents/CONV_ID/undo"
+```
+
+**Response:**
+
+```json
+true
+```
+
+#### Perform Undo
+
+| Element      | Value                                                   |
+| ------------ | ------------------------------------------------------- |
+| HTTP Method  | `POST`                                                  |
+| API Endpoint | `/agents/{conversationId}/undo` |
+| Response     | HTTP 200 (no content)                                   |
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:7070/agents/CONV_ID/undo"
+```
+
+**Response:** HTTP 200 (No Content)
+
+**Effect**: The last conversation step is removed from the conversation history and stored in the redo cache.
+
+### Redo API
+
+#### Check if Redo is Available
+
+| Element      | Value                                                   |
+| ------------ | ------------------------------------------------------- |
+| HTTP Method  | `GET`                                                   |
+| API Endpoint | `/agents/{conversationId}/redo` |
+| Response     | `true` if redo is available, `false` otherwise          |
+
+**Example:**
+
+```bash
+curl -X GET "http://localhost:7070/agents/CONV_ID/redo"
+```
+
+**Response:**
+
+```json
+true
+```
+
+#### Perform Redo
+
+| Element      | Value                                                   |
+| ------------ | ------------------------------------------------------- |
+| HTTP Method  | `POST`                                                  |
+| API Endpoint | `/agents/{conversationId}/redo` |
+| Response     | HTTP 200 (no content)                                   |
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:7070/agents/CONV_ID/redo"
+```
+
+**Response:** HTTP 200 (No Content)
+
+**Effect**: The last undone step is restored from the redo cache and added back to the conversation history.
+
+### Complete Example Flow
+
+```bash
+# 1. Start conversation
+curl -X POST "http://localhost:7070/agents/AGENT_ID/start" -d '{}'
+# Returns: 201 with "location: /agents/CONV_ID" header (no body)
+
+# 2. Send message
+curl -X POST "http://localhost:7070/agents/CONV_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello"}'
+# Agent responds: "Hi! How can I help?"
+
+# 3. Send another message
+curl -X POST "http://localhost:7070/agents/CONV_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Book a flight"}'
+# Agent responds: "Where would you like to go?"
+
+# 4. Oops, user meant hotel not flight! Undo last step
+curl -X POST "http://localhost:7070/agents/CONV_ID/undo"
+# Now back to: "Hi! How can I help?"
+
+# 5. Try again with correct input
+curl -X POST "http://localhost:7070/agents/CONV_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Book a hotel"}'
+# Agent responds: "Which city?"
+
+# 6. Wait, maybe flight was right. Check if redo is available
+curl -X GET "http://localhost:7070/agents/CONV_ID/redo"
+# Returns: true (the redo cache survives new messages — Step 3 is still cached)
+```
+
+### Redo Cache Behavior
+
+**Important**: The redo cache is **not** cleared when you send a new message after an undo. The undone step stays on the stack, so a redo after continuing the conversation splices it back on top of the step you just appended.
+
+```
+Normal flow:
+Step 1 → Step 2 → Step 3
+
+After undo:
+Step 1 → Step 2 | [Step 3 cached]
+         ↓ can redo
+
+After new message:
+Step 1 → Step 2 → Step 4 | [Step 3 still cached]
+         ↓ redo now yields Step 1 → Step 2 → Step 4 → Step 3
+```
+
+### Checking Whether Undo / Redo Is Available
+
+There are two ways to ask, and they answer different questions.
+
+**`GET` the action's own path** — a bare JSON boolean, nothing else:
+
+```bash
+curl -X GET "http://localhost:7070/agents/CONV_ID/undo"   # → true | false
+curl -X GET "http://localhost:7070/agents/CONV_ID/redo"   # → true | false
+```
+
+`GET` asks; `POST` to the same path performs the action. That symmetry is easy
+to trip over — a `POST /agents/CONV_ID/undo` you meant as a check will actually
+undo the step.
+
+**Read the conversation snapshot**, which carries both flags alongside the rest
+of the state:
+
+```json
+{
+  "conversationId": "CONV_ID",
+  "conversationState": "READY",
+  "undoAvailable": true,
+  "redoAvailable": false
+}
+```
+
+These are **booleans, not depths**. The redo cache is a stack and can hold more
+than one step, but neither the REST contract nor the snapshot exposes how many —
+`redoAvailable: true` means "at least one", and that is all you can rely on.
+
+### Use Cases
+
+**1. User Correction**
+
+```
+User: "Book me a table at 7pm"
+Agent: "For how many people?"
+User: "Wait, I meant 8pm"
+→ Undo and retry
+```
+
+**2. Exploring Options**
+
+```
+User: "Show me flights to Paris"
+Agent: [Shows flights]
+User: "Actually, let me see hotels instead"
+→ Undo and try different path
+```
+
+**3. Testing Agent Behavior**
+
+```
+Developer tests:
+1. Input A → Response X
+2. Undo
+3. Input B → Response Y
+4. Undo, redo → Back to Response X
+```
+
+### Limitations
+
+- Undo/redo only affects conversation **history** and **memory**
+- External API calls made during undone steps are **not reversed**
+  - Example: If a payment API was called, undoing won't refund the payment
+- Redo cache has a **size limit** (configurable)
+- Redo cache is **session-specific** (cleared on conversation end)
+
+### Best Practices
+
+1. **Always check availability** before calling undo/redo to avoid errors
+2. **Inform users** that continuing after an undo leaves the undone step redoable (UX consideration)
+3. **Be careful with side effects** - undo doesn't reverse external API calls
+4. **Use for user convenience** - great for conversational UX
+5. **Log undo/redo** - helps with analytics and debugging
+
+## Related API Endpoints
+
+- `POST /agents/{agentId}/start` - Start conversation
+- `POST /agents/{conversationId}` - Send message
+- `GET /agents/{conversationId}` - Get conversation state
+- `POST /agents/{conversationId}/undo` - Undo last step
+- `POST /agents/{conversationId}/redo` - Redo last step
+- `GET /agents/{conversationId}/undo` - Check undo availability
+- `GET /agents/{conversationId}/redo` - Check redo availability
+
+## Sample Agent
+
+> **Run it yourself.** The GitBook-hosted Postman collections that used to be linked here
+> were lost in the migration. You do not need them: every request is shown inline above,
+> and Postman can import EDDI's own spec directly — **Import → Link →**
+> `<your-eddi-host>/openapi` (`http://localhost:7070/openapi` for a local install).
+> It is generated from the running build, so unlike a committed collection it cannot go
+> out of date. The same spec is browsable at `<your-eddi-host>/q/swagger-ui`.

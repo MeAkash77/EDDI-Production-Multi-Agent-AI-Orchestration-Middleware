@@ -1,0 +1,14 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory.model;
+
+import java.util.LinkedHashMap;
+
+public class ConversationOutput extends LinkedHashMap<String, Object> {
+    @SuppressWarnings("unchecked")
+    public <T> T get(Object key, Class<T> clazz) {
+        return (T) super.get(key);
+    }
+}

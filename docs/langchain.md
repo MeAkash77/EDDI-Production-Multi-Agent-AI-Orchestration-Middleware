@@ -1,0 +1,1768 @@
+# LLM Integration
+
+[![Version](https://img.shields.io/github/v/release/labsai/EDDI?label=version&color=blue)](https://github.com/labsai/EDDI/releases)
+
+## Overview
+
+The **LLM Lifecycle Task** (formerly "Langchain") is EDDI's unified integration point for Large Language Models (LLMs).
+
+By default, it provides **simple chat** with any LLM provider. Optionally, you can enable **agent mode** to give your LLM access to built-in tools (calculator, web search, weather, etc.).
+
+EDDI supports **12 LLM providers** out of the box — eleven registered model builders: OpenAI, Anthropic, Google Gemini (`gemini`), Google Vertex AI (`gemini-vertex`), Mistral AI, Azure OpenAI, Amazon Bedrock, Oracle GenAI, Ollama, Hugging Face, and Jlama — plus any OpenAI-compatible endpoint (DeepSeek, Cohere, etc.) via the `baseUrl` parameter.
+
+The task automatically detects which mode to use based on your configuration—no manual switching required.
+
+---
+
+## EDDI's Value Proposition for LLMs
+
+EDDI doesn't just forward messages to LLMs—it **orchestrates** them:
+
+1. **Conditional LLM Invocation**: Use Behavior Rules to decide whether to call an LLM based on user input, context, or conversation state
+2. **Pre-processing**: Parse, normalize, and enrich user input before sending to the LLM
+3. **Context Management**: Control exactly what conversation history and context data is sent to the LLM
+4. **Multi-LLM Support**: Switch between different LLMs (OpenAI, Claude, Gemini, Ollama, Hugging Face, Jlama) based on rules or user preferences
+5. **Post-processing**: Transform, validate, or augment LLM responses before sending to users
+6. **Hybrid Workflows**: Combine LLM calls with traditional APIs (e.g., LLM generates query → API fetches data → LLM formats result)
+7. **State Persistence**: All LLM interactions are logged in conversation memory for analytics and debugging
+8. **Tool Calling**: Enable LLMs to use built-in tools or custom HTTP call tools to access external capabilities
+
+---
+
+## Role in the Lifecycle
+
+The Langchain task is a lifecycle task that executes when triggered by Behavior Rules:
+
+```
+User Input → Parser → Behavior Rules → [LangChain Task] → Output Generation
+                           ↓
+                    Action: "send_to_llm"
+```
+
+---
+
+## Supported LLM Providers
+
+The Langchain task integrates with multiple LLM providers via the langchain4j library:
+
+- **OpenAI** (ChatGPT, GPT-4, GPT-4o) — also supports **DeepSeek** and **Cohere** via `baseUrl`
+- **Anthropic** (Claude)
+- **Google Gemini** (`gemini` - AI Studio API, `gemini-vertex` - Vertex AI)
+- **Mistral AI** (Mistral Large, Codestral, Pixtral)
+- **Azure OpenAI** (GPT-4o via Azure-hosted endpoints)
+- **Amazon Bedrock** (Claude, Llama, Titan via AWS credential chain)
+- **Oracle GenAI** (Cohere Command R+ via OCI authentication)
+- **Ollama** (Local models)
+- **Hugging Face** (Various models)
+- **Jlama** (Local Java-based inference)
+
+**Note**: The Manager's agent wizard (`/manage/agents/wizard`) and the Platform Operator (`/manage/operator`) both generate a working LLM task for you, so you rarely need to hand-write this config from scratch.
+
+---
+
+## Configuration Modes
+
+### Default: Simple Chat
+
+By default, the Langchain task provides straightforward LLM chat functionality. Just configure your LLM provider and start chatting.
+
+### Optional: Agent Mode with Tools
+
+To give your LLM access to tools (calculator, web search, weather, etc.), set `enableBuiltInTools: true` in your configuration.
+
+The task automatically switches to agent mode when tools are enabled.
+
+**Note**: Custom HTTP call tools (via the `tools` parameter) are also supported. You can provide a list of EDDI HTTP call URIs to give the agent access to your own APIs.
+
+---
+
+## Simple Chat Configuration
+
+This is the standard way to use the Langchain task - just connect to an LLM and start chatting.
+
+### Basic Example
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "simpleChat",
+      "type": "openai",
+      "description": "Simple chat interaction",
+      "parameters": {
+        "apiKey": "your-api-key",
+        "modelName": "gpt-4o",
+        "systemMessage": "You are a helpful assistant",
+        "prompt": "",
+        "logSizeLimit": "-1",
+        "convertToObject": "false",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+### Configuration Parameters
+
+| Parameter                  | Type    | Description                                           | Default           |
+| -------------------------- | ------- | ----------------------------------------------------- | ----------------- |
+| **Core Parameters**        |         |                                                       |                   |
+| `apiKey`                   | string  | API key for the LLM provider                          | Required          |
+| `modelName`                | string  | Model identifier (e.g., "gpt-4o", "Claude")           | Provider-specific |
+| `systemMessage`            | string  | System message for LLM context                        | ""                |
+| `prompt`                   | string  | Override user input (if not set, uses actual input)   | ""                |
+| **Context Control**        |         |                                                       |                   |
+| `logSizeLimit`             | int     | Conversation history limit (`-1` = unlimited, `0` = none) | falls back to `conversationHistoryLimit` (default 10) |
+| `includeFirstAgentMessage` | boolean | **Deprecated — do not use in new configs.** Include the opening **agent** message in context. `false` drops it — and only it: a first message from the *user* is always kept. Setting it logs a WARN; see [Deprecated parameters](#deprecated-parameters) | true              |
+| **Output Control**         |         |                                                       |                   |
+| `convertToObject`          | boolean | Parse response as JSON. Enables three-layer enforcement: system prompt reinforcement, native API JSON mode (see the [provider matrix](#native-json-mode--provider-matrix)), and pre-parse validation | false             |
+| `responseSchema`           | string  | JSON schema for structured output. When set with `convertToObject=true`, the exact schema is injected into the system prompt so the LLM knows the expected format | ""                |
+| `addToOutput`              | boolean | Add response to conversation output                   | false             |
+| **Logging**                |         |                                                       |                   |
+| `logRequests`              | boolean | Log API requests (sync and streaming)                 | false             |
+| `logResponses`             | boolean | Log API responses (sync and streaming)                | false             |
+| **API Configuration**      |         |                                                       |                   |
+| `temperature`              | string  | Model temperature (0-1)                               | Provider-specific |
+| `maxTokens`                | string  | Maximum output tokens per response — see [Output Token Limits](#output-token-limits) | Provider-specific |
+| `timeout`                  | string  | Request timeout (milliseconds) — see [Timeouts](#timeouts-and-streaming) | Provider-specific |
+
+> **These three settings are part of a model's identity.** Two tasks that differ only in `timeout`, `logRequests` or `logResponses` get two separate cached model instances, so a task always runs with the settings it declares regardless of which task was constructed first.
+>
+> **Logging is EDDI's, not the provider's.** `logRequests`/`logResponses` are honoured by EDDI's own model decorators, which truncate the logged request to 200 and the logged response to 500 characters. They are deliberately **not** forwarded to the provider builders: langchain4j's client-level logging writes whole request and response bodies at INFO with no truncation, so switching it on would put full prompts, full conversation history and full model output into the application log. (`logRequestsAndResponses`, which only the Azure OpenAI and Gemini builders accept, is a provider-level escape hatch and *is* still forwarded — use it only where that exposure is acceptable.)
+>
+> **An unusable `timeout` is ignored, not fatal.** The value is normalised once before it reaches a provider builder: it is trimmed, and dropped entirely when it is blank, non-numeric (`"30s"`) or non-positive (`"0"`, historically "no timeout"), with a WARN naming the model type. Provider builders parse the value with an unguarded `Long.parseLong`, so without this a stored config carrying one of those values would fail on every turn. `" 5000 "` and `"5000"` are the same timeout and share one cached model.
+### Output Token Limits
+
+The `maxTokens` parameter controls the **maximum number of output tokens** the LLM can generate per response. This is a ceiling, not a target — the model generates only what it needs and stops. Setting it higher does not increase cost unless the model actually produces more tokens; the `timeout` parameter is the real cost safety net.
+
+> [!WARNING]
+> **Anthropic + Extended Thinking**: Models with extended thinking (e.g. `claude-sonnet-5`, `claude-sonnet-4`) count **thinking tokens** toward `maxTokens`. If the limit is too low, thinking can consume the entire budget, leaving **zero tokens for the actual response** — resulting in empty/null output. This is a silent failure: the API returns successfully, token usage shows consumption, but `text()` is `null`.
+
+#### Provider Limits and EDDI Defaults
+
+| Provider | Config Key | Max Output Capability | EDDI Default (if omitted) | Notes |
+|----------|------------|----------------------|--------------------------|-------|
+| **Anthropic** | `maxTokens` | 8,192 (standard) / 128,000 (with extended thinking) | **16,384** | Required by API. Set higher for thinking models |
+| **Gemini** | `maxOutputTokens` | 65,536 | Provider SDK default | Use `maxOutputTokens` (not `maxTokens`) |
+| **OpenAI** | `maxTokens` | 4,096–16,384 (model-dependent) | Provider SDK default | |
+| **Azure OpenAI** | `maxTokens` | Same as OpenAI | Provider SDK default | |
+| **Bedrock** | `maxTokens` | Model-dependent | Provider SDK default | |
+| **Mistral** | `maxTokens` | 32,768 | Provider SDK default | |
+| **Oracle GenAI** | `maxTokens` | Model-dependent | Provider SDK default | |
+
+#### Recommended Settings
+
+For most conversational use cases:
+```json
+"maxTokens": "16384"
+```
+
+For complex analysis, multi-step reasoning, or models with extended thinking:
+```json
+"maxTokens": "32768"
+```
+
+For maximum output (e.g. long-form document generation):
+```json
+"maxTokens": "65536"
+```
+
+### Timeouts and Streaming
+
+Two settings bound an LLM call, and they are deliberately distinct:
+
+| Setting                                | Where               | Unit | What it bounds                                                                                                                                       |
+| -------------------------------------- | ------------------- | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout` (`parameters`)               | model parameter     | ms   | The provider call. On a non-streaming task it bounds the whole request. On a **streaming** task it is the provider HTTP client's request/read timeout — for the JDK client, the time until the provider's first response, so it catches a provider that never answers without truncating one that answers slowly. |
+| `streamingTimeoutSeconds` (task field) | task-level, sibling of `parameters` | s    | The **overall** wall-clock backstop for the whole stream, for providers whose native timeout does not fire (or does not exist). Streaming only.       |
+
+How the backstop is resolved:
+
+1. An explicit positive `streamingTimeoutSeconds` always wins.
+2. Otherwise the backstop is **120s**, raised (never lowered) to cover a longer explicitly configured `timeout`. So `timeout: "300000"` with no `streamingTimeoutSeconds` yields a 300s backstop rather than being cut short at 120s; any `timeout` at or below 120s leaves the 120s default untouched.
+3. Otherwise 120s.
+
+Both stored shapes therefore keep working: a config that sets only `streamingTimeoutSeconds` behaves exactly as before, and a config that sets only `timeout` is now honoured on the streaming path instead of being discarded.
+
+```json
+{
+  "actions": ["send_message"],
+  "id": "longRunning",
+  "type": "openai",
+  "streamingTimeoutSeconds": 300,
+  "parameters": {
+    "apiKey": "your-openai-api-key",
+    "modelName": "gpt-4o",
+    "timeout": "300000"
+  }
+}
+```
+
+> `timeout` is read from the task's stored parameters when deriving the backstop. A Qute-templated value (e.g. `"{vars.llm-timeout}"`) cannot be resolved at that point and simply leaves the 120s default in place — it never produces a shorter bound.
+
+### Provider-Specific Examples
+
+#### OpenAI
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "openaiChat",
+      "type": "openai",
+      "description": "OpenAI GPT-4o chat",
+      "parameters": {
+        "apiKey": "your-openai-api-key",
+        "modelName": "gpt-4o",
+        "temperature": "0.7",
+        "timeout": "15000",
+        "logRequests": "true",
+        "logResponses": "true",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+#### Anthropic Claude
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "claudeChat",
+      "type": "anthropic",
+      "description": "Anthropic Claude chat",
+      "parameters": {
+        "apiKey": "your-anthropic-api-key",
+        "modelName": "claude-sonnet-4-20250514",
+        "temperature": "0.7",
+        "maxTokens": "16384",
+        "timeout": "60000",
+        "systemMessage": "You are a helpful assistant",
+        "includeFirstAgentMessage": "false",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+> **`includeFirstAgentMessage` is deprecated and no longer needed for Anthropic.** This example keeps
+> `"false"` only because countless existing configs carry it. The advice it used to
+> illustrate — "Anthropic doesn't allow the first message to be from the agent, so set
+> this to `false`" — described a restriction the
+> [Messages API](https://platform.claude.com/docs/en/api/messages) no longer documents,
+> and a history beginning with an assistant turn is accepted. Leave the parameter off
+> new Anthropic configs unless you genuinely want the opening greeting withheld.
+>
+> **maxTokens**: Anthropic requires `max_tokens` in every request. If omitted, EDDI defaults to **16384**. For models with **extended thinking** (e.g. `claude-sonnet-5`), thinking tokens count toward this budget — set it higher (e.g. `"32768"` or `"65536"`) for complex analysis tasks.
+
+#### Google Gemini (AI Studio)
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "geminiChat",
+      "type": "gemini",
+      "description": "Google Gemini chat",
+      "parameters": {
+        "apiKey": "your-gemini-api-key",
+        "modelName": "gemini-3.8-flash",
+        "temperature": "0.7",
+        "maxOutputTokens": "8192",
+        "timeout": "60000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+##### Thought signatures — required for tool calling on Gemini 3.x
+
+Gemini 3.x attaches an opaque **`thoughtSignature`** to every `functionCall` part
+it emits, and requires it echoed back verbatim when that model turn is replayed on
+the follow-up request carrying the `functionResponse`. Without it the API answers:
+
+```
+400 INVALID_ARGUMENT — Function call is missing a thought_signature in functionCall parts.
+```
+
+Measured against `generativelanguage.googleapis.com`:
+
+| Model | Emits `thoughtSignature` | Replay without it |
+| --- | --- | --- |
+| `gemini-3.8-flash` | yes | **400** |
+| `gemini-3.5-flash` | yes | **400** |
+| `gemini-2.5-flash` | yes | 200 (tolerated) |
+
+There is **no `thinkingConfig` setting that avoids this** — Gemini 3.x emits the
+signature and rejects its absence even with `thinkingBudget: 0`.
+
+EDDI handles it for you: the `gemini` builder sets langchain4j's `returnThinking`
+(capture the signature) and `sendThinking` (echo it back) to **`true` by default**.
+Both are exposed as parameters:
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `returnThinking` | `true` | Captures `thoughtSignature` off the response. Also routes any thought text to a separate field rather than into the user-visible reply. |
+| `sendThinking` | `true` | Echoes the captured signature back on follow-up requests. |
+
+> **Setting either to `false` breaks tool calling on every Gemini 3.x model.** There is
+> little reason to: Gemini 2.x tolerates the echoed signature. Note that `false` is not
+> the state before thought signatures were handled — EDDI used to leave `returnThinking` unset, which prepends any thought
+> text to the reply, whereas `false` drops it. EDDI exposes no `thinkingConfig`, so Gemini
+> returns no thought text today and the two are indistinguishable in practice.
+
+#### Google Gemini (Vertex AI)
+
+> **Gemini 3.x with tools is not supported on `gemini-vertex` — use `gemini`
+> instead.** The thought-signature requirement above applies to Gemini 3.x on
+> Vertex AI as well, but the field cannot be carried on this path: neither
+> `langchain4j-vertex-ai-gemini` nor the `com.google.cloud.vertexai.api.Part`
+> protobuf it depends on models `thought_signature`, so there is nothing for EDDI
+> to configure. Fixing it needs an upstream langchain4j change plus a
+> `google-cloud-vertexai` bump. `gemini-vertex` remains correct for Gemini 2.x, and
+> for Gemini 3.x **without** tools. Configuring a Gemini 3.x model id here logs a
+> warning at model-build time naming the alternative.
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "geminiChat",
+      "type": "gemini-vertex",
+      "description": "Google Gemini chat",
+      "parameters": {
+        "publisher": "vertex-ai",
+        "projectId": "your-project-id",
+        "location": "us-central1",
+        "modelId": "gemini-pro",
+        "temperature": "0.7",
+        "timeout": "15000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+#### Ollama (Local Models)
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "ollamaChat",
+      "type": "ollama",
+      "description": "Ollama local model chat",
+      "parameters": {
+        "baseUrl": "http://ollama:11434",
+        "model": "llama3.2:3b",
+        "timeout": "120000",
+        "think": "false",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+**Ollama-specific parameters**
+
+| Parameter        | Effect                                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `baseUrl`        | Ollama's address. Default `http://localhost:11434`, overridable deployment-wide with `EDDI_OLLAMA_DEFAULT_BASE_URL`. |
+| `model`          | Model tag as `ollama list` reports it, e.g. `llama3.2:3b`.                                   |
+| `think`          | `"true"` / `"false"`. Unset leaves it to Ollama and the model — see below.                    |
+| `returnThinking` | `"true"` surfaces the separate `thinking` field instead of discarding it. Off by default.     |
+| `temperature`, `maxTokens`, `topP`, `topK` | Standard sampling controls. `maxTokens` maps to Ollama's `num_predict`. |
+
+> **Reaching Ollama from a container.** Inside the `eddi` container `localhost`
+> is the container. Use `http://host.docker.internal:11434` for an Ollama on the
+> host, or bring up the overlay —
+> `docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d` —
+> which puts Ollama on the same network as `http://ollama:11434` and pre-fills
+> that base URL for new agents.
+
+> **Reasoning models look like a hang.** gemma3n, deepseek-r1, qwen3 and friends
+> think before they answer, and where that reasoning goes depends on the model:
+>
+> - Reported in a separate `thinking` field — not part of the streamed content, so
+>   a streaming chat window shows nothing at all for as long as the model reasons,
+>   then the whole answer at once. `"returnThinking": "true"` surfaces it instead
+>   of discarding it.
+> - Prepended to the content itself as `<think>…</think>` — the tags stream into
+>   the reply, where the user sees them. `returnThinking` does not affect this
+>   case; there is no `thinking` field to parse.
+>
+> `"think": "false"` turns reasoning off entirely and is the quickest way to a
+> model that answers immediately. Give such a model a generous `timeout` either
+> way.
+
+#### Hugging Face
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "huggingfaceChat",
+      "type": "huggingface",
+      "description": "Hugging Face model chat",
+      "parameters": {
+        "accessToken": "your-huggingface-access-token",
+        "modelId": "llama3",
+        "temperature": "0.7",
+        "timeout": "15000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+#### Jlama (Local Java Inference)
+
+Jlama is the only provider that runs inference **inside the EDDI JVM**. There is no
+second process, no Ollama, no HTTP hop — which also means the model's memory, CPU and
+weight storage are EDDI's problem rather than a sidecar's. Read the two subsections
+below before deploying it; both describe defaults that fail in a container.
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "jlamaChat",
+      "type": "jlama",
+      "description": "Jlama local model chat",
+      "parameters": {
+        "modelName": "tjake/Llama-3.2-1B-Instruct-JQ4",
+        "modelCachePath": "/var/lib/eddi/jlama",
+        "temperature": "0.7",
+        "maxTokens": "512",
+        "timeout": "30000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+| Parameter | Meaning |
+| --------- | ------- |
+| `modelName` | Hugging Face repo id, e.g. `tjake/Llama-3.2-1B-Instruct-JQ4`. Jlama downloads it on first use |
+| `modelCachePath` | Where weights are cached. **Set this in any container** — see below. Default: `${user.home}/.jlama/models` |
+| `authToken` | Hugging Face token, for gated or private repos. Use `${vault:...}` rather than a literal |
+| `quantizeModelAtRuntime` | `true` quantizes on load: slower startup, smaller memory footprint |
+| `workingDirectory` | Scratch space for the loader. Needs to be writable |
+| `workingQuantizedType` | Jlama `DType` name for working-set quantization, e.g. `F32`, `I8`. Case-insensitive; an unknown name is logged and ignored |
+| `temperature`, `maxTokens` | As for every other provider. Jlama defaults to `0.3` and the model's full context length |
+| `timeout` | Honoured, but applied by EDDI as a wall-clock bound around the call rather than by Jlama itself — Jlama's own builder has no timeout |
+
+##### Required JVM flag
+
+Jlama needs the Java Vector API for SIMD tensor operations:
+
+```
+--add-modules=jdk.incubator.vector
+```
+
+**EDDI sets this for you** in both container images, in the Maven Surefire fork and in
+the `mise` dev tasks. (Deliberately not in the Failsafe fork — declaring an `argLine`
+there would replace the implicit `${argLine}` that carries the JaCoCo integration-test
+agent and Quarkus's module opens, and no integration test builds a Jlama model anyway.) You only need to add it yourself if you launch `quarkus-run.jar` with
+your own command line.
+
+The image carries it on **`JDK_JAVA_OPTIONS`**, deliberately, rather than on
+`JAVA_OPTS_APPEND` where EDDI's other JVM settings live. The `java` launcher reads
+`JDK_JAVA_OPTIONS` itself, so the flag survives an operator overriding either of the
+other two variables — and overriding them is normal: a `docker run -e JAVA_OPTS_APPEND=…`
+*replaces* the image's value rather than adding to it, so a deployment that sets its
+MongoDB connection string that way would otherwise silently drop the flag and fall back
+to scalar inference.
+
+> ⚠️ If you set `JDK_JAVA_OPTIONS` yourself, carry
+> `--add-modules=jdk.incubator.vector` across — that one *does* replace the image's value.
+> You will see `NOTE: Picked up JDK_JAVA_OPTIONS` in the startup log either way.
+
+This matters more than a usual tuning flag, because the failure is silent. Jlama probes
+for the Vector API inside a `catch (Throwable)`; without the module it logs one line,
+falls back to `NaiveTensorOperations` — scalar Java matrix arithmetic — and answers
+normally, just orders of magnitude slower than SIMD. Nothing errors; the agent is simply
+too slow to use. EDDI logs its own warning naming this flag when it builds a Jlama model
+on a JVM that lacks it.
+
+> The JVM prints `WARNING: Using incubator modules: jdk.incubator.vector` at startup.
+> That is expected and is not an error.
+
+##### Deploying Jlama in a container
+
+Three things behave differently inside a container. None of them raises an error — which
+is exactly why each is worth setting explicitly.
+
+- **`modelCachePath` — set it.** Jlama writes weights to `${user.home}/.jlama/models`,
+  which in a container is the pod's ephemeral writable layer. That *works*, which is what
+  makes it a trap rather than an error: the multi-gigabyte weights live exactly as long as
+  the pod does, so every restart, rollout and reschedule re-downloads them from Hugging
+  Face before the first turn can be answered. Point it at a mounted volume. (The download
+  happens on the *first turn*, not at deploy time, so a mistake here surfaces long after
+  the agent was configured and saved.)
+- **Thread count — give the pod a CPU *limit*, not a parameter.** Jlama runs inference on
+  a process-global `PhysicalCoreExecutor` sized at `max(2, availableProcessors() / 2)`.
+  `availableProcessors()` honours a container CPU **limit**, so `limits.cpu: 4` yields two
+  inference threads. It does **not** honour a CPU **request**: cgroup shares have been
+  ignored since JDK 19, so a pod with only `requests.cpu` sees the whole node. EDDI
+  deliberately exposes no `threadCount` parameter — Jlama applies it through a one-shot
+  process-global latch that throws on its second call, so it cannot be a per-model setting.
+  If you must override it, size the pod.
+- **Memory — size for the weights, outside the heap.** Jlama memory-maps the safetensors
+  files, so the weights land in RSS and page cache, not the Java heap. They still count
+  against the container's memory limit. Size the pod for the model *plus* EDDI's heap, and
+  note that `JAVA_MAX_MEM_RATIO` only governs the heap, so raising it does not make room
+  for the model — it takes room away.
+
+For an air-gapped deployment, pre-seed `modelCachePath` from a machine that has network
+access and mount it read-only. Jlama reaches out to Hugging Face whenever the model is
+not already in the cache, so an empty cache with no egress fails rather than degrades.
+
+**Note**: Jlama runs models locally in Java without requiring external services like
+Ollama. It is CPU inference — there is no GPU path — so it suits small quantized models
+(1B–8B) rather than large ones. For a GPU or a larger model, serve it with vLLM or
+`llama-server` and point the `openai` provider at it via `baseUrl`.
+
+**`modelName` must be a Hugging Face repository id in `owner/name` form** — for
+example `tjake/Llama-3.2-1B-Instruct-JQ4` or
+`tjake/TinyLlama-1.1B-Chat-v1.0-Jlama-Q4`. Jlama resolves the model through its
+own registry, which downloads it from Hugging Face on first use; a bare name
+such as `llama-3.2-1b` has no owner to resolve and fails on the agent's first
+turn, long after the configuration was saved. Private repositories additionally
+need `authToken`.
+
+**There is no `baseUrl`.** Jlama runs *inside the EDDI JVM* — there is no model
+server to point at, and a `baseUrl` parameter is dropped with an
+"unrecognised parameter" warning. See the parameter table above for everything
+the builder does read; `threadCount` is deliberately absent from it — see
+"Deploying Jlama in a container" above.
+
+#### Mistral AI
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "mistralChat",
+      "type": "mistral",
+      "description": "Mistral AI chat",
+      "parameters": {
+        "apiKey": "your-mistral-api-key",
+        "modelName": "mistral-large-latest",
+        "temperature": "0.7",
+        "timeout": "15000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+#### Azure OpenAI
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "azureChat",
+      "type": "azure-openai",
+      "description": "Azure OpenAI chat",
+      "parameters": {
+        "apiKey": "your-azure-api-key",
+        "deploymentName": "gpt-4o",
+        "endpoint": "https://your-instance.openai.azure.com",
+        "temperature": "0.7",
+        "timeout": "15000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+**Note**: Azure OpenAI uses `deploymentName` (not `modelName`) and requires an `endpoint` URL for your Azure instance.
+
+#### Amazon Bedrock
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "bedrockChat",
+      "type": "bedrock",
+      "description": "Amazon Bedrock chat",
+      "parameters": {
+        "modelId": "anthropic.claude-v2",
+        "region": "us-east-1",
+        "temperature": "0.7",
+        "maxTokens": "16384",
+        "timeout": "30000",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+**Note**: Bedrock uses `modelId` (not `modelName`) and does not require an `apiKey`. Authentication is via the AWS SDK default credential chain (environment variables, IAM roles, `~/.aws/credentials`).
+
+#### Oracle GenAI
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "oracleChat",
+      "type": "oracle-genai",
+      "description": "Oracle GenAI chat",
+      "parameters": {
+        "modelName": "cohere.command-r-plus",
+        "compartmentId": "ocid1.compartment.oc1..your-compartment-id",
+        "configProfile": "DEFAULT",
+        "temperature": "0.7",
+        "maxTokens": "16384",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+**Note**: Oracle GenAI does not require an `apiKey`. Authentication is via OCI SDK (`~/.oci/config`). The `configProfile` parameter selects which OCI profile to use (defaults to `"DEFAULT"`).
+
+#### DeepSeek / Cohere (via OpenAI-Compatible Endpoints)
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "deepseekChat",
+      "type": "openai",
+      "description": "DeepSeek via OpenAI-compatible endpoint",
+      "parameters": {
+        "apiKey": "your-deepseek-api-key",
+        "modelName": "deepseek-chat",
+        "baseUrl": "https://api.deepseek.com",
+        "temperature": "0.7",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+**Note**: Any OpenAI-compatible provider (DeepSeek, Cohere, etc.) can be used by setting the `baseUrl` parameter on the `openai` type. No additional dependencies are required.
+
+---
+
+## Agent Mode (Enhanced Features)
+
+### AI Agent with Built-in Tools
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["help"],
+      "id": "aiAgent",
+      "type": "openai",
+      "description": "AI agent with calculator and web search",
+      "parameters": {
+        "apiKey": "your-api-key",
+        "modelName": "gpt-4o",
+        "systemMessage": "You are a helpful assistant with access to tools."
+      },
+      "enableBuiltInTools": true,
+      "builtInToolsWhitelist": ["calculator", "datetime", "websearch"],
+      "conversationHistoryLimit": 10
+    }
+  ]
+}
+```
+
+### Agent Mode Parameters
+
+| Parameter                  | Type     | Description                                      | Default                |
+| -------------------------- | -------- | ------------------------------------------------ | ---------------------- |
+| **Tool Configuration**     |          |                                                  |                        |
+| `enableBuiltInTools`       | boolean  | Enable built-in tools                            | false                  |
+| `builtInToolsWhitelist`    | string[] | Specific tools to enable                         | (all if not specified) |
+| `tools`                    | string[] | Custom HTTP call tool URIs to enable             | (none)                 |
+| **Context Control**        |          |                                                  |                        |
+| `conversationHistoryLimit` | int      | Max conversation turns in context                | 10                     |
+| `maxToolContextTokens`     | int      | Aggregate token ceiling on the **in-turn** tool-call context (tool requests + tool results across all loop iterations). The oldest complete tool exchange is evicted when exceeded. `-1`/`0` disables. See [In-Turn Tool Context Budget](#in-turn-tool-context-budget). | 60000 |
+| **Cost & Performance**     |          |                                                  |                        |
+| `maxBudgetPerConversation` | number   | Ceiling on accumulated **tool** cost per conversation, in USD. Records cost; only refuses calls when `enforceBudget` is on | (unlimited) |
+| `enforceBudget`            | boolean  | Refuse tool calls once `maxBudgetPerConversation` is passed. **Opt-in** — a ceiling without it is report-only, and is named in a startup WARN | false (`eddi.tools.budget.enforce-by-default`) |
+| `toolPricing`              | map      | Per-call tool prices in USD. Keyed on the built-in slug (`{"websearch": 0.005}`) or on a single dispatch name (`{"searchNews": 0.01}`), which takes precedence — so one operation can be priced apart from its siblings | (built-in defaults) |
+| `inputPricePer1M` / `outputPricePer1M` | number | Token prices in USD per 1M tokens for this task's **model calls**, feeding the conversation's tracked cost (and any group cost ceiling). Applies to non-cascade calls; a [model cascade](model-cascade.md) prices its steps via its own fields of the same name. Negative values fail deployment | (unpriced — $0) |
+| `enableToolCaching`        | boolean  | Cache tool results to reduce API calls           | true                   |
+| `toolCacheScopes`          | map      | Per-tool cache partition: `user`/`conversation`/`global` | (all `user`)   |
+| `defaultToolCacheScope`    | string   | Cache partition for tools without an override    | `user`                 |
+| `enableRateLimiting`       | boolean  | Limit tool/LLM usage rate                        | true                   |
+| `toolLoadingStrategy`      | string   | `EAGER` sends every tool spec on every request. `LAZY` sends only a `discover_tools` meta-tool, and injects the tools the model asks for from the next iteration on. Use `LAZY` when a large tool set is crowding the context window | `EAGER` |
+| `maxToolsInContext`        | int      | Maximum tool specifications returned per discovery call under `LAZY`. Ignored under `EAGER` | 20 |
+| `retry`                    | object   | Retry policy for LLM calls — see [Retry configuration](#retry-configuration) | (none) |
+| `responseValidation`       | object   | Validates the model's response and applies a remediation action. Policies: `onEmpty`, `onTruncation`, `onContentFilter`, `onRefusal`, `onStreamingTimeout` | (none) |
+| **Retrieval (RAG)**        |          | Requires the agent's workflow to bind the knowledge base with an `eddi://ai.labs.rag` step — see [RAG](rag.md#configuration) | |
+| `knowledgeBases`           | object[] | Knowledge bases this task retrieves from, by `name`, each optionally overriding `maxResults` / `minScore`. The name must match a KB the workflow binds; an unmatched name is skipped silently | (none) |
+| `enableWorkflowRag`        | boolean  | Retrieve from **every** knowledge base the workflow binds, instead of listing them. Ignored when `knowledgeBases` contains at least one reference; an empty `knowledgeBases` array does **not** suppress it | false |
+| `ragDefaults`              | object   | `maxResults` / `minScore` applied under `enableWorkflowRag`; falls back to each KB's own defaults | (KB defaults) |
+| `httpCallRag`              | string   | Name of an httpCall to execute as a search, injecting its response as `## Search Results:`. Needs no vector store and no workflow step, but calls an **external** search API — it cannot query an EDDI knowledge base | (none) |
+| `maxRagContextChars`       | int      | Ceiling on the assembled RAG context, in characters. `-1` or `0` disables it and restores the older unbounded behaviour | 20000 |
+| **Prompt & History Limits** |         |                                                  |                        |
+| `maxSystemPromptChars`     | int      | Hard ceiling on the whole assembled system prompt, applied after RAG context, counterweight, identity masking and response-format blocks are appended. `-1` leaves it untouched | -1 |
+| `conversationSummary`      | object   | Rolling conversation summary — see [Rolling Conversation Summary](#rolling-conversation-summary) | (none) |
+
+### Behavioral Safety (Counterweight & Identity Masking)
+
+EDDI provides two per-task safety mechanisms that are injected into the system prompt before sending it to the LLM. Both must be explicitly enabled with `"enabled": true` — they are off by default.
+
+#### Behavioral Counterweight
+
+Counterweights append behavioral safety instructions to the system prompt. Three preset levels are available:
+
+| Level | Effect |
+|-------|--------|
+| `normal` | No-op — no safety instructions added (default) |
+| `cautious` | Adds guidelines for careful responses, hedging on uncertain topics, and suggesting professional consultation |
+| `strict` | Adds stronger instructions: refuse harmful content, flag uncertainty, always suggest human oversight |
+
+**Auto-downgrade**: When an agent runs via the `scheduled` channel (e.g., `ScheduleFireExecutor`), `strict` is automatically downgraded to `cautious` to prevent overly rigid responses in automated pipelines.
+
+**Configuration**:
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "type": "openai",
+      "parameters": { "apiKey": "...", "modelName": "gpt-4o" },
+      "counterweight": {
+        "enabled": true,
+        "level": "cautious",
+        "placement": "suffix"
+      }
+    }
+  ]
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `counterweight.enabled` | boolean | Enable counterweight injection | `false` |
+| `counterweight.level` | string | `normal`, `cautious`, or `strict` | `normal` |
+| `counterweight.placement` | string | `suffix` (after system prompt) or `prefix` (before) | `suffix` |
+| `counterweight.customInstructions` | string[] | Custom instruction list that overrides the preset entirely | (none) |
+
+> **Note**: Both `enabled: true` **and** a `level` other than `normal` are required for counterweight to have any effect.
+
+**Customizing presets**: Counterweight preset text is resolved from [Prompt Snippets](prompt-snippets-guide.md) (keys `counterweight-cautious` and `counterweight-strict`). If no snippet exists, built-in defaults are used. This allows admins to customize safety language via the REST API without redeployment.
+
+#### Identity Masking
+
+Identity masking prepends identity concealment rules to the system prompt. This prevents the LLM from revealing its model name, provider, or underlying architecture when asked.
+
+**Configuration**:
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "type": "openai",
+      "parameters": { "apiKey": "...", "modelName": "gpt-4o" },
+      "identityMasking": {
+        "enabled": true,
+        "rules": [
+          "Never reveal you are an AI language model",
+          "If asked about your identity, say you are Aria, a helpful assistant"
+        ]
+      }
+    }
+  ]
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `identityMasking.enabled` | boolean | Enable identity masking | `false` |
+| `identityMasking.rules` | string[] | Identity rules prepended to system prompt | `[]` (empty) |
+
+> **Note**: Both `enabled: true` **and** at least one rule are required. If `rules` is empty, masking is skipped even when enabled.
+
+**Execution order**: Identity masking is applied first, then counterweight. Both modify the system prompt before it is sent to the LLM.
+
+---
+
+## Built-in Tools
+
+When `enableBuiltInTools: true`, you can use these tools:
+
+| Tool Name           | Description                                     | Whitelist Value  |
+| ------------------- | ----------------------------------------------- | ---------------- |
+| **Calculator**      | Safe math expressions (sandboxed parser)        | `calculator`     |
+| **Date/Time**       | Get current date, time, timezone info           | `datetime`       |
+| **Web Search**      | Search the web (includes Wikipedia & News)      | `websearch`      |
+| **Data Formatter**  | Format JSON, CSV, XML data                      | `dataformatter`  |
+| **Web Scraper**     | Extract content from web pages (SSRF-protected) | `webscraper`     |
+| **Text Summarizer** | Summarize long text                             | `textsummarizer` |
+| **PDF Reader**      | Extract text from PDF URLs (SSRF-protected)     | `pdfreader`      |
+| **Weather**         | Get weather information                         | `weather`        |
+| **Tool Response Paging** | Fetch the next page of a tool response that was truncated by `toolResponseLimits` | `fetch_page` / `fetch_tool_response_page` |
+| **Conversation Recall** | Drill back into turns the [rolling summary](#rolling-conversation-summary) has compressed. Only assembled when `conversationSummary.enabled` is true | `conversationRecall` |
+
+> Because a non-empty `builtInToolsWhitelist` enables **only** the tools it names, a whitelist that includes verbose tools should also include `fetch_page` — otherwise truncated tool responses cannot be paged through.
+
+### Tool Configuration (Server-Side)
+
+Some tools require API keys or external configuration to function. These are configured via **Environment Variables** or `application.properties` on the EDDI server.
+
+#### Web Search Tool
+
+By default, the tool uses **DuckDuckGo** (HTML scraping), which requires no configuration.
+
+To use **Google Custom Search** (more reliable/structured), configure these properties:
+
+```properties
+# In application.properties
+eddi.tools.websearch.provider=google
+eddi.tools.websearch.google.api-key=YOUR_GOOGLE_API_KEY
+eddi.tools.websearch.google.cx=YOUR_CUSTOM_SEARCH_ENGINE_ID
+```
+
+**Docker Environment Variables:**
+
+- `EDDI_TOOLS_WEBSEARCH_PROVIDER=google`
+- `EDDI_TOOLS_WEBSEARCH_GOOGLE_API_KEY=...`
+- `EDDI_TOOLS_WEBSEARCH_GOOGLE_CX=...`
+
+#### Weather Tool
+
+The weather tool uses **OpenWeatherMap**. You must provide an API key:
+
+```properties
+# In application.properties
+eddi.tools.weather.openweathermap.api-key=YOUR_OWM_API_KEY
+```
+
+**Docker Environment Variables:**
+
+- `EDDI_TOOLS_WEATHER_OPENWEATHERMAP_API_KEY=...`
+
+### Example: Selective Tool Enablement
+
+```json
+{
+  "enableBuiltInTools": true,
+  "builtInToolsWhitelist": ["calculator", "datetime", "websearch"]
+}
+```
+
+This enables **only** calculator, datetime, and websearch tools.
+
+### Example: Enable All Tools
+
+```json
+{
+  "enableBuiltInTools": true
+}
+```
+
+Omitting `builtInToolsWhitelist` enables all available built-in tools.
+
+---
+
+## Custom HTTP Tools
+
+In addition to built-in tools, your agent gets access to the EDDI HTTP calls configured in its own workflow. This allows the agent to interact with your own APIs or third-party services.
+
+### Configuration
+
+Exposure is controlled by `enableHttpCallTools` (default `true`). Every `eddi://ai.labs.httpcalls` step in the agent's workflow is discovered automatically — there is no per-call list to maintain. Set it to `false` to expose none of them.
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "type": "openai",
+      "parameters": {
+        "apiKey": "...",
+        "modelName": "gpt-4o"
+      },
+      "enableBuiltInTools": true,
+      "enableHttpCallTools": true
+    }
+  ]
+}
+```
+
+The same applies to MCP calls via `enableMcpCallTools` (also default `true`), which discovers the `mcpcalls` configs in the workflow.
+
+> **Legacy**: the `tools` property (a list of httpcall URIs) still exists, but its entries are **not** resolved — listing a URI there grants no access. Its only remaining effect is to switch the task into agent mode, which `enableBuiltInTools` or `a2aAgents` do as well.
+
+### How it Works
+
+1.  **Configuration**: You add httpcall steps to the agent's workflow, as you would for `ApiCallsTask`.
+2.  **Discovery**: Each `ApiCall` in those configurations becomes its own tool, named after the ApiCall's `name`, described by its `description`, and with one string parameter per entry in its `parameters` map. That name is also the key used by `toolPricing`, `toolRateLimits` and `toolCacheScopes`, and the name `toolApprovals` patterns match on (alongside the `http.method:path` form).
+3.  **Execution**: When the agent decides to use a tool, it calls that tool by name (e.g. `get_stock_price`) with the arguments the schema declares.
+4.  **Security**: The agent can **only** execute the HTTP calls present in its workflow. It cannot make arbitrary HTTP requests to the internet. To narrow the agent's reach, narrow the httpcalls configuration in its workflow — or set `enableHttpCallTools: false`.
+
+---
+
+## Extended Configuration Options
+
+The Langchain task supports advanced pre-request and post-response processing for fine-tuned control over task behavior.
+
+### Complete Configuration Example
+
+```json
+{
+  "tasks": [
+    {
+      "id": "advancedTask",
+      "type": "openai",
+      "description": "Task with pre/post processing",
+      "actions": ["process_input"],
+      "preRequest": {
+        "propertyInstructions": [
+          {
+            "name": "userContext",
+            "valueString": "premium_user",
+            "scope": "conversation"
+          }
+        ]
+      },
+      "parameters": {
+        "apiKey": "your-api-key",
+        "modelName": "gpt-4o",
+        "systemMessage": "You are a helpful assistant",
+        "addToOutput": "false"
+      },
+      "postResponse": {
+        "propertyInstructions": [
+          {
+            "name": "lastRespondingAgent",
+            "valueString": "{conversationInfo.agentId}",
+            "scope": "conversation"
+          }
+        ],
+        "outputBuildInstructions": [
+          {
+            "pathToTargetArray": "response.suggestions",
+            "iterationObjectName": "item",
+            "outputType": "text",
+            "outputValue": "{item.text}"
+          }
+        ],
+        "qrBuildInstructions": [
+          {
+            "pathToTargetArray": "response.quickReplies",
+            "iterationObjectName": "reply",
+            "quickReplyValue": "{reply.text}",
+            "quickReplyExpressions": "{reply.action}"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+### Configuration Parameters Explained
+
+#### Pre-Request Configuration
+
+- **preRequest.propertyInstructions**: Defines properties to be set before making the request to the LLM API
+  - **name**: The property name
+  - **valueString**: The value to be assigned (supports templating)
+  - **scope**: The scope of the property (`step`, `conversation`, `longTerm`)
+
+#### Post-Response Configuration
+
+- **postResponse.propertyInstructions**: Defines properties to be set based on the LLM response
+  - **name**: The property name
+  - **valueString**: The value to be assigned (supports templating)
+  - **scope**: The scope of the property
+
+- **postResponse.outputBuildInstructions**: Configures how the response should be transformed into output (alternative to `addToOutput`)
+  - **pathToTargetArray**: The path to the array in the response
+  - **iterationObjectName**: The name of the object for iterating
+  - **outputType**: The type of output to generate
+  - **outputValue**: The value to be used for output (supports templating)
+
+- **postResponse.qrBuildInstructions**: Configures quick replies based on the response
+  - **pathToTargetArray**: The path to the quick replies array
+  - **iterationObjectName**: The name of the object for iterating
+  - **quickReplyValue**: The value for the quick reply (supports templating)
+  - **quickReplyExpressions**: The expressions for the quick reply
+
+#### Response Metadata
+
+- **responseObjectName**: Name for storing the full response object in memory
+- **responseMetadataObjectName**: Name for storing response metadata (token usage, finish reason) in memory
+
+## Conversation Window Management
+
+EDDI provides two modes for controlling how much conversation history is sent to the LLM:
+
+### Step-Count Window (Default)
+
+The default mode uses `conversationHistoryLimit` (or `logSizeLimit` parameter) to include the last N conversation steps. This is simple and backward compatible.
+
+### Token-Aware Window with Anchored Opening
+
+For production workloads where token costs matter, EDDI supports **token-budget windowing** that also **anchors the first N steps** to preserve the opening context.
+
+```
+[System prompt]
+[Turn 1: user's opening message]        ← anchored (always included)
+[Turn 1: agent's opening response]      ← anchored (always included)
+[... turns 3-40 omitted ...]            ← gap marker
+[Turn 41: user message]                 ← recent window (fills remaining budget)
+[Turn 42: agent response]               ← recent window
+[Turn 43: user message]                 ← current
+```
+
+#### Configuration
+
+| Parameter          | Type    | Description                                                                                    | Default |
+| ------------------ | ------- | ---------------------------------------------------------------------------------------------- | ------- |
+| `maxContextTokens` | int     | Maximum token budget for conversation history (excluding system prompt). -1 = use step count. | -1      |
+| `anchorFirstSteps` | int     | Number of opening conversation steps to always include regardless of window position. **Token-aware windowing only** — it takes effect when `maxContextTokens > 0` and is ignored by the step-count window (`conversationHistoryLimit`). | 2       |
+
+#### Example
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["*"],
+      "id": "costAwareAgent",
+      "type": "openai",
+      "parameters": {
+        "apiKey": "your-api-key",
+        "modelName": "gpt-4o",
+        "systemMessage": "You are a project planner."
+      },
+      "enableBuiltInTools": true,
+      "maxContextTokens": 4000,
+      "anchorFirstSteps": 2
+    }
+  ]
+}
+```
+
+This agent:
+- Uses at most **4000 tokens** of conversation history (excluding the system prompt)
+- **Always includes** the first 2 conversation steps (the user's initial requirements)
+- Fills the remaining budget with the most recent messages
+- Inserts a gap marker between anchored and recent messages when turns are omitted
+
+#### Token Counting
+
+- **OpenAI / Azure OpenAI**: Uses tiktoken-based tokenizer (accurate, model-specific)
+- **All other providers**: Uses an approximate tokenizer (characters ÷ 4)
+
+When `maxContextTokens` is -1 (default), the existing `conversationHistoryLimit` step-count behavior applies. **Full backward compatibility is guaranteed.**
+
+### Retry Configuration
+
+`retry` on an LLM task bounds how the engine re-attempts a failed model call. Only errors the
+engine classifies as retriable are retried — transport faults, rate limits and 5xx responses —
+never a malformed request or an authentication failure.
+
+```json
+{
+  "retry": {
+    "maxAttempts": 3,
+    "backoffDelayMs": 1000,
+    "backoffMultiplier": 2.0,
+    "maxBackoffDelayMs": 10000
+  }
+}
+```
+
+| Parameter            | Type   | Description                                          | Default |
+| -------------------- | ------ | ---------------------------------------------------- | ------- |
+| `maxAttempts`        | int    | Total attempts including the first                   | 3       |
+| `backoffDelayMs`     | long   | Delay before the second attempt                      | 1000    |
+| `backoffMultiplier`  | double | Multiplier applied to the delay after each failure   | 2.0     |
+| `maxBackoffDelayMs`  | long   | Ceiling on any single delay                          | 10000   |
+
+The engine clamps these so a config cannot pin a pipeline thread: at most 10 attempts, at most
+30 seconds for one backoff, and at most 60 seconds of backoff in total across the retry sequence.
+A clamped value is reported once in a WARN.
+
+### Rolling Conversation Summary
+
+The third windowing strategy compresses older turns into a running summary that is injected into
+the system message, and keeps only the most recent turns verbatim. Unlike token-aware windowing,
+nothing is dropped outright: the model still sees what happened, in condensed form, and can drill
+back into the full text through the `conversationRecall` built-in tool.
+
+```json
+{
+  "conversationSummary": {
+    "enabled": true,
+    "recentWindowSteps": 5,
+    "maxSummaryTokens": 800,
+    "excludePropertiesFromSummary": true,
+    "maxRecallTurns": 20
+  }
+}
+```
+
+| Parameter                      | Type    | Description                                                                                     | Default |
+| ------------------------------ | ------- | ----------------------------------------------------------------------------------------------- | ------- |
+| `enabled`                      | boolean | Master switch. Nothing is summarized while this is false                                         | false   |
+| `llmProvider`                  | string  | Provider for the summarization call. Inherits the parent task's provider when unset              | (inherit) |
+| `llmModel`                     | string  | Model for the summarization call. Inherits the parent task's model when unset                    | (inherit) |
+| `maxSummaryTokens`             | int     | Token ceiling on the generated summary                                                           | 800     |
+| `excludePropertiesFromSummary` | boolean | Tell the summarizer to skip facts already captured as persistent properties                      | true    |
+| `recentWindowSteps`            | int     | Conversation steps kept verbatim alongside the summary. Everything older is covered by it        | 5       |
+| `maxRecallTurns`               | int     | Maximum verbatim turns returned per `conversationRecall` invocation                              | 20      |
+
+> **Watch the whitelist.** A non-empty `builtInToolsWhitelist` enables only the tools it names, and
+> `conversationRecall` is one of them. Enabling the rolling summary on a task whose whitelist does
+> not include `conversationRecall` leaves the model unable to drill back into summarized turns — it
+> answers from the condensed view with no error and no log line.
+
+### In-Turn Tool Context Budget
+
+`maxContextTokens` and `conversationHistoryLimit` bound the **conversation history** — the
+turns already on the record. They do **not** bound the messages a single tool-using turn
+accumulates *while it runs*. Inside one turn the agent loop appends the model's tool-call
+request and every tool result, iteration after iteration, up to `maxToolIterations`. Verbose
+tools (web scrapes, full PDF dumps, raw API bodies) can push that in-turn context past the
+model's context window and hard-fail the whole turn with a provider `400` — mid-loop, after
+the tool side effects have already happened. Per-tool `toolResponseLimits` help only when they
+are configured; they have no default, so an ordinary agent runs unbounded.
+
+`maxToolContextTokens` puts an **aggregate** ceiling on that in-turn tool traffic:
+
+- It counts only tool traffic — every `AiMessage` that carries tool-call requests plus its
+  `ToolExecutionResultMessage`s, summed across all iterations of this turn (and across a HITL
+  pause, which replays the same transcript). System, user and assistant-prose messages are
+  never counted or touched here — that is what `maxContextTokens` governs.
+- When the ceiling is exceeded, the **oldest complete tool exchange** — a requesting
+  `AiMessage` **together with all of its results** — is dropped before the next model call,
+  repeatedly, until the traffic fits. Requests and their results are always evicted together:
+  dropping one without the other leaves a dangling `tool_call_id` that itself provokes the
+  `400` the budget exists to prevent.
+- The **most recent** exchange is never evicted. If it alone exceeds the ceiling the request
+  is sent unchanged (the model asked for those results and must see them) and the overrun is
+  logged — reach for `toolResponseLimits` or a lower `maxToolIterations` in that case.
+- The same token estimator used for conversation windowing is reused, so a budget expressed in
+  tokens means the same thing in both halves of the request (tiktoken for OpenAI/Azure,
+  characters ÷ 4 elsewhere).
+
+**Default: `60000`.** High enough that no ordinary tool-using turn is ever touched — the guard
+is byte-for-byte inert below the ceiling, so agents that work today are unaffected — and low
+enough to keep a runaway loop inside a 128k context window once the system prompt, the
+conversation history and the model's own completion are added. Set `-1` (or `0`) to disable the
+guard and restore the pre-6.1 unbounded behaviour.
+
+**Observability.** Eviction is never silent: it emits a `tool_context_evicted` entry in the
+execution trace (with token counts before/after, exchanges and messages dropped, and whether
+the result is within budget), increments the `eddi.llm.tool_context.evictions` counter (tagged
+`outcome=within_budget|still_over_budget`), and logs a `WARN` (`llm.tool_context.evicted`)
+carrying the conversation id and the remediation hint. Because eviction removes tool results the
+model can no longer see, treat a steady stream of these as a signal to lower `maxToolIterations`,
+set `toolResponseLimits`, or raise `maxToolContextTokens`.
+
+```json
+{
+  "type": "openai",
+  "parameters": { "modelName": "gpt-4o" },
+  "enableBuiltInTools": true,
+  "builtInToolsWhitelist": ["websearch", "webscraper"],
+  "maxToolIterations": 10,
+  "maxToolContextTokens": 60000
+}
+```
+
+---
+
+## API Endpoints
+
+The Langchain task configurations can be managed via REST API endpoints.
+
+### Endpoints Overview
+
+1. **Read JSON Schema**
+   - **Endpoint:** `GET /llmstore/llms/jsonSchema`
+   - **Description:** Retrieves the JSON schema for validating Langchain configurations
+
+2. **List Langchain Descriptors**
+   - **Endpoint:** `GET /llmstore/llms/descriptors`
+   - **Description:** Returns a list of all Langchain configurations with optional filters
+
+3. **Read Langchain Configuration**
+   - **Endpoint:** `GET /llmstore/llms/{id}`
+   - **Description:** Fetches a specific Langchain configuration by its ID
+
+4. **Update Langchain Configuration**
+   - **Endpoint:** `PUT /llmstore/llms/{id}`
+   - **Description:** Updates an existing Langchain configuration
+
+5. **Create Langchain Configuration**
+   - **Endpoint:** `POST /llmstore/llms`
+   - **Description:** Creates a new Langchain configuration
+
+6. **Duplicate Langchain Configuration**
+   - **Endpoint:** `POST /llmstore/llms/{id}`
+   - **Description:** Duplicates an existing Langchain configuration
+
+7. **Delete Langchain Configuration**
+   - **Endpoint:** `DELETE /llmstore/llms/{id}`
+   - **Description:** Deletes a specific Langchain configuration
+
+---
+
+## Tool Execution Pipeline
+
+All tool invocations—both built-in tools and custom HTTP call tools—are routed through a unified **Tool Execution Service** that applies enterprise-grade controls:
+
+```
+Tool Call ──▶ Rate Limiter ──▶ Cache Check ──▶ Execute Tool ──▶ Cost Tracker ──▶ Result
+```
+
+### Controls
+
+| Feature           | Description                                                            | Config Key                                                 |
+| ----------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **Rate Limiting** | Token-bucket per tool, configurable limits                             | `enableRateLimiting`, `defaultRateLimit`, `toolRateLimits` |
+| **Smart Caching** | Deduplicates identical tool calls, partitioned per identity            | `enableToolCaching`, `toolCacheScopes`, `defaultToolCacheScope` |
+| **Cost Tracking** | Per-conversation tool-cost accounting, with an opt-in ceiling and automatic stale-data eviction | `enableCostTracking`, `toolPricing`, `maxBudgetPerConversation`, `enforceBudget` |
+
+#### Tool names: dispatch name vs. configuration slug
+
+A built-in tool has **two** names, and knowing which one a setting expects is the
+difference between a rule that binds and one that is silently ignored:
+
+- the **slug** — the token you write in `builtInToolsWhitelist` (`websearch`,
+  `calculator`, `datetime`, …). This is a property of the *tool*.
+- the **dispatch name** — the `@Tool` method the model actually calls
+  (`searchWeb`, `searchNews`, `searchWikipedia` all belong to `websearch`). This
+  is a property of the individual *operation*.
+
+| Setting                      | Accepted keys                                        |
+| ---------------------------- | ---------------------------------------------------- |
+| `builtInToolsWhitelist`      | slug only                                            |
+| `toolRateLimits`             | slug **or** dispatch name — dispatch name wins       |
+| `toolPricing`                | slug **or** dispatch name — dispatch name wins       |
+| `toolCacheScopes`            | slug **or** dispatch name — dispatch name wins       |
+| `toolApprovals`              | dispatch name, optionally `source:name`-qualified    |
+| cache TTL, default price     | slug (resolved automatically)                        |
+| `eddi.tool.*` metric `tool` tag | dispatch name                                     |
+
+> **Rate-limit buckets are per dispatch name.** `{"websearch": 30}` sets the
+> *limit* for the whole tool but gives `searchWeb`, `searchNews` and
+> `searchWikipedia` 30 calls/minute **each**, not 30 between them. Pin a single
+> operation by using its dispatch name: `{"searchNews": 5}`.
+
+#### Budgets
+
+`maxBudgetPerConversation` bounds **tool** cost only — the accumulated per-call
+prices of the tools a conversation invokes. LLM token spend is a separate,
+run-scoped concern governed by the model cascade's `maxCostPerRun`; the two are
+not added together.
+
+Enforcement is **opt-in**: a configured ceiling records cost but refuses nothing
+until you add `enforceBudget: true`. Built-in tools priced at $0.00 until the
+canonical-slug fix in this release, so enforcing automatically would make those
+ceilings bind for the first time and start aborting tool calls mid-conversation
+on upgrade.
+
+That choice has a real cost, which is why the engine warns rather than staying
+quiet: http, MCP, A2A and dynamic tools dispatch under their configured name, so
+a tool called `websearch` **was** priced and refused before `enforceBudget`
+existed. If you relied on such a ceiling, add the flag — every task carrying a
+ceiling without it is named once in a startup WARN. Cost is tracked and reported
+(`GET /llm/tools/costs`, `eddi.tool.costs`) either way. The deployment-wide
+default comes from `eddi.tools.budget.enforce-by-default` (default `false`).
+
+The check runs *before* each call and uses `<=`, so the call that crosses the
+ceiling still completes and the next one is refused with
+`Error: Budget exceeded for conversation <id>`.
+
+Default per-call prices: `webscraper` $0.002, `websearch` $0.001, `pdfreader`
+$0.001, `weather` $0.0005; `calculator`, `datetime`, `dataformatter` and
+`textsummarizer` are free. Anything not in that table — http, mcp, a2a, dynamic
+and the remaining built-ins — costs $0.00 until you price it with `toolPricing`.
+Negative `toolPricing` values are clamped to 0.0.
+
+#### Tool cache scoping
+
+Cached tool results are partitioned by identity. The cache key is
+`scopeTag|toolName:arguments`, and the scope tag is resolved per tool call as
+`toolCacheScopes[<dispatch name>]` → `toolCacheScopes[<slug>]` →
+`defaultToolCacheScope` → `user`:
+
+| Scope          | Tag                                    | A cached result is reused…                     |
+| -------------- | -------------------------------------- | ---------------------------------------------- |
+| `user`         | `u:<32 hex chars of SHA-256(userId)>`  | only for the same authenticated user (default) |
+| `conversation` | `c:<conversationId>`                   | only inside the conversation that produced it  |
+| `global`       | `g`                                    | by everyone — opt-in only                      |
+
+Choose `global` **only** for tools whose result depends purely on their
+arguments and never on who is asking (pure computation, public reference data).
+It is the one setting that permits cross-user reuse.
+
+When `user` scope applies but there is no user id, the entry falls back to the
+narrower conversation partition. When neither identity is available the cache is
+bypassed entirely for that call — nothing is read and nothing is stored, and the
+`eddi.tool.cache.bypassed` counter is incremented.
+
+An unrecognized token never fails the agent load, and it never widens a tool's
+audience either. A `toolCacheScopes` entry whose value does not parse
+(`"usr"`, `""`, `null`) resolves to `user` — **not** to `defaultToolCacheScope`,
+which could be `global` — and is logged at WARN naming the tool and the bad
+token. An unrecognized `defaultToolCacheScope` likewise resolves to `user`.
+
+Per-tool TTLs are enforced per entry: a cached result is removed once its own
+TTL has elapsed since it was written, independently of the other entries in the
+cache. The TTL is resolved from the dispatch name first and the slug second, so
+`searchNews` gets the 10-minute `news` TTL while its `searchWeb` sibling
+inherits `websearch`'s 30 minutes. `GET /llm/tools/cache/ttl/{toolName}` reports
+the TTL that will be applied. Size eviction (10 000 entries) is the secondary
+bound.
+
+### Configuration Example
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["help"],
+      "type": "openai",
+      "enableBuiltInTools": true,
+      "enableRateLimiting": true,
+      "defaultRateLimit": 100,
+      "toolRateLimits": { "websearch": 30, "weather": 50 },
+      "enableToolCaching": true,
+      "enableCostTracking": true,
+      "toolPricing": { "websearch": 0.005 },
+      "maxBudgetPerConversation": 5.0,
+      "enforceBudget": true,
+      "parameters": { "apiKey": "...", "modelName": "gpt-4o" }
+    }
+  ]
+}
+```
+
+### Security Hardening
+
+Tools that accept URLs from LLM-generated arguments are protected against **Server-Side Request Forgery (SSRF)**:
+
+- Only `http` and `https` schemes are allowed
+- Private/internal IP ranges are blocked (loopback, site-local, link-local)
+- Cloud metadata endpoints are blocked (`169.254.169.254`, `metadata.google.internal`)
+- Internal hostnames (`.local`, `.internal`, `localhost`) are rejected
+
+The **Calculator** tool uses a sandboxed recursive-descent math parser (`SafeMathParser`) instead of a script engine, eliminating any possibility of code injection.
+
+See the [Security documentation](security.md) for full details.
+
+---
+
+## Monitoring & Observability
+
+EDDI provides built-in metrics for monitoring agent performance:
+
+- Tool execution success/failure rates
+- Response latency (P50, P95, P99)
+- Cache hit rates
+- Cost tracking
+- Rate limit violations
+
+See the [Metrics Documentation](metrics.md) for details on configuring Prometheus/Grafana monitoring.
+
+---
+
+## Complete Example: Multi-Capability Agent
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["*"],
+      "id": "universalAssistant",
+      "type": "openai",
+      "description": "Universal AI assistant with multiple capabilities",
+      "parameters": {
+        "apiKey": "your-openai-api-key",
+        "modelName": "gpt-4o",
+        "systemMessage": "You are a helpful AI assistant with access to calculator, web search, and weather tools.",
+        "temperature": "0.7",
+        "timeout": "30000"
+      },
+      "enableBuiltInTools": true,
+      "builtInToolsWhitelist": [
+        "calculator",
+        "datetime",
+        "websearch",
+        "weather"
+      ],
+      "conversationHistoryLimit": 10
+    }
+  ]
+}
+```
+
+This agent can:
+
+- ✅ Perform calculations
+- ✅ Get date/time info
+- ✅ Search the web
+- ✅ Check weather
+- ✅ Maintain 10 turns of conversation history
+
+---
+
+## Integration with Behavior Rules
+
+To trigger the Langchain task, configure Behavior Rules to emit the appropriate action:
+
+```json
+{
+  "behaviorGroups": [
+    {
+      "name": "Send to LLM",
+      "behaviorRules": [
+        {
+          "name": "User asks question",
+          "conditions": [
+            {
+              "type": "inputmatcher",
+              "configs": {
+                "expressions": "*",
+                "occurrence": "currentStep"
+              }
+            }
+          ],
+          "actions": ["send_message"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Then reference this action in your Langchain task:
+
+```json
+{
+  "tasks": [
+    {
+      "actions": ["send_message"],
+      "id": "myChat",
+      "type": "openai",
+      "parameters": {
+        "apiKey": "your-api-key",
+        "addToOutput": "true"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Structured Output (JSON Mode)
+
+When you need the LLM to return a specific JSON structure (e.g., for property extraction, API response formatting, or quick reply generation), use the `convertToObject` parameter with an optional `responseSchema`.
+
+### Three-Layer Enforcement
+
+EDDI uses three complementary mechanisms to ensure reliable JSON output:
+
+| Layer | Mechanism | Coverage |
+|---|---|---|
+| **1. System Prompt** | Appends `## RESPONSE FORMAT (MANDATORY)` section with schema to every request | All providers |
+| **2. Native API** | Sets `ResponseFormatType.JSON` on the outgoing `ChatRequest` | See the matrix below |
+| **3. Validation** | Pre-parse `startsWith("{")` check before deserialization | All providers |
+
+If a provider doesn't support native JSON mode (e.g. Anthropic), EDDI gracefully falls back to prompt-only enforcement.
+
+#### Native JSON mode — provider matrix
+
+Layer 2 is applied **per request**, never baked into the model instance, and it is applied in **all three execution modes**: no-tools (legacy), agent mode (tool-calling) and streaming — including every step of a multi-model cascade, which is evaluated against that step's own provider.
+
+| Provider | No tools (legacy / streaming) | Agent mode (tools present) |
+|---|---|---|
+| `openai` | ✅ | ✅ |
+| `azure-openai` | ✅ | ✅ |
+| `mistral` | ✅ | ✅ |
+| `gemini`, `gemini-vertex` | ✅ | ❌ — the Gemini API rejects `responseMimeType: application/json` together with `tools` |
+| `anthropic`, `bedrock` | ❌ — both reject a JSON format without a schema | ❌ |
+| `ollama`, `jlama`, `huggingface`, `oracle-genai` | ❌ (not verified — opt in with `jsonResponseFormat: "on"`) | ❌ |
+
+#### Overriding the matrix per task
+
+Set `jsonResponseFormat` on the LLM **task** (not in `parameters`):
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Use the matrix above, including the tools-aware distinction |
+| `on` | Always send the JSON format when `convertToObject=true`, tools included. The escape hatch for a provider or OpenAI-compatible gateway the matrix does not know yet — it also bypasses the Gemini guard, so only use it where you have verified the provider accepts the combination |
+| `off` | Never send it; enforcement stays prompt-only |
+
+```json
+{
+  "id": "classifier",
+  "type": "mistral",
+  "jsonResponseFormat": "auto",
+  "parameters": { "convertToObject": "true" }
+}
+```
+
+> **Do not set a `responseFormat` model parameter.** It is only read by the OpenAI builder and it bakes JSON mode into a **cached** model that is then reused for tool-calling and streaming requests — the cause of the historical Gemini `400 Function calling with a response mime type: 'application/json' is unsupported`. `convertToObject` alone is enough.
+
+### Basic JSON Mode
+
+```json
+{
+  "parameters": {
+    "convertToObject": "true",
+    "addToOutput": "false",
+    "systemMessage": "You are a customer support classifier."
+  }
+}
+```
+
+### With Response Schema
+
+For maximum reliability, specify the exact JSON structure you expect:
+
+```json
+{
+  "parameters": {
+    "convertToObject": "true",
+    "addToOutput": "false",
+    "responseSchema": "{\"htmlResponseText\": \"string — the formatted response\", \"quickReplies\": [\"string — suggested follow-up options\"], \"sentiment\": \"positive|negative|neutral\"}",
+    "systemMessage": "You are a customer support agent. Analyze the user's message and respond."
+  }
+}
+```
+
+The schema is injected into the system prompt as a JSON code block so the LLM sees the exact expected format.
+
+### Using with Output Configuration
+
+When `convertToObject=true`, the LLM's JSON response is stored in conversation memory as a parsed object. You can then reference its fields in the Output Configuration:
+
+```json
+{
+  "outputBuildInstructions": [{
+    "outputType": "text",
+    "outputValue": "{properties.aiOutputObject.htmlResponseText}"
+  }],
+  "qrBuildInstructions": [{
+    "pathToTargetArray": "properties.aiOutputObject.quickReplies",
+    "iterationObjectName": "quickReply",
+    "quickReplyValue": "{quickReply}",
+    "quickReplyExpressions": "trigger(quick_reply)"
+  }]
+}
+```
+
+### Debugging
+
+When `convertToObject=true`, the raw LLM response is **always** persisted in conversation memory (key: `langchain:data`) even if JSON parsing fails. This ensures you can inspect what the LLM actually returned via the conversation log.
+
+### Tips
+
+- **Streaming**: Not recommended with JSON mode — the UI would show raw JSON building up. It does work (the streamed request carries the format for supported providers), but pair it with `addToOutput: "false"` and a `postResponse`
+- **Provider compatibility**: see the provider matrix above. Unsupported providers rely on prompt-based enforcement
+- **Schema specificity**: The more specific your `responseSchema`, the more reliable the output. Use type hints (`"string"`, `"number"`, `"boolean"`) and descriptions
+
+---
+
+## Deprecated parameters
+
+### `includeFirstAgentMessage`
+
+**Deprecated. Still honoured; do not use it in new configurations.**
+
+It exists for one reason: Anthropic used to reject a conversation whose first
+message was an assistant turn, so the flag stripped EDDI's opening greeting to
+make the history start with a user message.
+
+**That restriction is gone.** The
+[Messages API reference](https://platform.claude.com/docs/en/api/messages) no
+longer documents a first-message role rule anywhere, and a history beginning with
+an assistant turn is accepted.
+
+What remains is a flag whose only documented reason to exist has expired, and
+which for years was implemented as *remove the first message* regardless of whose
+it was — so an agent with no `ai.labs.output` step, which opens on the **user's**
+turn, sent an empty history and Anthropic answered
+`invalid_request_error: messages: Field required`. The removal is role-aware now,
+so the flag is no longer dangerous; it is merely pointless for the case it was
+written for.
+
+**Why deprecated rather than removed.** Agent behaviour lives in JSON stored in
+MongoDB and imported from ZIPs — the one backward-compatibility boundary this
+codebase has. Silently ignoring a parameter an author set deliberately would be
+worse than honouring it: an agent that genuinely wants its greeting withheld
+would start sending it, with no diagnostic. So the flag keeps working exactly as
+before, and `LlmTask` logs a WARN naming the task the first time each configured
+task uses it.
+
+**What to do:** delete it from the task. Keep it only if that agent must really
+withhold its opening greeting from the model — which is a presentation choice,
+not a provider requirement.
+
+## Common Issues and Troubleshooting
+
+### API Key Issues
+
+- **Problem**: "Invalid API key" errors
+- **Solution**: Ensure API keys are valid and have not expired. Renew them before expiry.
+
+### Model Misconfiguration
+
+- **Problem**: "Model not found" errors
+- **Solution**: Verify model names match those supported by the provider (e.g., "gpt-4o" for OpenAI, not "gpt4")
+
+### Timeout Issues
+
+- **Problem**: Requests timing out
+- **Solution**: Increase the `timeout` parameter value (in milliseconds). Default is often 15000 (15 seconds).
+- **Problem**: A *streaming* turn is cut off after ~120s even though `timeout` is larger
+- **Solution**: This was the behaviour before the `timeout`/`streamingTimeoutSeconds` unification; the backstop now follows a longer `timeout` automatically. Set `streamingTimeoutSeconds` explicitly if you need a bound that differs from the derived one — see [Timeouts and Streaming](#timeouts-and-streaming).
+
+### Anthropic First Message Error
+
+- **Historical problem**: the Anthropic API rejected conversations starting with an agent message
+- **Solution**: Historical. The Messages API no longer documents a "first message must be
+  the user's" rule, and an assistant-first history is accepted — so `includeFirstAgentMessage`
+  is not the fix for a modern Anthropic failure. Leave it unset.
+
+### `invalid_request_error: messages: Field required` (Anthropic)
+
+- **Problem**: An agent with **no** `ai.labs.output` step — a group member that only answers,
+  say — sends an empty message list.
+- **Cause**: `includeFirstAgentMessage: "false"` drops the opening greeting. An agent that
+  produces no greeting opens on the *user's* turn, so on the first turn there was nothing
+  left to send. The removal is role-aware since 6.4.1 and only ever drops an **agent**
+  message, so this cannot recur; a local Ollama smoke test will not reproduce it either,
+  because Ollama accepts an empty message list.
+- **Solution**: Remove `includeFirstAgentMessage` from the task (or set it to `"true"`).
+
+### Tool Not Working
+
+- **Problem**: Agent not using expected tools
+- **Solution**:
+  - Verify `enableBuiltInTools: true` is set
+  - Check `builtInToolsWhitelist` includes the desired tool
+  - Ensure the model supports tool calling (e.g., gpt-4o, not gpt-3.5-turbo)
+
+### Response Not Added to Output
+
+- **Problem**: LLM response not visible to user
+- **Solution**: Set `addToOutput: "true"` in parameters, or configure `postResponse.outputBuildInstructions`
+
+---
+
+## Tool Execution Context
+
+Understanding how tools execute is critical for designing new built-in tools and avoiding common pitfalls.
+
+### Execution Path
+
+All LLM tools execute **inside a conversation pipeline**. The full execution path is:
+
+```
+LlmTask.execute(memory)
+  └─→ AgentOrchestrator.buildToolList(memory, config)
+      └─→ Constructs tool instances with conversation context
+  └─→ LLM invokes tool
+  └─→ ToolExecutionService.executeToolWrapped()
+      └─→ Rate Limiter → Cache Check → Execute → Cost Tracker → Result
+```
+
+### Implicit Context
+
+`IConversationMemory` is **always available** when tools execute. Tools that need conversation state (e.g., `userId`, `agentId`, `groupIds`) receive it via constructor injection from `AgentOrchestrator`, which has the memory object at tool-list build time.
+
+This means:
+- **No ThreadLocal** or request-scoped beans needed
+- **No `userId` parameter** on LLM tools — the conversation always knows who the user is
+- Only external interfaces (MCP, REST) that operate **outside** a conversation need explicit user identification
+
+### LLM Tools vs MCP Tools
+
+| Aspect | LLM Tools (built-in) | MCP Tools |
+|---|---|---|
+| Execution context | Inside conversation pipeline | Outside conversation |
+| User identification | Implicit from `IConversationMemory` | Explicit `userId` parameter |
+| Registration | `builtInToolsWhitelist` in langchain config | `McpMemoryTools.java` |
+| Audience | The LLM agent itself | External AI agents or admin tooling |
+
+---
+
+## See Also
+
+- [Behavior Rules](behavior-rules.md) - Triggering LLM tasks conditionally
+- [HTTP Calls](httpcalls.md) - Creating custom HTTP call tools for agents
+- [Security](security.md) - SSRF protection, sandboxed evaluation, tool hardening
+- [Output Configuration](output-configuration.md) - Formatting agent responses
+- [Conversation Memory](conversation-memory.md) - Understanding conversation state
+- [Metrics](metrics.md) - Monitoring LLM performance
+
+---
+
+## Summary
+
+The LLM Lifecycle Task provides a flexible, unified interface for integrating LLMs into EDDI agents:
+
+1. ✅ **Simple by Default** - Start with basic chat, add tools when needed
+2. ✅ **12 Provider Support** - OpenAI, Anthropic, Google Gemini, Google Vertex AI, Mistral, Azure, Bedrock, Oracle, Ollama, Hugging Face, Jlama + OpenAI-compatible (DeepSeek, Cohere)
+3. ✅ **Built-in Tools** - 9 tools available when you enable agent mode
+4. ✅ **Tool Execution Pipeline** - Rate limiting, caching, cost tracking for every tool call
+5. ✅ **Security Hardened** - SSRF protection, sandboxed math evaluation, input validation
+6. ✅ **Fine-Grained Control** - Pre/post processing, context management, templating
+7. ✅ **Orchestration Layer** - Conditional invocation, hybrid workflows, state persistence
+8. ✅ **Easy Configuration** - Generated for you by the Manager's agent wizard or the Platform Operator
+
+Whether you need simple chat or advanced agent capabilities, the Langchain task provides the foundation for intelligent conversational experiences in EDDI.

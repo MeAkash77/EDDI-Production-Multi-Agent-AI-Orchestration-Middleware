@@ -1,0 +1,683 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.mcp;
+
+import ai.labs.eddi.configs.rest.StrictConfigurationParser;
+import ai.labs.eddi.configs.groups.IGroupWorkspaceStore;
+import ai.labs.eddi.configs.groups.IRestAgentGroupStore;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration;
+import ai.labs.eddi.configs.groups.model.GroupWorkspace;
+import ai.labs.eddi.configs.groups.templates.GroupTemplateService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import ai.labs.eddi.configs.groups.model.SharedTaskList;
+import ai.labs.eddi.configs.groups.rest.RestGroupWorkspace;
+import ai.labs.eddi.configs.groups.model.SharedTaskList.TaskItem;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.TaskDefinition;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.DiscussionStyle;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.GroupMember;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.ProtocolConfig;
+import ai.labs.eddi.configs.groups.model.DiscussionStylePresets;
+import ai.labs.eddi.configs.groups.model.GroupConversation;
+import ai.labs.eddi.configs.descriptors.model.DocumentDescriptor;
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.datastore.serialization.IJsonSerialization;
+import ai.labs.eddi.engine.api.IGroupConversationService;
+import ai.labs.eddi.engine.security.OwnershipValidator;
+import ai.labs.eddi.utils.LogSanitizer;
+import io.quarkiverse.mcp.server.Tool;
+import io.quarkiverse.mcp.server.ToolArg;
+import io.quarkus.security.ForbiddenException;
+import io.quarkus.security.identity.SecurityIdentity;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.core.Response;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static ai.labs.eddi.engine.mcp.McpToolUtils.*;
+
+/**
+ * MCP tools for managing agent groups and group conversations. Exposes CRUD for
+ * group configurations and discussion orchestration as MCP-compliant tools.
+ * <p>
+ * Phase 10 — Group Conversations
+ *
+ * @author ginccc
+ */
+@ApplicationScoped
+public class McpGroupTools {
+
+    private static final Logger LOGGER = Logger.getLogger(McpGroupTools.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private final IRestAgentGroupStore groupStore;
+    private final IGroupConversationService groupConversationService;
+    private final IJsonSerialization jsonSerialization;
+
+    /**
+     * Strict deserialisation for the config bodies this surface accepts — the same
+     * check REST's {@code StrictConfigurationBodyInterceptor} applies, which never
+     * fires for these in-process calls. See {@code StrictConfigurationParser}.
+     */
+    private final StrictConfigurationParser configParser;
+    private final SecurityIdentity identity;
+    private final OwnershipValidator ownershipValidator;
+    private final IGroupWorkspaceStore workspaceStore;
+    private final GroupTemplateService templateService;
+    private final boolean authEnabled;
+
+    @Inject
+    public McpGroupTools(IRestAgentGroupStore groupStore, IGroupConversationService groupConversationService, IJsonSerialization jsonSerialization,
+            StrictConfigurationParser configParser, SecurityIdentity identity, OwnershipValidator ownershipValidator,
+            IGroupWorkspaceStore workspaceStore, GroupTemplateService templateService,
+            @ConfigProperty(name = "authorization.enabled", defaultValue = "false") boolean authEnabled) {
+        this.configParser = configParser;
+        this.groupStore = groupStore;
+        this.groupConversationService = groupConversationService;
+        this.jsonSerialization = jsonSerialization;
+        this.identity = identity;
+        this.ownershipValidator = ownershipValidator;
+        this.workspaceStore = workspaceStore;
+        this.templateService = templateService;
+        this.authEnabled = authEnabled;
+    }
+
+    /**
+     * MCP parity with the REST surface: a specific group conversation may only be
+     * read or mutated by its owner (or an admin). The MCP role check alone is a
+     * coarse gate — without this, any caller holding the baseline MCP role could
+     * read, append to, re-run or close ANOTHER user's group conversation, while the
+     * equivalent REST endpoints all enforce {@code requireOwnerOrAdmin} (403).
+     */
+    private void requireConversationOwner(String groupConversationId)
+            throws IResourceStore.ResourceNotFoundException, IResourceStore.ResourceStoreException {
+        GroupConversation gc = groupConversationService.readGroupConversation(groupConversationId);
+        ownershipValidator.requireOwnerOrAdmin(identity, gc.getUserId(), "group conversation");
+    }
+
+    /**
+     * Resolves the owner to record on a conversation created over MCP. With auth
+     * enabled this is the CALLING principal (a blank {@code userId} resolves to the
+     * caller, and a non-admin naming someone else is rejected) — so the creator can
+     * subsequently read/continue/close their own conversation through the ownership
+     * gate, and cannot create one owned by another user. The legacy "mcp-client"
+     * default only applies when auth is off (with auth on, {@code requireRole} has
+     * already rejected anonymous callers before this runs).
+     */
+    private String resolveOwner(String userId) {
+        String resolved = ownershipValidator.validateAndResolveUserId(identity, userId);
+        return resolved != null && !resolved.isBlank() ? resolved : "mcp-client";
+    }
+
+    /**
+     * Uniform, non-leaking denial for an MCP call on someone else's conversation.
+     */
+    private String accessDenied(String tool, String groupConversationId) {
+        // WARN, not INFO: an authorization denial is a security-relevant event that log
+        // monitoring should be able to alert on.
+        LOGGER.warnf("%s denied: caller does not own group conversation %s",
+                tool, LogSanitizer.sanitize(groupConversationId));
+        return errorJson("Access denied: you do not own this group conversation");
+    }
+
+    // --- Discovery ---
+
+    @Tool(description = "Describe all available discussion styles for agent " + "groups. Returns the name, phase flow, and recommended use case "
+            + "for each style (ROUND_TABLE, PEER_REVIEW, DEVIL_ADVOCATE, " + "DELPHI, DEBATE, TASK_FORCE, NEGOTIATION, plus CUSTOM). Call this "
+            + "before create_group to choose the right style.")
+    public String describe_discussion_styles() {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        return """
+                ## Discussion Styles
+
+                ### ROUND_TABLE (default)
+                Flow: Opinion → Discussion (N rounds) → Synthesis
+                Use when: Brainstorming, open-ended exploration, general Q&A panels.
+                Member roles: none required.
+
+                ### PEER_REVIEW
+                Flow: Opinion → Critique (each agent reviews each peer) → Revision → Synthesis
+                Use when: Code review, document review, proposal evaluation — anywhere structured feedback matters.
+                Member roles: none required. All members critique all others.
+
+                ### DEVIL_ADVOCATE
+                Flow: Opinion → Challenge (devil argues against consensus) → Defense → Synthesis
+                Use when: Risk assessment, stress-testing assumptions, identifying blind spots.
+                Member roles: assign one member role=DEVIL_ADVOCATE.
+
+                ### DELPHI
+                Flow: Independent Opinion → Anonymous Sharing → Revised Opinion → ... → Synthesis
+                Use when: Forecasting, reducing groupthink, getting unbiased independent estimates.
+                Member roles: none required. Opinions are anonymized between rounds.
+
+                ### DEBATE
+                Flow: Pro Opening → Con Opening → Pro Rebuttal → Con Rebuttal → Judge
+                Use when: Evaluating trade-offs, pro/con analysis, technology comparisons.
+                Member roles: assign members role=PRO or role=CON. Moderator acts as judge.
+
+                ### TASK_FORCE
+                Flow: Plan → Execute (parallel) → Verify → Synthesis
+                TASK_FORCE — Collaborative task accomplishment. The moderator decomposes the
+                goal into tasks, each agent executes their assigned tasks in parallel, a
+                verification phase checks results, and a synthesis phase combines everything.
+                Best for: concrete deliverables, divide-and-conquer goals, project-style work.
+                Member roles: none required. Moderator handles planning and synthesis.
+                Optional: pass pre-configured tasks via the `tasks` parameter to skip the
+                PLAN phase entirely.
+
+                ### NEGOTIATION
+                Flow: Positions & Interests → Opening Proposals → Bargaining (N rounds) → Arbitration → Synthesis
+                Trade, not win/lose. Members state interests independently (they do not see each
+                other first), then exchange proposals and bargain with a concession ledger tracking
+                what each side gave up. Arbitration is SKIPPED when agreement is reached — the
+                moderator only rules when bargaining failed to converge.
+                Use when: surfacing trade-offs, splitting scarce budget or scope, drafting a
+                compromise both sides can sign.
+                Member roles: none required. Moderator arbitrates and synthesizes.
+
+                ### CUSTOM
+                Flow: whatever you define via the `phases` parameter.
+                Use when: none of the presets fit — you need your own phase sequence, per-phase
+                turn order, context scope, voting, or approval gates.
+                Member roles: as your phases require.
+
+                ## Nested Groups (Group-of-Groups)
+                Members can be other groups (memberTypes=GROUP). The sub-group runs its
+                own full discussion and its synthesized answer becomes the member's response.
+                Use this for parallel review panels, red-team vs blue-team, or tournament brackets.
+
+                ## Parameters
+                - maxRounds: controls repeat count for ROUND_TABLE and DELPHI (default 2)
+                - moderatorAgentId: required for synthesis/judging phase
+                - memberRoles: comma-separated roles matching member positions
+                - memberTypes: comma-separated types: AGENT (default) or GROUP
+                - tasks: (TASK_FORCE only) JSON array of pre-configured task definitions.
+                  Each task: {"subject":"...","description":"...","assignToRole":"ALL",
+                  "dependsOn":[],"priority":0}. If provided, the PLAN phase is skipped.
+                """;
+    }
+
+    // --- Group Config CRUD ---
+
+    @Tool(description = "List all agent group configurations. Returns " + "descriptors with name, ID, and last modified date.")
+    public String list_groups(@ToolArg(description = "Filter by group name (optional)") String filter,
+                              @ToolArg(description = "Page index, 0-based (default 0)") String index,
+                              @ToolArg(description = "Page size (default 20)") String limit) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            int idx = parseIntOrDefault(index, 0);
+            int lim = parseIntOrDefault(limit, 20);
+            String flt = filter != null ? filter : "";
+            List<DocumentDescriptor> descriptors = groupStore.readGroupDescriptors(flt, idx, lim);
+            return jsonSerialization.serialize(descriptors);
+        } catch (Exception e) {
+            LOGGER.errorf("list_groups failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Read a group configuration including its members, " + "discussion style, phases, and protocol settings.")
+    public String read_group(@ToolArg(description = "Group configuration ID") String groupId,
+                             @ToolArg(description = "Version number (0 or omit for latest)") String version) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            int ver = parseIntOrDefault(version, 0);
+            if (ver == 0) {
+                ver = groupStore.getCurrentVersion(groupId);
+            }
+            AgentGroupConfiguration config = groupStore.readGroup(groupId, ver);
+            return jsonSerialization.serialize(config);
+        } catch (Exception e) {
+            LOGGER.errorf("read_group failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Create a new agent group for multi-agent discussions. " + "Call describe_discussion_styles first to choose a style. "
+            + "Members can be agents (default) or nested groups (memberTypes=GROUP).")
+    public String create_group(@ToolArg(description = "Group name") String name,
+                               @ToolArg(description = "Group description (optional)") String description,
+                               @ToolArg(description = "Comma-separated member IDs (agent IDs or "
+                                       + "group IDs depending on memberTypes)") String memberAgentIds,
+                               @ToolArg(description = "Comma-separated display names (optional)") String memberDisplayNames,
+                               @ToolArg(description = "Comma-separated member roles: PARTICIPANT, "
+                                       + "DEVIL_ADVOCATE, PRO, CON (optional)") String memberRoles,
+                               @ToolArg(description = "Comma-separated member types: AGENT "
+                                       + "(default) or GROUP for nested groups (optional)") String memberTypes,
+                               @ToolArg(description = "Moderator agent ID (optional)") String moderatorAgentId,
+                               @ToolArg(description = "Discussion style: ROUND_TABLE, PEER_REVIEW, "
+                                       + "DEVIL_ADVOCATE, DELPHI, DEBATE, TASK_FORCE, NEGOTIATION, CUSTOM "
+                                       + "(default ROUND_TABLE). All eight work; see describe_discussion_styles") String style,
+                               @ToolArg(description = "Max rounds (default 2)") String maxRounds,
+                               @ToolArg(description = "Maximum total agent turns across all phases (default 50). "
+                                       + "Safety cap to prevent runaway discussions.") String maxTurns,
+                               @ToolArg(description = "JSON array of pre-configured tasks for TASK_FORCE style "
+                                       + "(optional). Each element: {\"subject\":\"...\",\"description\":\"...\","
+                                       + "\"assignToRole\":\"ALL\",\"dependsOn\":[],\"priority\":0}. "
+                                       + "If provided, the PLAN phase is skipped.") String tasks) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            AgentGroupConfiguration config = new AgentGroupConfiguration();
+            config.setName(name);
+            config.setDescription(description);
+
+            // Parse members
+            String[] agentIds = memberAgentIds.split(",");
+            String[] displayNames = memberDisplayNames != null ? memberDisplayNames.split(",") : new String[0];
+            String[] roles = memberRoles != null ? memberRoles.split(",") : new String[0];
+            String[] types = memberTypes != null ? memberTypes.split(",") : new String[0];
+
+            List<GroupMember> members = new ArrayList<>();
+            for (int i = 0; i < agentIds.length; i++) {
+                String displayName = i < displayNames.length ? displayNames[i].trim() : "Agent " + (i + 1);
+                String role = i < roles.length && !roles[i].trim().isBlank() ? roles[i].trim().toUpperCase() : null;
+                if ("PARTICIPANT".equals(role)) {
+                    role = null;
+                }
+                var type = i < types.length && "GROUP".equalsIgnoreCase(types[i].trim())
+                        ? AgentGroupConfiguration.MemberType.GROUP
+                        : AgentGroupConfiguration.MemberType.AGENT;
+                members.add(new GroupMember(agentIds[i].trim(), displayName, i + 1, role, type));
+            }
+            config.setMembers(members);
+
+            if (moderatorAgentId != null && !moderatorAgentId.isBlank()) {
+                config.setModeratorAgentId(moderatorAgentId.trim());
+            }
+
+            // Style
+            DiscussionStyle discussionStyle = DiscussionStyle.ROUND_TABLE;
+            if (style != null && !style.isBlank()) {
+                try {
+                    discussionStyle = DiscussionStyle.valueOf(style.trim().toUpperCase());
+                } catch (IllegalArgumentException e) {
+                    // Fall back to ROUND_TABLE
+                }
+            }
+            config.setStyle(discussionStyle);
+            config.setMaxRounds(parseIntOrDefault(maxRounds, 2));
+
+            // Pre-configured tasks (TASK_FORCE style — skips PLAN phase)
+            if (tasks != null && !tasks.isBlank()) {
+                try {
+                    TaskDefinition[] taskArray = jsonSerialization.deserialize(tasks, TaskDefinition[].class);
+                    config.setTasks(List.of(taskArray));
+                } catch (Exception ex) {
+                    return errorJson("Invalid tasks JSON", ex);
+                }
+            }
+
+            // Protocol with maxTurns safety cap. The timeout/retry figures come from
+            // ProtocolConfig's own defaults — hard-coding 60 here meant every
+            // MCP-created group silently ran at the value the 180s default was
+            // introduced to replace.
+            int mt = parseIntOrDefault(maxTurns, 0);
+            config.setProtocol(new ProtocolConfig(ProtocolConfig.DEFAULT_AGENT_TIMEOUT_SECONDS, ProtocolConfig.MemberFailurePolicy.SKIP,
+                    ProtocolConfig.DEFAULT_MAX_RETRIES, ProtocolConfig.MemberUnavailablePolicy.SKIP, mt));
+
+            Response response = groupStore.createGroup(config);
+            String location = response.getLocation() != null ? response.getLocation().toString() : "";
+            String groupId = extractIdFromLocation(location);
+
+            // Build a rich response for AI clients
+            var phases = DiscussionStylePresets.expand(discussionStyle, config.getMaxRounds());
+            var phaseNames = phases.stream().map(p -> p.name()).toList();
+
+            return ("Created group '%s' (style=%s, %d members, " + "moderator=%s)\nID: %s\nPhases: %s").formatted(name, discussionStyle,
+                    members.size(), moderatorAgentId != null ? moderatorAgentId : "none", groupId, String.join(" → ", phaseNames));
+        } catch (Exception e) {
+            LOGGER.errorf("create_group failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Update an existing agent group. Pass the full " + "configuration as JSON.")
+    public String update_group(@ToolArg(description = "Group ID") String groupId,
+                               @ToolArg(description = "Version number (0 for latest)") String version,
+                               @ToolArg(description = "Full JSON configuration body") String configJson) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            int ver = parseIntOrDefault(version, 0);
+            // Same strictness as PUT /groupstore/groups — AgentGroupConfiguration is a
+            // first-party config model, so a typo'd key must be rejected here too
+            // rather than dropped into a silently different group.
+            AgentGroupConfiguration config = configParser.parse(configJson, AgentGroupConfiguration.class);
+            groupStore.updateGroup(groupId, ver, config);
+            return "Updated group " + groupId;
+        } catch (Exception e) {
+            LOGGER.errorf("update_group failed: %s", e.getMessage());
+            // describe(), not getMessage(): the strict parser's rejection travels as a
+            // response entity, and getMessage() on that is just "HTTP 400 Bad Request".
+            return errorJson("Failed to update group", e);
+        }
+    }
+
+    @Tool(description = "Delete an agent group configuration")
+    public String delete_group(@ToolArg(description = "Group ID") String groupId,
+                               @ToolArg(description = "Version number (0 for latest)") String version) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            int ver = parseIntOrDefault(version, 0);
+            groupStore.deleteGroup(groupId, ver, false);
+            return "Deleted group " + groupId;
+        } catch (Exception e) {
+            LOGGER.errorf("delete_group failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    // --- Group Conversation ---
+
+    @Tool(description = "Start a structured multi-agent discussion and wait for it to complete. "
+            + "All configured member agents participate using the group's discussion style. "
+            + "Returns the full GroupConversation including transcript, task list (for TASK_FORCE), "
+            + "dynamic agent tracking, and synthesized answer. "
+            + "WARNING: TASK_FORCE discussions with many agents/tasks can take several minutes. "
+            + "For long-running discussions, use start_group_discussion instead (returns immediately, "
+            + "poll with read_group_conversation).")
+    public String discuss_with_group(@ToolArg(description = "Group configuration ID (from create_group " + "or list_groups)") String groupId,
+                                     @ToolArg(description = "The question or topic for the group to " + "discuss") String question,
+                                     @ToolArg(description = "User ID (optional). With authorization enabled this defaults to the "
+                                             + "calling user and may not name another user.") String userId) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            String user = resolveOwner(userId);
+            GroupConversation gc = groupConversationService.discuss(groupId, question, user, 0);
+            return jsonSerialization.serialize(gc);
+        } catch (ForbiddenException e) {
+            return errorJson("Access denied: you cannot start a conversation as another user");
+        } catch (Exception e) {
+            LOGGER.errorf("discuss_with_group failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Read a group conversation including its full transcript, task list "
+            + "(for TASK_FORCE discussions with per-task status, assignments, and results), "
+            + "dynamic agent tracking (createdAgentIds, retainedAgentIds), synthesized answer, "
+            + "the structured decision record in the 'decision' field "
+            + "(verdict/vote/agreement/award, if one was reached), "
+            + "and conversation state. Use this to poll for completion after start_group_discussion, "
+            + "or to inspect task-level results after a TASK_FORCE discussion.")
+    public String read_group_conversation(
+                                          @ToolArg(description = "Group conversation ID (from "
+                                                  + "discuss_with_group, start_group_discussion, "
+                                                  + "or list_group_conversations)") String groupConversationId) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            GroupConversation gc = groupConversationService.readGroupConversation(groupConversationId);
+            ownershipValidator.requireOwnerOrAdmin(identity, gc.getUserId(), "group conversation");
+            return jsonSerialization.serialize(gc);
+        } catch (ForbiddenException e) {
+            return accessDenied("read_group_conversation", groupConversationId);
+        } catch (Exception e) {
+            LOGGER.errorf("read_group_conversation failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "List past group conversation transcripts for a " + "group. Returns conversation IDs, state, question, and " + "timestamps.")
+    public String list_group_conversations(@ToolArg(description = "Group configuration ID") String groupId,
+                                           @ToolArg(description = "Page index, 0-based (default 0)") String index,
+                                           @ToolArg(description = "Page size (default 20)") String limit) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            int idx = parseIntOrDefault(index, 0);
+            int lim = parseIntOrDefault(limit, 20);
+            List<GroupConversation> conversations = groupConversationService.listGroupConversations(groupId, idx, lim);
+            // Owner-filter (mirrors RestGroupConversation.listGroupConversations): these
+            // are
+            // FULL conversation documents (transcript, synthesized answer). Without this
+            // the
+            // per-conversation ownership gate is pointless — a non-owner could just list
+            // the
+            // group and read everyone's transcripts.
+            if (ownershipValidator.isAuthEnabled() && identity != null && !identity.isAnonymous()
+                    && !identity.hasRole("eddi-admin")) {
+                // A nameless principal owns nothing — an empty list, not an NPE.
+                String callerId = OwnershipValidator.principalName(identity);
+                conversations = conversations.stream()
+                        .filter(gc -> callerId != null && callerId.equals(gc.getUserId()))
+                        .toList();
+            }
+            return jsonSerialization.serialize(conversations);
+        } catch (Exception e) {
+            LOGGER.errorf("list_group_conversations failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    // --- Async Discussion + Delete ---
+
+    @Tool(description = "Start a group discussion asynchronously and return immediately "
+            + "with the conversation ID and IN_PROGRESS state. Use this instead of "
+            + "discuss_with_group for TASK_FORCE or other long-running discussions. "
+            + "Poll with read_group_conversation to check progress and get results "
+            + "when state changes to COMPLETED or FAILED.")
+    public String start_group_discussion(
+                                         @ToolArg(description = "Group configuration ID (from create_group or list_groups)") String groupId,
+                                         @ToolArg(description = "The question or topic for the group to discuss") String question,
+                                         @ToolArg(description = "User ID (optional). With authorization enabled this defaults to the calling user and may not name another user.") String userId) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            String user = resolveOwner(userId);
+            GroupConversation gc = groupConversationService.startAndDiscussAsync(groupId, question, user, null);
+            return jsonSerialization.serialize(Map.of(
+                    "groupConversationId", gc.getId(),
+                    "state", String.valueOf(gc.getState()),
+                    "message", "Discussion started. Poll read_group_conversation with this ID to check progress."));
+        } catch (ForbiddenException e) {
+            return errorJson("Access denied: you cannot start a conversation as another user");
+        } catch (Exception e) {
+            LOGGER.errorf("start_group_discussion failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Delete a group conversation. Its shared artifacts and any ephemeral agents "
+            + "created for it are deleted; the members' own conversations are ENDED, not deleted, and "
+            + "remain readable afterwards.")
+    public String delete_group_conversation(
+                                            @ToolArg(description = "Group conversation ID to delete") String groupConversationId) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            requireConversationOwner(groupConversationId);
+            groupConversationService.deleteGroupConversation(groupConversationId);
+            return "Deleted group conversation " + groupConversationId;
+        } catch (ForbiddenException e) {
+            return accessDenied("delete_group_conversation", groupConversationId);
+        } catch (Exception e) {
+            LOGGER.errorf("delete_group_conversation failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    // --- Follow-up Operations ---
+
+    @Tool(description = "Ask a follow-up question to a specific member agent in a "
+            + "completed group conversation. The agent retains full context from "
+            + "the discussion. Both the question and response are recorded on the "
+            + "group transcript. Works for any member including the moderator. "
+            + "The targetAgentId accepts either an agent ID or a member's display name.")
+    public String followup_with_member(
+                                       @ToolArg(description = "Group conversation ID") String groupConversationId,
+                                       @ToolArg(description = "Agent ID or display name of the member to address") String targetAgentId,
+                                       @ToolArg(description = "The follow-up question") String question) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            requireConversationOwner(groupConversationId);
+            GroupConversation gc = groupConversationService.followUpWithMember(
+                    groupConversationId, targetAgentId, question);
+            return jsonSerialization.serialize(gc);
+        } catch (ForbiddenException e) {
+            return accessDenied("followup_with_member", groupConversationId);
+        } catch (Exception e) {
+            // Curated payload — never echo the raw exception text to MCP callers
+            // (info exposure). Full detail (with stack trace) goes to the server log.
+            // Matches the McpHitlTools convention.
+            LOGGER.error("followup_with_member failed", e);
+            return errorJson("Failed to process follow-up with member", "INTERNAL", null);
+        }
+    }
+
+    @Tool(description = "Continue a completed group conversation with a new question. "
+            + "All agents re-run through the full discussion phases, retaining memory "
+            + "of prior rounds. The round counter increments. Returns the updated "
+            + "GroupConversation with new synthesis.")
+    public String continue_group_discussion(
+                                            @ToolArg(description = "Group conversation ID") String groupConversationId,
+                                            @ToolArg(description = "The follow-up question for the group") String question) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            requireConversationOwner(groupConversationId);
+            GroupConversation gc = groupConversationService.continueDiscussion(
+                    groupConversationId, question, null);
+            return jsonSerialization.serialize(gc);
+        } catch (ForbiddenException e) {
+            return accessDenied("continue_group_discussion", groupConversationId);
+        } catch (Exception e) {
+            LOGGER.error("continue_group_discussion failed", e);
+            return errorJson("Failed to continue group discussion", "INTERNAL", null);
+        }
+    }
+
+    @Tool(description = "Close a group conversation permanently. Ends all member "
+            + "conversations and cleans up dynamically-created agents. No further "
+            + "follow-ups or continuations are possible after closing. "
+            + "Returns the closed GroupConversation.")
+    public String close_group_conversation(
+                                           @ToolArg(description = "Group conversation ID") String groupConversationId) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            requireConversationOwner(groupConversationId);
+            GroupConversation gc = groupConversationService.closeGroupConversation(groupConversationId);
+            return jsonSerialization.serialize(gc);
+        } catch (ForbiddenException e) {
+            return accessDenied("close_group_conversation", groupConversationId);
+        } catch (Exception e) {
+            LOGGER.error("close_group_conversation failed", e);
+            return errorJson("Failed to close group conversation", "INTERNAL", null);
+        }
+    }
+
+    // =================================================================
+    // I13 — standing-team workspace (backlog for human PMs)
+    // =================================================================
+
+    @Tool(description = "Add a task to a standing team's backlog (I13). The backlog persists across "
+            + "discussions; scheduled cadences pull executable tasks from it into task-force runs. "
+            + "Higher priority runs earlier. Returns the created task.")
+    public String add_team_task(@ToolArg(description = "Group configuration ID") String groupId,
+                                @ToolArg(description = "Task subject (short, unique within the backlog)") String subject,
+                                @ToolArg(description = "Task description (optional)") String description,
+                                @ToolArg(description = "Priority, higher runs earlier (default 0)") String priority) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            if (subject == null || subject.isBlank()) {
+                return errorJson("subject is required");
+            }
+            if (subject.trim().length() > SharedTaskList.MAX_AGENT_TASK_SUBJECT_LENGTH) {
+                return errorJson("subject exceeds " + SharedTaskList.MAX_AGENT_TASK_SUBJECT_LENGTH + " characters");
+            }
+            if (description != null && description.length() > SharedTaskList.MAX_AGENT_TASK_DESCRIPTION_LENGTH) {
+                return errorJson("description exceeds " + SharedTaskList.MAX_AGENT_TASK_DESCRIPTION_LENGTH + " characters");
+            }
+            if (groupStore.getCurrentResourceId(groupId) == null) {
+                return errorJson("Group not found: " + groupId);
+            }
+            String trimmedSubject = subject.trim();
+            // Optimistic-concurrency retry — same reasoning as the REST surface: a
+            // lost CAS re-reads and re-validates so concurrent adds cannot drop
+            // each other or slip past the cap.
+            for (int attempt = 0; attempt < RestGroupWorkspace.MAX_CAS_ATTEMPTS; attempt++) {
+                var workspace = workspaceStore.readOrCreate(groupId);
+                if (workspace.getBacklog().size() >= GroupWorkspace.MAX_BACKLOG_SIZE) {
+                    return errorJson("The backlog already holds " + GroupWorkspace.MAX_BACKLOG_SIZE
+                            + " tasks — complete or delete existing tasks before adding more");
+                }
+                if (workspace.getBacklog().getTasks().stream().anyMatch(t -> trimmedSubject.equalsIgnoreCase(t.subject()))) {
+                    return errorJson("A backlog task with that subject already exists — writeback matches outcomes "
+                            + "by subject, so subjects must be unique");
+                }
+                var task = workspace.getBacklog().addTask(new TaskItem(
+                        trimmedSubject, description != null ? description : "", parseIntOrDefault(priority, 0)));
+                if (workspaceStore.casRevision(workspace)) {
+                    return jsonSerialization.serialize(task);
+                }
+            }
+            return errorJson("The workspace is being modified concurrently — retry the request");
+        } catch (Exception e) {
+            LOGGER.errorf("add_team_task failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "List a standing team's backlog (I13): every task with its status, priority, "
+            + "assignee and verification outcome.")
+    public String list_team_backlog(@ToolArg(description = "Group configuration ID") String groupId) {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            if (groupStore.getCurrentResourceId(groupId) == null) {
+                return errorJson("Group not found: " + groupId);
+            }
+            var workspace = workspaceStore.find(groupId);
+            return jsonSerialization.serialize(
+                    workspace != null ? workspace.getBacklog().getTasks() : List.of());
+        } catch (Exception e) {
+            LOGGER.errorf("list_team_backlog failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    // =================================================================
+    // I10 — org/team preset templates
+    // =================================================================
+
+    @Tool(description = "List the packaged group templates (I10): research-pod, editorial-team, ops-task-force, "
+            + "decision-board, negotiation-table. Each entry names its required roles — the keys "
+            + "create_group_from_template expects.")
+    public String list_group_templates() {
+        requireRole(identity, authEnabled, "eddi-viewer");
+        try {
+            return jsonSerialization.serialize(templateService.list());
+        } catch (Exception e) {
+            LOGGER.errorf("list_group_templates failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+
+    @Tool(description = "Create a group from a packaged template (I10) by assigning agents to its named roles. "
+            + "roleAssignments is a JSON object mapping role -> agent id (for HUMAN roles: the principal id). "
+            + "Saves through the normal store path, so every save-time validation applies.")
+    public String create_group_from_template(@ToolArg(description = "Template id, e.g. 'research-pod'") String templateId,
+                                             @ToolArg(description = "Name for the new group (optional)") String name,
+                                             @ToolArg(description = "JSON object: role -> agent id") String roleAssignments) {
+        requireRole(identity, authEnabled, "eddi-editor");
+        try {
+            Map<String, String> assignments = roleAssignments != null && !roleAssignments.isBlank()
+                    ? MAPPER.readValue(roleAssignments, new TypeReference<Map<String, String>>() {
+                    })
+                    : Map.of();
+            AgentGroupConfiguration config = templateService.instantiate(templateId, name, assignments);
+            Response response = groupStore.createGroup(config);
+            if (response.getStatus() >= 300) {
+                return errorJson("Group creation failed with status " + response.getStatus());
+            }
+            String location = response.getLocation() != null ? response.getLocation().toString() : "";
+            return "Created group '" + config.getName() + "' from template '" + templateId + "'"
+                    + (location.isEmpty() ? "" : " at " + location);
+        } catch (IllegalArgumentException e) {
+            return errorJson(e.getMessage());
+        } catch (Exception e) {
+            LOGGER.errorf("create_group_from_template failed: %s", e.getMessage());
+            return errorJson(e.getMessage());
+        }
+    }
+}

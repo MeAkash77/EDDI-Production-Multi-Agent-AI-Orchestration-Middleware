@@ -1,0 +1,316 @@
+# Properties
+
+[![Version](https://img.shields.io/github/v/release/labsai/EDDI?label=version&color=blue)](https://github.com/labsai/EDDI/releases)
+
+## Overview
+
+**Properties** are EDDI's primary mechanism for storing and retrieving state within and across conversations. They are key-value pairs that can be set by agent configuration, extracted from API responses, or written by LLM tools — and they're accessible in every template (system prompts, HTTP call bodies, output templates, property instructions).
+
+Properties are the glue that connects the pipeline's processing steps with persistent user state. Understanding how they work is essential for building stateful agents.
+
+## Key Concepts
+
+### What Properties Are
+
+A property has:
+
+- **Name** (key): The identifier used to access the property (e.g., `preferred_language`, `company_name`)
+- **Value**: Can be a `String`, `Integer`, `Float`, `Map`, `List`, or `Boolean`
+- **Scope**: How long the property lives
+- **Visibility** (v6): Who can see the property
+
+### Property vs Context vs Memory
+
+| Mechanism | Source | Lifetime | Access Pattern |
+|---|---|---|---|
+| **Properties** | Agent-set (via PropertySetter, LLM tools) | Configurable (step → longTerm) | `{properties.key}` |
+| **Context** | Your application (passed per request) | Per request | `{context.key}` |
+| **Memory** | Pipeline (each task writes data) | Per step (current turn's data) | `{memory.current.key}` |
+
+Use **properties** when the agent needs to remember something. Use **context** when your application injects something. Use **memory** when you need data from the current or previous pipeline step.
+
+---
+
+## Scopes
+
+Properties support four scopes that control their lifetime:
+
+| Scope | Lifetime | Persistence | Use Case |
+|---|---|---|---|
+| `step` | Current conversation turn only | Not persisted | Temporary data needed only for this response |
+| `conversation` | Entire conversation session | Persisted in conversation memory | User preferences within a session, extracted entities |
+| `longTerm` | Across conversations | Persisted in user property store | User profile data, preferences that should survive between sessions |
+| `secret` | Current conversation session (the property holds a `${vault:...}` reference) | Plaintext encrypted into SecretsVault under `<agentId>.<propertyName>`; the property itself is conversation-scoped and is not reloaded in a new conversation | API keys, tokens, sensitive credentials |
+
+### Choosing the Right Scope
+
+```
+Is this data only needed for the current response?
+  → step
+
+Will the user need this data later in the same conversation?
+  → conversation
+
+Should this data persist when the user starts a new conversation?
+  → longTerm
+
+Is this sensitive data (API keys, tokens)?
+  → secret
+```
+
+---
+
+## Visibility (v6)
+
+Properties also have a **visibility** dimension that controls which agents can see them:
+
+| Visibility | Who sees it | Use Case |
+|---|---|---|
+| `self` (default) | Only the owning agent | Agent-specific preferences, internal state |
+| `group` | All agents in the same group conversation | Shared context in multi-agent orchestration |
+| `global` | All agents for this user | Cross-agent user preferences (e.g., language, timezone) |
+
+Visibility is orthogonal to scope — a property can be `longTerm` + `self` (persists across sessions, visible only to the owning agent) or `longTerm` + `global` (persists and visible to all agents).
+
+---
+
+## Setting Properties
+
+### Via PropertySetter Configuration (JSON)
+
+The PropertySetter task (`ai.labs.property`) sets properties based on triggered actions:
+
+```json
+{
+  "setOnActions": [
+    {
+      "actions": ["greet_user"],
+      "setProperties": [
+        {
+          "name": "greeted",
+          "valueString": "true",
+          "scope": "conversation"
+        },
+        {
+          "name": "preferred_language",
+          "valueString": "{context.language}",
+          "scope": "longTerm",
+          "visibility": "global"
+        }
+      ]
+    }
+  ]
+}
+```
+
+When the `greet_user` action fires:
+1. `greeted` is set to `"true"` for this conversation session
+2. `preferred_language` is set from the input context and persisted across all conversations and agents
+
+### Via Pre/Post Request Instructions
+
+Properties can be set before or after any lifecycle task (HTTP calls, LLM calls):
+
+```json
+{
+  "preRequest": {
+    "propertyInstructions": [
+      {
+        "name": "requestTimestamp",
+        "valueString": "{uuidUtils:generateUUID()}",
+        "scope": "step"
+      }
+    ]
+  },
+  "postResponse": {
+    "propertyInstructions": [
+      {
+        "name": "lastApiResponse",
+        "fromObjectPath": "httpCalls.weatherApi",
+        "scope": "conversation"
+      }
+    ]
+  }
+}
+```
+
+### Via LLM Tools (Agent-Driven)
+
+When `enableMemoryTools` is enabled in the agent configuration, the LLM can set properties using built-in memory tools:
+
+```
+Agent: "I'll remember that you prefer dark mode."
+→ Tool call: rememberFact(key="ui_preference", value="dark_mode", category="preference", visibility="self")
+```
+
+See [Persistent User Memory](user-memory.md) for full details on the LLM memory tools, visibility scoping, and Dream consolidation.
+
+---
+
+## Accessing Properties in Templates
+
+Properties are available in **all** templates via the `properties` namespace.
+
+> ⚠️ **`properties` exposes raw values, not `Property` objects.** `MemoryItemConverter.convert()` puts `ConversationProperties.toMap()` into the template context, and `toMap()` returns the unwrapped Java value that was stored (`String`, `Integer`, `Float`, `Boolean`, `List`, `Map`) — the `Property` wrapper never reaches the template. Use `{properties.key}` directly. A `.valueString` / `.valueInt` / … suffix resolves against the raw value (a `String` has no `valueString` property) and fails at render time. The `valueString`, `valueInt`, … names are **write-side** field names of the JSON property-setter config only. AGENTS.md §5.1 is the authoritative reference for the template data model.
+
+### In Output Templates
+
+```
+Hello {properties.userName}! Your preferred language is {properties.preferred_language}.
+```
+
+### In System Prompts (LLM)
+
+```
+You are a helpful assistant. The user's name is {properties.userName}.
+They prefer {properties.preferred_language} responses.
+```
+
+### In HTTP Call Bodies
+
+```json
+{
+  "userId": "{properties.userId}",
+  "language": "{properties.preferred_language}"
+}
+```
+
+### Reading the Different Value Types
+
+The property-setter config picks the value type by which `value*` field you write (`valueString`, `valueInt`, `valueFloat`, `valueObject`, `valueList`, `valueBoolean`). In templates, all of them are read the same way — through the property name:
+
+| Written as | Read in a template | Example |
+|---|---|---|
+| `valueString` | `{properties.name}` | `Hello {properties.name}` |
+| `valueInt` | `{properties.age}` | `You are {properties.age}` |
+| `valueFloat` | `{properties.score}` | `Score: {properties.score}` |
+| `valueObject` | `{properties.profile.<field>}` | `{properties.profile.email}` |
+| `valueList` | `{properties.tags}` | `{#for item in properties.tags}...{/for}` |
+| `valueBoolean` | `{properties.isPremium}` | `{#if properties.isPremium}...{/if}` |
+
+---
+
+## Property Lifecycle
+
+Properties are managed by `Conversation.java` at session boundaries — NOT by pipeline tasks.
+
+### 1. Conversation Init
+
+```
+Conversation.init()
+  └─→ loadUserProperties()
+      └─→ IPropertiesHandler.getUserMemoryStore()
+      └─→ IUserMemoryStore.getVisibleEntries(userId, agentId, groupIds, recallOrder, maxEntries)
+      └─→ Entries converted to Property objects with scope=longTerm
+      └─→ Loaded into conversationProperties
+      └─→ Available as {properties.key} in all templates
+```
+
+Recall order (`most_recent` or `most_accessed`) and the maximum number of recalled entries come from the agent's `userMemoryConfig`, but only when the agent sets **`enableMemoryTools: true`** — that flag is what attaches the block (and, when the block is absent, a defaults instance whose field defaults are **`most_recent` ordering and 50 entries**).
+
+> **Note:** with `enableMemoryTools: false` the config is never attached, so the defaults on `UserMemoryConfig` apply — `maxRecallEntries` is 50 either way. This used to differ: a separate hard-coded default in `Conversation` recalled 1000 entries when no config was attached, so the effective cap changed twentyfold depending on that flag and a `maxRecallEntries` declared without `enableMemoryTools` had no effect. The two are now the same constant. Set `enableMemoryTools: true` plus an explicit `maxRecallEntries` if the number matters to you.
+
+### 2. Pipeline Execution
+
+```
+LifecycleManager runs pipeline
+  └─→ PropertySetterTask sets properties based on actions
+      └─→ scope=step (cleared after this turn)
+      └─→ scope=conversation (lives for the session)
+      └─→ scope=longTerm (persisted across conversations)
+      └─→ scope=secret (auto-vaulted via SecretsVault)
+```
+
+### 3. Conversation Teardown
+
+```
+Conversation.postConversationLifecycleTasks()
+  └─→ storePropertiesPermanently()
+      └─→ All longTerm properties saved via IUserMemoryStore.upsert()
+      └─→ Visibility applied at persistence boundary:
+          - Explicit visibility on property → used as-is
+          - No visibility set → defaults to agent's defaultVisibility (or `global`)
+```
+
+> **Key insight**: Persistent state is a **session concern** handled at init/teardown — NOT in the pipeline. This means properties "just work" without any task ordering dependencies.
+
+> **Storage**: In v6, all persistent properties are stored in the unified `usermemories` collection (MongoDB) or `usermemories` table (PostgreSQL). The legacy `properties` collection has been removed. See [Persistent User Memory](user-memory.md) for the full unified memory model.
+
+---
+
+## Secret Properties
+
+Properties with `scope=secret` are automatically handled by the SecretsVault:
+
+1. The moment the property instruction runs, `PropertySetterTask` stores the plaintext in SecretsVault under `<agentId>.<name>`
+2. The raw input is scrubbed from the conversation step
+3. The property value becomes a `${vault:<agentId>.<name>}` reference with `conversation` scope
+4. Downstream consumers (`ChatModelRegistry`, `ApiCallExecutor`, `SecretResolver`) resolve the reference at point-of-use
+
+If the vault is unavailable or disabled, the turn fails closed with a `LifecycleException` rather than persisting the plaintext — set `EDDI_VAULT_MASTER_KEY`.
+
+```json
+{
+  "name": "api_token",
+  "valueString": "sk-abc123...",
+  "scope": "secret"
+}
+```
+
+See [Secrets Vault](secrets-vault.md) for full documentation.
+
+---
+
+## Best Practices
+
+### 1. Use Appropriate Scopes
+
+```json
+// ❌ Don't persist temporary data
+{"name": "tempResult", "scope": "longTerm"}
+
+// ✅ Use step scope for temporary data
+{"name": "tempResult", "scope": "step"}
+```
+
+### 2. Use fromObjectPath for Extraction
+
+Instead of storing entire API responses, extract only what you need:
+
+```json
+{
+  "name": "temperature",
+  "fromObjectPath": "httpCalls.weatherApi.current.temperature",
+  "scope": "conversation"
+}
+```
+
+### 3. Use Visibility for Multi-Agent Scenarios
+
+```json
+// Agent-specific memory
+{"name": "internal_state", "scope": "longTerm", "visibility": "self"}
+
+// Shared within group conversation
+{"name": "group_context", "scope": "longTerm", "visibility": "group"}
+
+// Cross-agent user preference
+{"name": "language", "scope": "longTerm", "visibility": "global"}
+```
+
+### 4. Naming Conventions
+
+- Use `snake_case` for property names
+- Use descriptive, specific names (`user_preferred_timezone` not `tz`)
+- Prefix agent-specific properties with the agent's domain (`support_ticket_id`, `onboarding_step`)
+
+---
+
+## Related Documentation
+
+- [Conversation Memory](conversation-memory.md) - How memory flows through the pipeline
+- [Secrets Vault](secrets-vault.md) - Encrypted property storage
+- [Passing Context Information](passing-context-information.md) - External data injection
+- [Output Templating](output-templating.md) - Using properties in templates
+- [LLM Integration](langchain.md) - Using properties in LLM prompts
+- [HTTP Calls](httpcalls.md) - Using properties in API requests

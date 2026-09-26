@@ -1,0 +1,496 @@
+# Import/Export an Agent
+
+## Overview
+
+**Import/Export** functionality allows you to package entire agents (including all their dependencies) into portable ZIP files. This is essential for agent lifecycle management, collaboration, and deployment automation.
+
+### Why Import/Export?
+
+**Use Cases**:
+
+- **Backup & Restore**: Protect your agent configurations from accidental deletion or corruption
+- **Version Control**: Store agent configurations alongside code in Git
+- **Environment Migration**: Move agents from development → staging → production
+- **Continuous Sync**: Keep agents synchronized across environments with **merge imports**
+- **Team Collaboration**: Share agents with team members or customers
+- **Disaster Recovery**: Quickly restore agents after system failures
+- **Agent Templates**: Create reusable agent templates for similar use cases
+- **CI/CD Integration**: Automate agent deployment in your pipeline
+
+### What Gets Exported?
+
+When you export an agent, EDDI packages:
+
+- ✅ Agent configuration (package references)
+- ✅ All packages used by the agent
+- ✅ All extensions (behavior rules, dictionaries, HTTP calls, outputs, etc.)
+- ✅ Version information
+- ✅ Configuration metadata
+- ✅ **Origin IDs** (resource identifiers for merge tracking)
+- ✅ **Prompt snippets** the agent's configurations reference, under `snippets/`
+- ✅ **Scheduled triggers** (cron and heartbeat) of the agent, under `schedules/`
+- ✅ **Connections** the agent's configurations reference as `${connection:name}`, under
+  `connections/` — the connection *document* only: a name, an auth shape, `${vault:…}`
+  references and an allowlist. Never a resolved secret, and never a grant (linked accounts
+  stay where they were linked). On import a connection is created only when no connection
+  of that name exists yet; an existing one is **never overwritten**, and a document this
+  deployment refuses (a `PER_USER` connection without OIDC, an OAuth one without an active
+  vault) is skipped with the reason logged rather than failing the import. Both cases are
+  counted in an `X-Connections-Skipped` response header. See
+  [Connections → Export and import](connections.md#export-and-import).
+
+**Note**: Conversations and conversation history are **NOT** exported (only configurations).
+HITL approval-timeout schedules are not exported either: they are safety timers for one
+pending approval on that deployment, and the import surface refuses to mint them for anybody.
+
+### Selecting What to Export
+
+Three independent query parameters filter the archive. Each is **three-state**: absent means
+"no selection was expressed for this type" and exports all of it, a value filters, and a
+present-but-empty value means "none of them".
+
+| Parameter           | Filters                                | Absent           | Empty (`&selectedSnippets=`) |
+| ------------------- | -------------------------------------- | ---------------- | ---------------------------- |
+| `selectedResources` | Extension resources (by resource id)    | all of them      | all of them (blank = no filter) |
+| `selectedSnippets`  | Prompt snippets (by resource id)        | all referenced   | none                         |
+| `selectedSchedules` | Scheduled triggers (by schedule id)     | all of the agent | none                         |
+
+`selectedResources` is the exception: it is the older parameter and only a **non-blank**
+value filters, so a blank one is a full export. Agent and workflow skeletons are always
+included.
+
+When `selectedResources` omits an extension, the exported workflow **keeps the step that
+referenced it** — the archive states what the source deployment actually runs. What happens
+to a reference the archive cannot satisfy is the importer's call, because only it knows the
+strategy: **`merge` answers it from the target's own copy** of that configuration (and
+`400`s naming the resource when the target has none), while **`create` drops the step** —
+there is nothing on a brand-new agent to answer it with — and logs a warning naming it.
+
+> Dropping the step on export instead makes `merge` destructive: it replaces the target's
+> workflow with the archived one, so exporting only the behaviour rules from staging and
+> merging them into production would delete production's own LLM and output steps.
+
+### Archive Retention
+
+A finished archive lives under `tmp/archives/` and is deleted after
+`eddi.backup.export.retention-minutes` (default `60`). The sweep runs both before each
+export and on a timer (`eddi.backup.export.sweep-interval`, default `15m`), so an instance
+that stops exporting still reclaims what it wrote. Read the filename from the `Location`
+header and download it within the window; afterwards the download answers `404`.
+
+### Import Strategies
+
+EDDI supports three import strategies:
+
+| Strategy             | Behavior                                                        | Use Case                            |
+| -------------------- | --------------------------------------------------------------- | ----------------------------------- |
+| **Create** (default) | Always creates a new agent with new IDs                         | First-time import, creating copies  |
+| **Merge**            | Updates existing resources by matching origin IDs               | Syncing changes across environments |
+| **Upgrade**          | Updates existing agent by structural matching (no origin IDs needed) | Syncing independently created agents |
+
+### Export/Import Workflow
+
+**First-time import (Create):**
+
+```
+DEVELOPMENT EDDI
+    ↓
+1. Export Agent
+   POST /backup/export/agent123?agentVersion=1
+   ← Returns: agent123-1.zip
+    ↓
+2. Download ZIP file
+   GET /backup/export/agent123-1.zip
+   ← Receives: agent123-1.zip file
+    ↓
+3. Store in version control / backup / transfer
+    ↓
+PRODUCTION EDDI
+    ↓
+4. Upload ZIP file
+   POST /backup/import
+   Body: (application/zip with ZIP file)
+   ← Returns: New agent ID (Location header)
+    ↓
+5. Deploy imported agent
+   POST /administration/production/deploy/{newAgentId}?version=1
+```
+
+**Subsequent imports (Merge/Sync):**
+
+```
+DEVELOPMENT EDDI  (agent updated since last sync)
+    ↓
+1. Export latest version
+   POST /backup/export/agent123?agentVersion=2
+    ↓
+2. Download ZIP
+    ↓
+PRODUCTION EDDI  (has the agent from first import)
+    ↓
+3. Preview what would change
+   POST /backup/import/preview
+   ← Returns: list of resources with CREATE/UPDATE/SKIP actions
+    ↓
+4. Review changes, optionally deselect resources
+    ↓
+5. Merge import (updates existing, no duplicates)
+   POST /backup/import?strategy=merge&selectedResources=origin1,origin2
+   ← Returns: Same agent ID, incremented version
+    ↓
+6. Deploy updated agent
+```
+
+### Best Practices
+
+- **Version Your Exports**: Include version numbers in filenames: `customer-support-agent-v2.3.zip`
+- **Preview Before Merge**: Always use the preview endpoint before merging to review changes
+- **Selective Merge**: Only merge the resources that actually changed to minimize risk
+- **Document Changes**: Keep a changelog of what changed between exports
+- **Regular Backups**: Schedule automated exports of production agents
+- **Test Imports**: Always test imported agents in a test environment first
+- **Store Securely**: Keep exports in secure, version-controlled storage (e.g., Git LFS, S3)
+
+### Common Scenarios
+
+**Scenario 1: Promoting to Production (first time)**
+
+```bash
+# 1. Export from test environment — the Location header names the ZIP
+LOCATION=$(curl -s -D - -o /dev/null -X POST \
+  "http://test.eddi.com/backup/export/agent123?agentVersion=1" \
+  | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+
+# 2. Download the ZIP
+curl -o agent123-1.zip "http://test.eddi.com${LOCATION}"
+
+# 3. Import to production (creates new agent)
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-1.zip http://prod.eddi.com/backup/import
+
+# 4. Deploy in production
+curl -X POST http://prod.eddi.com/administration/production/deploy/{newAgentId}?version=1
+```
+
+**Scenario 2: Syncing Updates (merge)**
+
+```bash
+# 1. Export updated agent from dev
+LOCATION=$(curl -s -D - -o /dev/null -X POST \
+  "http://dev.eddi.com/backup/export/agent123?agentVersion=3" \
+  | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+curl -o agent123-3.zip "http://dev.eddi.com${LOCATION}"
+
+# 2. Preview what would change in production
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-3.zip http://prod.eddi.com/backup/import/preview
+
+# 3. Merge import — updates existing resources, no duplicates
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-3.zip "http://prod.eddi.com/backup/import?strategy=merge"
+
+# 4. Redeploy
+curl -X POST http://prod.eddi.com/administration/production/deploy/{agentId}?version=2
+```
+
+**Scenario 3: Selective Merge (only specific resources)**
+
+```bash
+# Preview first to get the origin IDs
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-3.zip http://prod.eddi.com/backup/import/preview
+# Response includes sourceId for each resource
+
+# Merge only the behavior rules and HTTP calls (by origin ID)
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-3.zip \
+  "http://prod.eddi.com/backup/import?strategy=merge&selectedResources=origin-beh-1,origin-http-1"
+```
+
+> **`selectedResources` covers every preview row, not just the extensions.** Naming two
+> extension ids deselects everything else the preview listed — including the archive's
+> **scheduled triggers**, which are then not imported. The answer says so: the `201`
+> carries `X-Schedules-Skipped: <count>` whenever the selection left schedules out, and
+> the same count is logged at `INFO`. List the schedule `sourceId`s alongside the
+> extension ones if you want them, or omit the parameter entirely to take the whole
+> archive. Prompt snippets are the one exception: they are matched by name and imported
+> regardless of the selection.
+
+**Scenario 4: Disaster Recovery**
+
+```bash
+# Regular automated backup (cron job)
+#!/bin/bash
+DATE=$(date +%Y%m%d)
+LOCATION=$(curl -s -D - -o /dev/null -X POST \
+  "http://prod.eddi.com/backup/export/agent123?agentVersion=1" \
+  | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+curl -o "backups/agent123-$DATE.zip" "http://prod.eddi.com${LOCATION}"
+aws s3 cp "backups/agent123-$DATE.zip" s3://agent-backups/
+
+# Restore after failure
+aws s3 cp s3://agent-backups/agent123-20250103.zip ./
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent123-20250103.zip http://prod.eddi.com/backup/import
+```
+
+---
+
+## Using the Manager UI
+
+The EDDI Manager provides a guided import wizard accessible from the **Agents** page:
+
+1. **Upload** — Drag-and-drop or browse for a `.zip` export file
+2. **Choose Strategy**:
+   - **Create New Agent** — Always creates a fresh agent (default)
+   - **Merge / Sync** — Updates an existing agent if one with matching origin IDs exists
+3. **Preview** (merge only) — Shows a table of all resources with their planned action:
+   - 🟢 **New** — Resource doesn't exist locally, will be created
+   - 🔵 **Update** — Resource exists locally, will be updated to the imported version
+   - ⚪ **Skip** — Resource is identical, no changes needed
+4. **Select Resources** — Checkboxes let you pick which resources to merge (all selected by default)
+5. **Confirm** — Executes the import
+
+---
+
+## How Merge Tracking Works
+
+When an agent is first imported into an EDDI instance, EDDI stores the **origin ID** of each resource (the ID it had on the source system) in the `DocumentDescriptor`. On subsequent imports with `strategy=merge`:
+
+1. EDDI reads each resource from the ZIP
+2. Looks up the origin ID in the local descriptor store (`findByOriginId`)
+3. If found → **updates** the existing resource (creating a new version)
+4. If not found → **creates** a new resource
+5. The agent itself is updated with references to the (possibly new) resource versions
+
+This means the **agent ID stays the same** across merge imports — only the version increments. Deployments, triggers, and integrations that reference the agent ID continue to work without reconfiguration.
+
+---
+
+## API Reference
+
+### Exporting an Agent
+
+Send a **`POST`** request to export. The response `Location` header contains the download URL.
+
+| Element      | Value                                             |
+| ------------ | ------------------------------------------------- |
+| HTTP Method  | `POST`                                            |
+| API Endpoint | `/backup/export/{agentId}?agentVersion={version}` |
+| Response     | `Location` header with ZIP download URL           |
+
+The filename is `{urlEncodedAgentName}-{agentId}-{agentVersion}.zip` whenever the agent's
+descriptor carries a name (it drops to `{agentId}-{agentVersion}.zip` only for a nameless
+agent), so read it from the `Location` header rather than constructing it.
+
+**Example:**
+
+```bash
+LOCATION=$(curl -s -D - -o /dev/null -X POST \
+  "http://localhost:7070/backup/export/agent123?agentVersion=1" \
+  | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+# e.g. /backup/export/My+Agent-agent123-1.zip
+
+curl -O "http://localhost:7070${LOCATION}"
+```
+
+### Importing an Agent (Create)
+
+Upload a ZIP file to create a new agent.
+
+| Element      | Value                                |
+| ------------ | ------------------------------------ |
+| HTTP Method  | `POST`                               |
+| API Endpoint | `/backup/import`                     |
+| Content-Type | `application/zip`                    |
+| Request Body | ZIP file binary                      |
+| Response     | `Location` header with new agent URI |
+
+**Example:**
+
+```bash
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip http://localhost:7070/backup/import
+```
+
+### Preview Merge Import
+
+Dry-run analysis: returns what would change without modifying any data.
+
+| Element      | Value                            |
+| ------------ | -------------------------------- |
+| HTTP Method  | `POST`                           |
+| API Endpoint | `/backup/import/preview`         |
+| Content-Type | `application/zip`                |
+| Request Body | ZIP file binary                  |
+| Response     | JSON with resource diff analysis |
+
+**Response format:**
+
+```json
+{
+  "sourceAgentId": "original-agent-id-from-source",
+  "sourceAgentName": "My Agent",
+  "targetAgentId": "local-agent-id",
+  "targetAgentName": "My Agent",
+  "resources": [
+    {
+      "sourceId": "original-resource-id",
+      "resourceType": "agent",
+      "name": "My Agent",
+      "action": "UPDATE",
+      "targetId": "local-agent-id",
+      "targetVersion": 1,
+      "matchStrategy": "originId",
+      "workflowIndex": -1
+    },
+    {
+      "sourceId": "original-behavior-id",
+      "resourceType": "behavior",
+      "name": "Greeting Rules",
+      "action": "CREATE",
+      "targetId": null,
+      "targetVersion": null,
+      "matchStrategy": null,
+      "workflowIndex": 0
+    }
+  ]
+}
+```
+
+Upgrade previews additionally populate `sourceContent` and `targetContent` with the
+raw JSON of each side. The `sourceId` values are what `selectedResources` expects.
+
+**Actions:**
+
+- `CREATE` — No matching local resource found; will be created
+- `UPDATE` — Matching local resource found; will be updated
+- `SKIP` — Resource is unchanged; will be skipped
+- `CONFLICT` — Match is ambiguous; must be resolved manually
+
+### Importing an Agent (Merge)
+
+Update an existing agent by matching origin IDs.
+
+| Element      | Value                                                      |
+| ------------ | ---------------------------------------------------------- |
+| HTTP Method  | `POST`                                                     |
+| API Endpoint | `/backup/import?strategy=merge`                            |
+| Content-Type | `application/zip`                                          |
+| Request Body | ZIP file binary                                            |
+| Query Params | `strategy=merge`, optional `selectedResources=id1,id2,...` |
+| Response     | `Location` header with updated agent URI                   |
+
+**Example (merge all):**
+
+```bash
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip "http://localhost:7070/backup/import?strategy=merge"
+```
+
+**Example (selective merge):**
+
+```bash
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip \
+  "http://localhost:7070/backup/import?strategy=merge&selectedResources=origin-id-1,origin-id-2"
+```
+
+`selectedResources` is one flat list over **every** row the preview returned — extensions
+and scheduled triggers alike — so anything not named is left out. A selection of extension
+ids therefore imports no schedules; the response then carries `X-Schedules-Skipped: <count>`
+and the same count is logged at `INFO`. Omit the parameter to import the whole archive.
+
+> **Important:** The agent will not be deployed after import — you must deploy it yourself using the [Deployment API](deployment-management-of-agents.md).
+
+---
+
+## Upgrade Strategy
+
+In addition to `create` (new agent) and `merge` (by origin ID), EDDI supports an **`upgrade`** strategy that uses structural matching to sync content into an existing agent — even if the agents were created independently (no shared origin IDs):
+
+```bash
+# Preview what would change
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip \
+  "http://localhost:7070/backup/import/preview?targetAgentId=local-agent-id"
+
+# Execute upgrade
+curl -X POST -H "Content-Type: application/zip" \
+  --data-binary @agent-export.zip \
+  "http://localhost:7070/backup/import?strategy=upgrade&targetAgentId=local-agent-id"
+```
+
+The upgrade strategy matches resources by **structure** (workflow position, extension type, snippet name) rather than by origin ID. See [Agent Sync](agent-sync-guide.md) for details on how structural matching works.
+
+### Upgrade response codes
+
+An upgrade (and every `/backup/sync` call, which shares the same executor) answers with one
+of three statuses. **All three are 2xx**, so a client must branch on the status code, not on
+`response.ok`:
+
+| Status                 | Meaning                                                                                     |
+| ---------------------- | ------------------------------------------------------------------------------------------- |
+| `200 OK`               | Source and target already agree. Nothing was written and no agent version was burned.        |
+| `201 Created`          | Everything landed and something was written.                                                 |
+| `207 Multi-Status`     | **Partially applied.** The body's `failures[]` names every resource that could not be written. |
+
+The body is an `UpgradeResult` (`agentUri`, `agentUpdated`, `updated`, `created`, `skipped`,
+`failures[]`) on all three, and the `Location` header is present on all three.
+
+### Restoring an EDDI 5.x archive
+
+A genuine 5.x export names its agent file `<id>.bot.json` and its workflow file
+`<id>.package.json` with a `packageExtensions` step list. Both are accepted, and legacy
+`eddi://` URIs are rewritten to their v6 form on the way in.
+
+### What happens to schedules on import
+
+Imported schedules are repointed at the agent the import just wrote, and everything belonging
+to the source deployment is reset: `nextFire` is recomputed from the cron expression (an
+archived one is either long past — firing during the restore — or absent, so it would never
+fire), `agentVersion` goes back to `0` ("latest"), and the tenant and persistent conversation
+are cleared. Every write goes through the ordinary schedule API, so the same rules apply as
+when creating a schedule by hand: a schedule may not run as another user unless you are an
+administrator, its agent's USE gate is checked, and its cron expression is validated. A
+schedule that is refused fails the whole import with that status.
+
+**`userId` is source-deployment state too.** It is the identity every fire *acts as*, minted by
+whichever identity provider the source instance used, so it is kept only when it is already
+your own and cleared otherwise — the imported schedule then runs as the system scheduler until
+you assign an owner. Two consequences worth knowing: you can import somebody else's archive
+without being an administrator, and a **Dream consolidation** schedule arrives with no owner and
+rejects its first fire with a message naming the field to set. Set `userId` on it after the
+import (`PUT /schedulestore/schedules/{id}`) — that is deliberately louder than silently
+consolidating the memories of whichever local user happens to hold the archived id.
+
+With `strategy=merge`, a schedule whose **name** matches one the target agent already has is
+updated in place rather than added, so re-importing the same agent does not accumulate
+duplicate cron jobs. Such an update replaces what the schedule *does* — cron, message, agent —
+but never **who it runs as**: when the archive brings no identity of its own (the usual case,
+per the paragraph above), the owner already on the target is kept. Otherwise every promotion
+reset that schedule to the system scheduler, which stops Dream consolidation and drops the
+schedule's ownership protection. The target's HITL approval timers are excluded from that name matching —
+they are per-conversation safety timers, never part of an agent's configuration, and the export
+side leaves them out for the same reason. If the import fails after a schedule was overwritten,
+the target's original is written back as part of the rollback. The merge preview says so:
+a schedule whose name the target already uses is listed as `UPDATE` with that schedule's id,
+not as `CREATE`.
+
+Schedules also honour `selectedResources`: unticking one in the import preview keeps it out.
+Because that parameter is a single flat list across every preview row, a caller who names
+only extension ids leaves **all** of them out — the import answers `X-Schedules-Skipped: <count>`
+and logs the same number at `INFO`, rather than a bare `201` for an agent whose nightly job
+did not come back. Name the schedule ids too, or leave `selectedResources` off.
+
+## Live Sync (Without ZIP)
+
+If both EDDI instances are reachable over HTTP, you can skip the ZIP step entirely and sync directly between instances. See the **[Agent Sync Guide](agent-sync-guide.md)** for the full workflow.
+
+---
+
+## See Also
+
+- [Agent Sync Guide](agent-sync-guide.md) — Live instance-to-instance sync and upgrade imports
+- [Deployment Management](deployment-management-of-agents.md) — Deploying agents after import
+- [Secrets Vault](secrets-vault.md) — How API keys are scrubbed and re-vaulted during import

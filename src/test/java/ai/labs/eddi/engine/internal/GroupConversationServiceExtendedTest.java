@@ -1,0 +1,2021 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.internal;
+import ai.labs.eddi.configs.agents.IAgentStore;
+
+import ai.labs.eddi.engine.security.CallerIdentityContext;
+import ai.labs.eddi.configs.groups.IAgentGroupStore;
+import ai.labs.eddi.configs.groups.IGroupConversationStore;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.*;
+import ai.labs.eddi.configs.groups.model.GroupConversation;
+import ai.labs.eddi.configs.groups.model.GroupConversation.GroupConversationState;
+import ai.labs.eddi.configs.groups.model.GroupConversation.TranscriptEntry;
+import ai.labs.eddi.configs.groups.model.GroupConversation.TranscriptEntryType;
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.datastore.serialization.IJsonSerialization;
+import ai.labs.eddi.engine.api.IConversationService;
+import ai.labs.eddi.engine.api.IConversationService.ConversationResponseHandler;
+import ai.labs.eddi.engine.api.IGroupConversationService.GroupDiscussionEventListener;
+import ai.labs.eddi.engine.api.IGroupConversationService.GroupDiscussionException;
+import ai.labs.eddi.engine.api.IGroupConversationService;
+import ai.labs.eddi.engine.lifecycle.GroupConversationEventSink;
+import ai.labs.eddi.engine.memory.model.ConversationOutput;
+import ai.labs.eddi.engine.memory.model.ConversationState;
+import ai.labs.eddi.engine.memory.model.SimpleConversationMemorySnapshot;
+import ai.labs.eddi.engine.model.Deployment.Environment;
+import ai.labs.eddi.engine.model.InputData;
+import ai.labs.eddi.engine.runtime.IAgent;
+import ai.labs.eddi.engine.runtime.IAgentFactory;
+import ai.labs.eddi.modules.templating.ITemplatingEngine;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.time.Instant;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Extended tests for {@link GroupConversationService} — covers branches missed
+ * by the main test file: startAndDiscussAsync, parallel phases, peer-targeted
+ * phases, maxTurns cap, listener events, delete error handling, template
+ * fallback, resolveParticipants edge cases, and context scope filtering.
+ */
+class GroupConversationServiceExtendedTest {
+
+    private IAgentGroupStore groupStore;
+    private IGroupConversationStore conversationStore;
+    private IConversationService conversationService;
+    private IAgentFactory agentFactory;
+    private ITemplatingEngine templatingEngine;
+    private IJsonSerialization jsonSerialization;
+    private GroupConversationService service;
+
+    private IAgentStore agentStore;
+
+    private static final String GROUP_ID = "test-group";
+    private static final String USER_ID = "test-user";
+    private static final String QUESTION = "What is the best approach?";
+
+    @BeforeEach
+    void setUp() throws Exception {
+        groupStore = mock(IAgentGroupStore.class);
+        conversationStore = mock(IGroupConversationStore.class);
+        conversationService = mock(IConversationService.class);
+        agentFactory = mock(IAgentFactory.class);
+        templatingEngine = mock(ITemplatingEngine.class);
+        jsonSerialization = mock(IJsonSerialization.class);
+
+        agentStore = mock(IAgentStore.class);
+        service = new GroupConversationService(groupStore, conversationStore,
+                conversationService, agentFactory, templatingEngine,
+                jsonSerialization, new SimpleMeterRegistry(),
+                null, agentStore, null, null, null, new CallerIdentityContext(null, null), "default", 3);
+
+        when(conversationStore.create(any())).thenReturn("gc-1");
+
+        lenient().when(jsonSerialization.serialize(any()))
+                .thenAnswer(inv -> inv.getArgument(0).toString());
+
+        lenient().when(templatingEngine.processTemplate(anyString(), any(), any()))
+                .thenAnswer(inv -> {
+                    String tmpl = inv.getArgument(0, String.class);
+                    return tmpl.length() > 80 ? tmpl.substring(0, 80) : tmpl;
+                });
+    }
+
+    // --- Helpers ---
+
+    private AgentGroupConfiguration config(DiscussionStyle style, int rounds,
+                                           GroupMember... members) {
+        var c = new AgentGroupConfiguration();
+        c.setName("Test Group");
+        c.setMembers(List.of(members));
+        c.setStyle(style);
+        c.setMaxRounds(rounds);
+        c.setProtocol(new ProtocolConfig(60,
+                ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                ProtocolConfig.MemberUnavailablePolicy.SKIP));
+        return c;
+    }
+
+    private void setupStore(AgentGroupConfiguration cfg) throws Exception {
+        setupStore(GROUP_ID, cfg);
+    }
+
+    private void setupStore(String groupId, AgentGroupConfiguration cfg) throws Exception {
+        var rid = mock(IResourceStore.IResourceId.class);
+        when(rid.getVersion()).thenReturn(1);
+        when(groupStore.getCurrentResourceId(groupId)).thenReturn(rid);
+        when(groupStore.read(groupId, 1)).thenReturn(cfg);
+    }
+
+    private void stubAgent(String agentId, String response) throws Exception {
+        when(agentFactory.getLatestReadyAgent(any(Environment.class), eq(agentId)))
+                .thenReturn(mock(IAgent.class));
+
+        when(conversationService.startConversation(any(Environment.class),
+                eq(agentId), anyString(), any()))
+                .thenReturn(new IConversationService.ConversationResult(
+                        "conv-" + agentId, null));
+
+        doAnswer(inv -> {
+            ConversationResponseHandler handler = inv.getArgument(8);
+            var snapshot = new SimpleConversationMemorySnapshot();
+            var output = new ConversationOutput();
+            output.put("output", List.of(response));
+            snapshot.setConversationOutputs(new ArrayList<>(List.of(output)));
+            handler.onComplete(snapshot);
+            return null;
+        }).when(conversationService).say(any(Environment.class), eq(agentId),
+                anyString(), any(), any(), any(), any(InputData.class),
+                anyBoolean(), any(ConversationResponseHandler.class));
+    }
+
+    // =========================================================
+    // startAndDiscussAsync
+    // =========================================================
+
+    /**
+     * I14 — a VOTE phase end-to-end: blind parallel ballots, weighted tally, the
+     * DecisionRecord on the discussion, and decision_reached finally firing (the §4
+     * gap this item folds in).
+     */
+    @Nested
+    class VotePhases {
+
+        private AgentGroupConfiguration voteConfig(AgentGroupConfiguration.TiePolicy tiePolicy) {
+            var c = new AgentGroupConfiguration();
+            c.setName("Vote Group");
+            c.setStyle(DiscussionStyle.CUSTOM);
+            c.setModeratorAgentId("mod");
+            c.setMembers(List.of(new GroupMember("a1", "Alice", 1, null), new GroupMember("a2", "Bob", 2, null),
+                    new GroupMember("a3", "Carol", 3, null)));
+            c.setPhases(List.of(new AgentGroupConfiguration.DiscussionPhase("Ballot", PhaseType.VOTE, "ALL",
+                    TurnOrder.PARALLEL, ContextScope.NONE, false, null, 1, false, null, false,
+                    new AgentGroupConfiguration.VoteConfig(AgentGroupConfiguration.VoteMethod.MAJORITY,
+                            AgentGroupConfiguration.OptionsSource.EXPLICIT, List.of("Ship it", "Hold it"), 0.5,
+                            Map.of(), false, tiePolicy))));
+            c.setProtocol(new ProtocolConfig(60, ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            return c;
+        }
+
+        @Test
+        void votePhase_majorityWins_recordsDecision_andFiresDecisionReached() throws Exception {
+            setupStore(voteConfig(AgentGroupConfiguration.TiePolicy.NO_DECISION));
+            stubAgent("a1", "{\"vote\": \"Ship it\", \"statement\": \"ready\"}");
+            stubAgent("a2", "{\"vote\": \"Ship it\"}");
+            stubAgent("a3", "{\"vote\": \"Hold it\", \"statement\": \"needs QA\"}");
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            GroupConversation gc = service.discuss(GROUP_ID, "Release?", USER_ID, 0, listener);
+
+            assertNotNull(gc.getDecision());
+            assertEquals(GroupConversation.DecisionType.VOTE, gc.getDecision().type());
+            assertEquals("Ship it", gc.getDecision().winner());
+            assertEquals(1, gc.getDecision().dissents().size(), "the losing statement is the minority report");
+
+            var captor = ArgumentCaptor.forClass(GroupConversationEventSink.DecisionReachedEvent.class);
+            verify(listener).onDecisionReached(captor.capture());
+            assertEquals("Ship it", captor.getValue().decision().winner());
+        }
+
+        @Test
+        void votePhase_tie_moderatorDecides_viaOneTiebreakTurn() throws Exception {
+            var config = voteConfig(AgentGroupConfiguration.TiePolicy.MODERATOR_DECIDES);
+            config.setMembers(List.of(new GroupMember("a1", "Alice", 1, null), new GroupMember("a2", "Bob", 2, null)));
+            setupStore(config);
+            stubAgent("a1", "{\"vote\": \"Ship it\"}");
+            stubAgent("a2", "{\"vote\": \"Hold it\"}");
+            stubAgent("mod", "Hold it");
+
+            GroupConversation gc = service.discuss(GROUP_ID, "Release?", USER_ID, 0);
+
+            assertEquals(GroupConversation.DecisionType.VOTE, gc.getDecision().type());
+            assertEquals("Hold it", gc.getDecision().winner());
+            assertEquals("vote+moderator-tiebreak", gc.getDecision().method());
+        }
+
+        @Test
+        void votePhase_tie_noDecisionPolicy_recordsHonestNone_andContinues() throws Exception {
+            var config = voteConfig(AgentGroupConfiguration.TiePolicy.NO_DECISION);
+            config.setMembers(List.of(new GroupMember("a1", "Alice", 1, null), new GroupMember("a2", "Bob", 2, null)));
+            setupStore(config);
+            stubAgent("a1", "{\"vote\": \"Ship it\"}");
+            stubAgent("a2", "{\"vote\": \"Hold it\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, "Release?", USER_ID, 0);
+
+            assertEquals(GroupConversation.DecisionType.NONE, gc.getDecision().type());
+            assertNull(gc.getDecision().winner());
+            assertNotEquals(GroupConversation.GroupConversationState.FAILED, gc.getState(),
+                    "an undecided vote is not a failed discussion");
+        }
+
+        @Test
+        void votePhase_ballotsAreVoteEntries_peerHiddenDuringTheirPhase() throws Exception {
+            setupStore(voteConfig(AgentGroupConfiguration.TiePolicy.NO_DECISION));
+            stubAgent("a1", "{\"vote\": \"Ship it\"}");
+            stubAgent("a2", "{\"vote\": \"Ship it\"}");
+            stubAgent("a3", "{\"vote\": \"Hold it\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, "Release?", USER_ID, 0);
+
+            long voteEntries = gc.getTranscript().stream().filter(e -> e.type() == TranscriptEntryType.VOTE).count();
+            assertEquals(3, voteEntries, "each ballot is a VOTE transcript entry (F4 hides them until the phase ends)");
+        }
+    }
+
+    /**
+     * I12 — the bounded facilitator end-to-end: checkpoint cadences, runtime
+     * phase-list divergence (CALL_VOTE, EXTEND_PHASE), END_PHASE, escalation
+     * pauses, and the degrade-to-CONTINUE guarantees under failure.
+     */
+    @Nested
+    class Facilitator {
+
+        private AgentGroupConfiguration facilitatorConfig(FacilitatorCheckpoint checkAfter, int maxMoves,
+                                                          int repeats, FacilitatorMove... moves) {
+            var c = new AgentGroupConfiguration();
+            c.setName("Facilitated Group");
+            c.setStyle(DiscussionStyle.CUSTOM);
+            c.setMembers(List.of(new GroupMember("a1", "Alice", 1, null), new GroupMember("a2", "Bob", 2, null)));
+            c.setPhases(List.of(new AgentGroupConfiguration.DiscussionPhase("Discuss", PhaseType.OPINION, "ALL",
+                    TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, repeats, false)));
+            c.setFacilitator(new AgentGroupConfiguration.FacilitatorConfig(true, "fac", List.of(moves), checkAfter,
+                    maxMoves, "boss@example.com"));
+            c.setProtocol(new ProtocolConfig(60, ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            return c;
+        }
+
+        private long entriesOfType(GroupConversation gc, TranscriptEntryType type) {
+            return gc.getTranscript().stream().filter(e -> e.type() == type).count();
+        }
+
+        @Test
+        void callVote_insertsAOneOffVotePhase_thatActuallyRuns() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_PHASE, 1, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.CALL_VOTE);
+            setupStore(config);
+            // The members' single stub answers both their opinion turn and the
+            // inserted ballot — a valid ballot is a fine opinion for this test.
+            stubAgent("a1", "{\"vote\": \"Ship it\"}");
+            stubAgent("a2", "{\"vote\": \"Ship it\"}");
+            stubAgent("fac", "{\"move\": \"CALL_VOTE\", \"args\": {\"options\": [\"Ship it\", \"Hold it\"]}, "
+                    + "\"reason\": \"split opinions\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(2, entriesOfType(gc, TranscriptEntryType.VOTE),
+                    "the config had NO vote phase — these ballots prove the runtime insertion ran");
+            assertNotNull(gc.getDecision());
+            assertEquals(GroupConversation.DecisionType.VOTE, gc.getDecision().type());
+            assertEquals("Ship it", gc.getDecision().winner());
+            assertNull(gc.getRuntimePhases(), "the divergence is one-off — completion clears it");
+            // Checkpoint 1 (after Discuss) executed CALL_VOTE; checkpoint 2 (after
+            // the inserted vote) had no budget left (maxMoves=1) and was rejected.
+            assertEquals(2, entriesOfType(gc, TranscriptEntryType.FACILITATION));
+        }
+
+        @Test
+        void endPhase_atEachRepeat_skipsTheRemainingRepeats() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 3,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.END_PHASE);
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("fac", "{\"move\": \"END_PHASE\", \"reason\": \"positions are clear\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(2, entriesOfType(gc, TranscriptEntryType.OPINION),
+                    "repeats=3 would produce 6 opinions — END_PHASE after repeat 1 leaves exactly one round");
+            assertTrue(gc.getTranscript().stream().anyMatch(e -> e.type() == TranscriptEntryType.FACILITATION
+                    && e.content() != null && e.content().contains("ended phase")));
+        }
+
+        @Test
+        void extendPhase_addsRepeats_andTheCapHolds() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.EXTEND_PHASE);
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            // Always asks to extend: 1 configured repeat + 2 allowed extensions = 3
+            // rounds, then the per-phase cap rejects the third ask.
+            stubAgent("fac", "{\"move\": \"EXTEND_PHASE\", \"reason\": \"still productive\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(6, entriesOfType(gc, TranscriptEntryType.OPINION),
+                    "2 members × (1 configured + 2 extended) repeats — the cap is what stops the loop");
+            assertTrue(gc.getFacilitatorExtensions().isEmpty(), "completion clears the per-phase extension counts");
+        }
+
+        @Test
+        void escalateHuman_pausesForTheConfiguredPrincipal() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_PHASE, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.ESCALATE_HUMAN);
+            // A second phase so the escalation has somewhere to resume into.
+            config.setPhases(List.of(
+                    new AgentGroupConfiguration.DiscussionPhase("Discuss", PhaseType.OPINION, "ALL",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false),
+                    new AgentGroupConfiguration.DiscussionPhase("Wrap", PhaseType.SYNTHESIS, "MODERATOR",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false)));
+            config.setModeratorAgentId("mod");
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("mod", "The synthesis.");
+            stubAgent("fac", "{\"move\": \"ESCALATE_HUMAN\", \"args\": {\"question\": \"Do we have budget for this?\"}, "
+                    + "\"reason\": \"commercial call\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.AWAITING_HUMAN_INPUT, gc.getState());
+            var pending = gc.getPendingHumanInput();
+            assertNotNull(pending);
+            assertEquals("boss@example.com", pending.memberId(), "the pause waits on the CONFIGURED principal");
+            assertEquals("Do we have budget for this?", pending.renderedPrompt());
+            assertEquals(TranscriptEntryType.FOLLOW_UP.name(), pending.entryType(),
+                    "the answer lands as peer-visible guidance, not hidden bookkeeping");
+            var bookmark = gc.getResumePoint();
+            assertEquals(1, bookmark.phaseIdx(), "resumes at the NEXT phase");
+            assertEquals(-1, bookmark.speakerIdx(), "the +1 advance on submission starts it at speaker 0");
+            assertEquals(GroupConversation.RESUME_KIND_HUMAN_TURN, bookmark.pauseKind());
+        }
+
+        @Test
+        void escalate_midPhaseAtEachRepeat_bookmarksTheSamePhaseAndNextRepeat() throws Exception {
+            // The DEFERRED EACH_REPEAT branch (review finding: previously untested)
+            // — a mid-phase escalation must resume the SAME phase at repeat+1, or
+            // the resumed leg would re-run the completed repeat (duplicate turns,
+            // double cost) or skip a scheduled one.
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 3,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.ESCALATE_HUMAN);
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("fac", "{\"move\": \"ESCALATE_HUMAN\", \"args\": {\"question\": \"Keep going?\"}, "
+                    + "\"reason\": \"checking in\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.AWAITING_HUMAN_INPUT, gc.getState());
+            assertEquals(2, entriesOfType(gc, TranscriptEntryType.OPINION), "exactly repeat 0 ran before the pause");
+            var bookmark = gc.getResumePoint();
+            assertEquals(0, bookmark.phaseIdx(), "mid-phase: resumes the SAME phase");
+            assertEquals(1, bookmark.repeatIdx(), "…at the NEXT repeat — never re-running the completed one");
+            assertEquals(GroupConversation.RESUME_KIND_HUMAN_TURN, bookmark.pauseKind());
+        }
+
+        @Test
+        void escalate_atFinalRepeatBoundary_bookmarksTheNextPhase() throws Exception {
+            // The deferred branch's OTHER arithmetic arm: a boundary escalation
+            // (final repeat, no approval gate on the phase) resumes at phase+1.
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.ESCALATE_HUMAN);
+            config.setPhases(List.of(
+                    new AgentGroupConfiguration.DiscussionPhase("Discuss", PhaseType.OPINION, "ALL",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false),
+                    new AgentGroupConfiguration.DiscussionPhase("Wrap", PhaseType.SYNTHESIS, "MODERATOR",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false)));
+            config.setModeratorAgentId("mod");
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("mod", "The synthesis.");
+            stubAgent("fac", "{\"move\": \"ESCALATE_HUMAN\", \"args\": {\"question\": \"Proceed to wrap-up?\"}, "
+                    + "\"reason\": \"boundary call\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.AWAITING_HUMAN_INPUT, gc.getState());
+            var bookmark = gc.getResumePoint();
+            assertEquals(1, bookmark.phaseIdx(), "boundary: resumes at the NEXT phase");
+            assertEquals(0, bookmark.repeatIdx());
+        }
+
+        @Test
+        void escalate_atTheBoundaryOfAnApprovalGatedPhase_theApprovalGateWins() throws Exception {
+            // CRITICAL review finding: a boundary escalation used to return before
+            // the phase-boundary HITL gate, silently skipping a requiresApproval
+            // phase's mandatory human approval — the escalation answerer has no
+            // REJECT path, so the compliance gate simply vanished.
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.ESCALATE_HUMAN);
+            config.setPhases(List.of(
+                    new AgentGroupConfiguration.DiscussionPhase("Discuss", PhaseType.OPINION, "ALL",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, true),
+                    new AgentGroupConfiguration.DiscussionPhase("Wrap", PhaseType.SYNTHESIS, "MODERATOR",
+                            TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false)));
+            config.setModeratorAgentId("mod");
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("fac", "{\"move\": \"ESCALATE_HUMAN\", \"args\": {\"question\": \"Skip approval?\"}, "
+                    + "\"reason\": \"impatient\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.AWAITING_APPROVAL, gc.getState(),
+                    "the phase's mandatory approval pause supersedes the facilitator's escalation");
+            assertNull(gc.getPendingHumanInput(), "no human-turn pause was committed");
+            assertTrue(gc.getTranscript().stream().anyMatch(e -> e.type() == TranscriptEntryType.FACILITATION
+                    && e.content() != null && e.content().contains("suppressed")
+                    && e.content().contains("Skip approval?")),
+                    "the suppression entry preserves the facilitator's question for the approver");
+        }
+
+        @Test
+        void continueEverywhere_leavesTheDiscussionUntouched() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_PHASE, 10, 2, FacilitatorMove.CONTINUE);
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("fac", "{\"move\": \"CONTINUE\", \"reason\": \"healthy\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(4, entriesOfType(gc, TranscriptEntryType.OPINION), "2 members × 2 repeats, unchanged");
+            assertEquals(0, entriesOfType(gc, TranscriptEntryType.FACILITATION), "CONTINUE is silent");
+            assertNull(gc.getRuntimePhases());
+        }
+
+        /**
+         * Final-review finding: a facilitator END_PHASE used to take a plain
+         * {@code break} AFTER the decision block, so a VOTE phase it ended never
+         * tallied its cast ballots. END_PHASE now folds into the phase outcome BEFORE
+         * the block — the tally, verdict and dissent machinery all see a real phase
+         * end.
+         */
+        @Test
+        void endPhase_onAVotePhase_stillTalliesTheCastBallots() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.END_PHASE);
+            config.setPhases(List.of(new AgentGroupConfiguration.DiscussionPhase("Ballot", PhaseType.VOTE, "ALL",
+                    TurnOrder.PARALLEL, ContextScope.NONE, false, null, 2, false, null, false,
+                    new AgentGroupConfiguration.VoteConfig(AgentGroupConfiguration.VoteMethod.MAJORITY,
+                            AgentGroupConfiguration.OptionsSource.EXPLICIT, List.of("Ship it", "Hold it"), 0.5,
+                            Map.of(), false, AgentGroupConfiguration.TiePolicy.NO_DECISION))));
+            setupStore(config);
+            stubAgent("a1", "{\"vote\": \"Ship it\"}");
+            stubAgent("a2", "{\"vote\": \"Ship it\"}");
+            stubAgent("fac", "{\"move\": \"END_PHASE\", \"reason\": \"one ballot round is enough\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(2, gc.getTranscript().stream().filter(e -> e.type() == TranscriptEntryType.VOTE).count(),
+                    "END_PHASE stopped the second ballot round");
+            assertNotNull(gc.getDecision(), "the cast ballots MUST still be tallied — an untallied election is lost work");
+            assertEquals(GroupConversation.DecisionType.VOTE, gc.getDecision().type());
+            assertEquals("Ship it", gc.getDecision().winner());
+        }
+
+        /**
+         * Final-review finding: EXTEND_PHASE at a phase's final repeat used to run
+         * AFTER the decision block had already fired for that repeat, so the next
+         * (extended) final repeat re-ran it — duplicate dissent rounds and a re-fired
+         * decision event. The consult now precedes the block, so an extension DEFERS it
+         * to the true final repeat.
+         */
+        @Test
+        void extendPhase_onTheFinalSynthesisRepeat_runsTheDissentRoundExactlyOnce() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_REPEAT, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.EXTEND_PHASE);
+            config.setPhases(List.of(new AgentGroupConfiguration.DiscussionPhase("Wrap", PhaseType.SYNTHESIS,
+                    "MODERATOR", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false)));
+            config.setModeratorAgentId("mod");
+            config.setRecordDissents(true);
+            setupStore(config);
+            stubAgent("a1", "I still disagree about the rollout risk.");
+            stubAgent("a2", "I still disagree about the budget.");
+            stubAgent("mod", "The synthesis.");
+            stubAgent("fac", "{\"move\": \"EXTEND_PHASE\", \"reason\": \"one more pass\"}");
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(3, gc.getTranscript().stream().filter(e -> e.type() == TranscriptEntryType.SYNTHESIS).count(),
+                    "1 configured + 2 extended synthesis repeats");
+            assertEquals(2, gc.getTranscript().stream().filter(e -> e.type() == TranscriptEntryType.DISSENT).count(),
+                    "ONE dissent round (two dissenters), on the true final repeat only — not one per extension");
+        }
+
+        @Test
+        void effectivePhases_prefersTheRuntimeList_overTheConfig() {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_PHASE, 10, 1, FacilitatorMove.CONTINUE);
+            var gc = new GroupConversation();
+            var diverged = List.of(
+                    config.getPhases().get(0),
+                    new AgentGroupConfiguration.DiscussionPhase("Facilitator Vote", PhaseType.VOTE, "ALL",
+                            TurnOrder.PARALLEL, ContextScope.NONE, false, null, 1, false));
+
+            assertEquals(config.getPhases(), service.effectivePhases(gc, config),
+                    "no divergence → the config is authoritative");
+
+            gc.setRuntimePhases(diverged);
+            assertEquals(diverged, service.effectivePhases(gc, config),
+                    "a persisted runtime list wins — the bookmark was taken against it");
+
+            gc.setRuntimePhases(List.of());
+            assertEquals(config.getPhases(), service.effectivePhases(gc, config), "empty behaves as unset");
+        }
+
+        @Test
+        void facilitatorAgentUnavailable_discussionCompletesNormally() throws Exception {
+            var config = facilitatorConfig(FacilitatorCheckpoint.EACH_PHASE, 10, 1,
+                    FacilitatorMove.CONTINUE, FacilitatorMove.END_PHASE);
+            setupStore(config);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            // "fac" is never stubbed: getLatestReadyAgent returns null → the
+            // SKIP unavailable-policy yields a contentless reply → no intervention.
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(2, entriesOfType(gc, TranscriptEntryType.OPINION));
+            assertEquals(0, entriesOfType(gc, TranscriptEntryType.FACILITATION),
+                    "a facilitator that never replied has no attempt to record");
+        }
+    }
+
+    /**
+     * Review finding (final pass): a human turn pauses MID-repeat, after other
+     * speakers already appended this repeat's entries — a resumed leg recomputing
+     * "transcript size at top of repeat" sliced only the post-pause entries, so the
+     * convergence check (and every later consumer of the repeat slice) silently
+     * lost the pre-pause contributions.
+     */
+    @Nested
+    class HumanPauseRepeatSlice {
+
+        private AgentGroupConfiguration humanConfig() {
+            var c = new AgentGroupConfiguration();
+            c.setName("Hybrid");
+            c.setStyle(DiscussionStyle.CUSTOM);
+            c.setMembers(List.of(new GroupMember("a1", "Alice", 1, null),
+                    new GroupMember("h1", "Hannah", 2, null, AgentGroupConfiguration.MemberType.HUMAN),
+                    new GroupMember("a2", "Bob", 3, null)));
+            c.setPhases(List.of(new AgentGroupConfiguration.DiscussionPhase("Discuss", PhaseType.OPINION, "ALL",
+                    TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1, false)));
+            c.setProtocol(new ProtocolConfig(60, ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            return c;
+        }
+
+        @Test
+        void midRepeatHumanPause_persistsTheRepeatSliceBase() throws Exception {
+            setupStore(humanConfig());
+            stubAgent("a1", "Opinion A");
+            // The resumed leg re-reads the DOCUMENT — the in-memory instance below
+            // proves nothing about what a crashed-and-recovered pod would see
+            // (review finding: a captor would hold the same mutable instance, so
+            // the value is recorded AT persist time instead).
+            var basesAtPersistTime = new ArrayList<Integer>();
+            doAnswer(inv -> {
+                basesAtPersistTime.add(((GroupConversation) inv.getArgument(0)).getPausedRepeatSliceBase());
+                return null;
+            }).when(conversationStore).update(any());
+
+            GroupConversation gc = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.AWAITING_HUMAN_INPUT, gc.getState());
+            assertEquals(2, gc.getTranscript().size(), "the QUESTION entry plus a1's pre-pause opinion");
+            assertEquals(1, gc.getPausedRepeatSliceBase(),
+                    "the repeat began AFTER the question entry — the resumed leg must slice from there, "
+                            + "not from the pause point (which would lose a1's contribution)");
+            assertFalse(basesAtPersistTime.isEmpty(), "the pause must persist the conversation");
+            assertEquals(1, basesAtPersistTime.get(basesAtPersistTime.size() - 1),
+                    "the slice base must be IN the persisted pause record, not only in memory");
+        }
+
+        @Test
+        void resumedLeg_consumesThePersistedBase_exactlyOnce() throws Exception {
+            var config = humanConfig();
+            setupStore(config);
+            stubAgent("a2", "Opinion B");
+            // The resumed leg: a1 and the human already answered before the pause;
+            // the bookmark stands past the human, and the persisted base points at
+            // the top of the repeat.
+            var gc = new GroupConversation();
+            gc.setId("gc-resume");
+            gc.setGroupId(GROUP_ID);
+            gc.setUserId(USER_ID);
+            gc.setState(GroupConversationState.IN_PROGRESS);
+            gc.setOriginalQuestion(QUESTION);
+            gc.getTranscript().add(new TranscriptEntry("a1", "Alice", "Opinion A", 0, "Discuss",
+                    TranscriptEntryType.OPINION, Instant.now(), null, null));
+            gc.getTranscript().add(new TranscriptEntry("h1", "Hannah", "Human view", 0, "Discuss",
+                    TranscriptEntryType.OPINION, Instant.now(), null, null));
+            gc.setResumePoint(new GroupConversation.ResumePoint(0, 0, 2, GroupConversation.RESUME_KIND_HUMAN_TURN));
+            gc.setPausedRepeatSliceBase(0);
+
+            service.executeDiscussion(gc, config, service.resolvePhases(config), QUESTION, null, 0);
+
+            assertEquals(-1, gc.getPausedRepeatSliceBase(),
+                    "the base is consumed exactly once by the resumed repeat — a stale base must never bleed forward");
+            assertEquals(GroupConversationState.COMPLETED, gc.getState());
+            assertEquals(3, gc.getTranscript().size(), "only a2 ran on the resumed leg");
+        }
+    }
+
+    @Nested
+    class AsyncDiscussion {
+
+        @Test
+        void startAndDiscussAsync_nullGroupId_throwsIllegalArgument() {
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.startAndDiscussAsync(null, QUESTION, USER_ID, null));
+        }
+
+        @Test
+        void startAndDiscussAsync_groupNotFound_throwsResourceNotFoundException() throws Exception {
+            when(groupStore.getCurrentResourceId("missing")).thenReturn(null);
+
+            assertThrows(IResourceStore.ResourceNotFoundException.class,
+                    () -> service.startAndDiscussAsync("missing", QUESTION, USER_ID, null));
+        }
+
+        @Test
+        void startAndDiscussAsync_nullConfig_throwsResourceNotFoundException() throws Exception {
+            var rid = mock(IResourceStore.IResourceId.class);
+            when(rid.getVersion()).thenReturn(1);
+            when(groupStore.getCurrentResourceId(GROUP_ID)).thenReturn(rid);
+            when(groupStore.read(GROUP_ID, 1)).thenReturn(null);
+
+            assertThrows(IResourceStore.ResourceNotFoundException.class,
+                    () -> service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, null));
+        }
+
+        @Test
+        void startAndDiscussAsync_emptyPhases_throwsGroupDiscussionException() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setPhases(List.of()); // empty phases
+            setupStore(cfg);
+
+            assertThrows(GroupDiscussionException.class,
+                    () -> service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, null));
+        }
+
+        @Test
+        void startAndDiscussAsync_returnsImmediately_withConversationId() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+
+            // Gate the first agent response so the async thread blocks until we release it.
+            // This guarantees the state is still IN_PROGRESS when we assert.
+            var gate = new CountDownLatch(1);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(Environment.class),
+                    eq("a1"), anyString(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+            doAnswer(inv -> {
+                gate.await(5, TimeUnit.SECONDS); // block until test releases
+                ConversationResponseHandler handler = inv.getArgument(8);
+                var snapshot = new SimpleConversationMemorySnapshot();
+                var output = new ConversationOutput();
+                output.put("output", List.of("Opinion A"));
+                snapshot.setConversationOutputs(new ArrayList<>(List.of(output)));
+                handler.onComplete(snapshot);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("a1"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            stubAgent("mod", "Synthesis");
+
+            var result = service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, null);
+
+            // Assert while the async thread is still blocked on the gate
+            assertNotNull(result);
+            assertEquals("gc-1", result.getId());
+            assertEquals(GROUP_ID, result.getGroupId());
+            assertEquals(GroupConversationState.IN_PROGRESS, result.getState());
+
+            // Release the gate so the async thread can finish cleanly
+            gate.countDown();
+            Thread.sleep(500);
+        }
+
+        @Test
+        void startAndDiscussAsync_withListener_sendsGroupStartEvent() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, listener);
+
+            // Give async thread time to complete
+            Thread.sleep(1000);
+
+            verify(listener, atLeastOnce()).onGroupStart(any(GroupConversationEventSink.GroupStartEvent.class));
+        }
+    }
+
+    // =========================================================
+    // Listener events
+    // =========================================================
+
+    @Nested
+    class ListenerEvents {
+
+        @Test
+        void discuss_withListener_emitsAllEvents() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            service.discuss(GROUP_ID, QUESTION, USER_ID, 0, listener);
+
+            // Verify all event types are emitted
+            verify(listener).onGroupStart(any(GroupConversationEventSink.GroupStartEvent.class));
+            verify(listener, atLeastOnce()).onPhaseStart(any(GroupConversationEventSink.PhaseStartEvent.class));
+            verify(listener, atLeastOnce()).onSpeakerStart(any(GroupConversationEventSink.SpeakerStartEvent.class));
+            verify(listener, atLeastOnce()).onSpeakerComplete(any(GroupConversationEventSink.SpeakerCompleteEvent.class));
+            verify(listener, atLeastOnce()).onPhaseComplete(any(GroupConversationEventSink.PhaseCompleteEvent.class));
+            verify(listener).onSynthesisStart(any(GroupConversationEventSink.SynthesisStartEvent.class));
+            verify(listener).onGroupComplete(any(GroupConversationEventSink.GroupCompleteEvent.class));
+        }
+
+        @Test
+        void discuss_failureWithListener_emitsGroupError() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.ABORT, 0,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(null);
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            assertThrows(GroupDiscussionException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 0, listener));
+
+            verify(listener).onGroupError(any(GroupConversationEventSink.GroupErrorEvent.class));
+        }
+
+        /**
+         * F6/N3: the field initialiser is the LEGACY sentinel (so key-less stored
+         * documents read as legacy), which means a freshly created document only claims
+         * the current schema because the creation path stamps it. Drop the stamp and
+         * every NEW document would persist claiming legacy shape.
+         */
+        @Test
+        void discuss_stampsCurrentSchemaVersionOnTheCreatedDocument() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            service.discuss(GROUP_ID, QUESTION, USER_ID, 0, null);
+
+            var created = ArgumentCaptor.forClass(GroupConversation.class);
+            verify(conversationStore).create(created.capture());
+            assertEquals(GroupConversation.CURRENT_SCHEMA_VERSION, created.getValue().getSchemaVersion(),
+                    "a new document must be stamped current at creation — the initialiser deliberately is not");
+        }
+
+        @Test
+        void discuss_withNullListener_doesNotThrow() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            // Null listener should work fine
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0, null);
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Parallel phase execution
+    // =========================================================
+
+    @Nested
+    class ParallelPhases {
+
+        @Test
+        void parallelPhase_executesAllSpeakersConcurrently() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null),
+                    new GroupMember("a2", "Bob", 2, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("ParallelOpinion", PhaseType.OPINION,
+                            "ALL", TurnOrder.PARALLEL, ContextScope.NONE, false, null, 1),
+                    new DiscussionPhase("Synthesis", PhaseType.SYNTHESIS,
+                            "MODERATOR", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("a1", "Alice parallel opinion");
+            stubAgent("a2", "Bob parallel opinion");
+            stubAgent("mod", "Parallel synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            long opinions = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.OPINION)
+                    .count();
+            assertTrue(opinions >= 2, "Expected >=2 parallel opinions, got " + opinions);
+        }
+
+        @Test
+        void parallelPhase_agentTimeout_producesSkippedEntry() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setProtocol(new ProtocolConfig(1,
+                    ProtocolConfig.MemberFailurePolicy.SKIP, 0,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("ParallelOpinion", PhaseType.OPINION,
+                            "ALL", TurnOrder.PARALLEL, ContextScope.NONE, false, null, 1),
+                    new DiscussionPhase("Synthesis", PhaseType.SYNTHESIS,
+                            "MODERATOR", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1)));
+            setupStore(cfg);
+
+            // Agent hangs forever
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("a1"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+            doAnswer(inv -> {
+                // Never call the handler — simulate timeout
+                Thread.sleep(5000);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("a1"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            // Should complete with a skipped/timeout entry
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Peer-targeted phases
+    // =========================================================
+
+    @Nested
+    class PeerTargetedPhases {
+
+        @Test
+        void peerTargetedPhase_skipsSelf() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null),
+                    new GroupMember("a2", "Bob", 2, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Opinions", PhaseType.OPINION),
+                    new DiscussionPhase("PeerCritique", PhaseType.CRITIQUE,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.FULL, true, null, 1),
+                    new DiscussionPhase("Synthesis", PhaseType.SYNTHESIS,
+                            "MODERATOR", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("a1", "Alice response");
+            stubAgent("a2", "Bob response");
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Peer-targeted critique: a1 critiques a2, a2 critiques a1 (2 total)
+            long critiques = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.CRITIQUE)
+                    .count();
+            assertTrue(critiques >= 2, "Expected >=2 peer critiques, got " + critiques);
+        }
+    }
+
+    // =========================================================
+    // Max Turns cap
+    // =========================================================
+
+    @Nested
+    class MaxTurnsCap {
+
+        @Test
+        void maxTurns_exceedsCap_skipRemainingPhases() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null),
+                    new GroupMember("a2", "Bob", 2, null),
+                    new GroupMember("a3", "Carol", 3, null));
+            cfg.setModeratorAgentId("mod");
+            // Set maxTurns to 1 so only first speaker completes
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP, 2));
+            setupStore(cfg);
+            stubAgent("a1", "Opinion A");
+            stubAgent("a2", "Opinion B");
+            stubAgent("a3", "Opinion C");
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Resolve Participants edge cases
+    // =========================================================
+
+    @Nested
+    class ResolveParticipants {
+
+        @Test
+        void moderatorParticipant_noModeratorSet_fallsBackToAll() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            // No moderator set — moderatorAgentId is null
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("SynthPhase", PhaseType.SYNTHESIS,
+                            "MODERATOR", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("a1", "Synth by participant");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Should fallback to ALL since no moderator
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> "a1".equals(e.speakerAgentId())));
+        }
+
+        @Test
+        void roleParticipant_nonExistentRole_fallsBackToAll() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, "EXPERT"));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Opinions", PhaseType.OPINION,
+                            "ROLE:NON_EXISTENT", TurnOrder.SEQUENTIAL,
+                            ContextScope.FULL, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("a1", "Fallback opinion");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> "a1".equals(e.speakerAgentId()) &&
+                            e.type() == TranscriptEntryType.OPINION));
+        }
+
+        @Test
+        void roleParticipant_matchingRole_filtersCorrectly() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, "EXPERT"),
+                    new GroupMember("a2", "Bob", 2, "OBSERVER"));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("ExpertOpinion", PhaseType.OPINION,
+                            "ROLE:EXPERT", TurnOrder.SEQUENTIAL,
+                            ContextScope.NONE, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("a1", "Expert opinion");
+            stubAgent("a2", "Should not speak");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> "a1".equals(e.speakerAgentId())));
+            assertFalse(result.getTranscript().stream()
+                    .anyMatch(e -> "a2".equals(e.speakerAgentId())));
+        }
+    }
+
+    // =========================================================
+    // Template engine fallback
+    // =========================================================
+
+    @Nested
+    class TemplateFallback {
+
+        @Test
+        void templateEngineException_fallsBackToPlainText() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            // Template engine throws
+            when(templatingEngine.processTemplate(anyString(), any(), any()))
+                    .thenThrow(new ITemplatingEngine.TemplateEngineException("Template error", new RuntimeException("cause")));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Delete group conversation edge cases
+    // =========================================================
+
+    @Nested
+    class DeleteEdgeCases {
+
+        @Test
+        void deleteGroupConversation_notFound_doesNotThrow() throws Exception {
+            when(conversationStore.read("gc-missing"))
+                    .thenThrow(new IResourceStore.ResourceNotFoundException("Not found"));
+
+            // Should log warning but not throw
+            assertDoesNotThrow(() -> service.deleteGroupConversation("gc-missing"));
+            verify(conversationStore, never()).delete(anyString());
+        }
+
+        @Test
+        void deleteGroupConversation_endConversationFails_stillDeletes() throws Exception {
+            var gc = new GroupConversation();
+            gc.setId("gc-3");
+            gc.getMemberConversationIds().put("a1", "conv-a1");
+            when(conversationStore.read("gc-3")).thenReturn(gc);
+
+            // endConversation throws for a1
+            doThrow(new RuntimeException("End failed"))
+                    .when(conversationService).endConversation("conv-a1");
+
+            service.deleteGroupConversation("gc-3");
+
+            // Should still attempt to delete despite endConversation failure
+            verify(conversationStore).delete("gc-3");
+        }
+    }
+
+    // =========================================================
+    // Agent failure handling policies
+    // =========================================================
+
+    @Nested
+    class FailurePolicies {
+
+        @Test
+        void unavailablePolicy_fail_throwsException() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(null);
+
+            // executeDiscussion must surface an execution failure as
+            // GroupExecutionException
+            // (which REST maps to 5xx), not a bare GroupDiscussionException (409).
+            assertThrows(IGroupConversationService.GroupExecutionException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 0));
+        }
+
+        @Test
+        void unavailablePolicy_fail_agentThrowsException() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenThrow(new RuntimeException("Agent check failed"));
+
+            assertThrows(IGroupConversationService.GroupExecutionException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 0));
+        }
+
+        @Test
+        void unavailablePolicy_skip_agentThrowsException_skips() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenThrow(new RuntimeException("Agent check failed"));
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SKIPPED));
+        }
+
+        @Test
+        void retryPolicy_agentFails_retriesAndThenSkips() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setProtocol(new ProtocolConfig(1,
+                    ProtocolConfig.MemberFailurePolicy.RETRY, 1,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("a1"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+            // say() always throws
+            doThrow(new RuntimeException("Agent crashed"))
+                    .when(conversationService).say(any(Environment.class), eq("a1"),
+                            anyString(), any(), any(), any(), any(InputData.class),
+                            anyBoolean(), any(ConversationResponseHandler.class));
+
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SKIPPED &&
+                            "a1".equals(e.speakerAgentId())));
+        }
+
+        @Test
+        void abortPolicy_agentTimesOut_throwsGroupTimeoutException() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            // 1s timeout, ABORT on failure, no retries → a member timeout aborts fast.
+            cfg.setProtocol(new ProtocolConfig(1,
+                    ProtocolConfig.MemberFailurePolicy.ABORT, 0,
+                    ProtocolConfig.MemberUnavailablePolicy.SKIP));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("a1"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+            // say() never invokes the response handler → the future never completes → the
+            // get(timeout) call times out, and under ABORT the round is aborted.
+            doNothing().when(conversationService).say(any(Environment.class), eq("a1"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            // A real member-agent timeout must be a GroupTimeoutException so REST maps it
+            // to
+            // 504 (not the 502 an ordinary execution failure gets). executeDiscussion's
+            // re-wrap preserves the subtype.
+            assertThrows(IGroupConversationService.GroupTimeoutException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 0));
+        }
+    }
+
+    // =========================================================
+    // Discussion depth (depth boundary)
+    // =========================================================
+
+    @Nested
+    class DepthBoundary {
+
+        @Test
+        void discuss_atMaxDepth_succeeds() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            // depth=3, maxDepth=3 — exactly at limit, should succeed
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 3);
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+
+        @Test
+        void discuss_overMaxDepth_throwsDepthExceededException() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            setupStore(cfg);
+
+            assertThrows(
+                    IGroupConversationService.GroupDepthExceededException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 4));
+        }
+    }
+
+    // =========================================================
+    // Discussion with no synthesis (null synthesizedAnswer)
+    // =========================================================
+
+    @Nested
+    class NoSynthesis {
+
+        @Test
+        void discuss_noSynthesisPhase_completesWithNullAnswer() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("OpinionOnly", PhaseType.OPINION)));
+            setupStore(cfg);
+            stubAgent("a1", "Opinion only");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNull(result.getSynthesizedAnswer());
+        }
+    }
+
+    // =========================================================
+    // Style: null style defaults to ROUND_TABLE
+    // =========================================================
+
+    @Nested
+    class DefaultStyle {
+
+        @Test
+        void discuss_nullStyle_defaultsToRoundTable() throws Exception {
+            var cfg = config(null, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setStyle(null); // explicitly null
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Protocol resolution
+    // =========================================================
+
+    @Nested
+    class ProtocolResolution {
+
+        @Test
+        void discuss_nullProtocol_usesDefaults() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            cfg.setProtocol(null); // null protocol
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+    }
+
+    // =========================================================
+    // Shutdown
+    // =========================================================
+
+    @Nested
+    class Shutdown {
+
+        @Test
+        void shutdown_executesCleanly() {
+            // Create a new service just for this test to avoid affecting others
+            var svc = new GroupConversationService(groupStore, conversationStore,
+                    conversationService, agentFactory, templatingEngine,
+                    jsonSerialization, new SimpleMeterRegistry(),
+                    null, null, null, null, null, new CallerIdentityContext(null, null), "default", 3);
+
+            assertDoesNotThrow(svc::shutdown);
+        }
+    }
+
+    // =========================================================
+    // Context scope: LAST_PHASE
+    // =========================================================
+
+    @Nested
+    class ContextScopeLastPhase {
+
+        @Test
+        void lastPhaseScope_onlyIncludesPriorPhaseEntries() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob", 2, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Phase0", PhaseType.OPINION,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.NONE, false, null, 1),
+                    new DiscussionPhase("Phase1", PhaseType.OPINION,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.LAST_PHASE, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice phase0 opinion");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob phase0 opinion");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Phase1 should contain opinions from both agents with LAST_PHASE context
+            long phase1Opinions = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.OPINION && e.phaseIndex() == 1)
+                    .count();
+            assertEquals(2, phase1Opinions, "Both agents should contribute opinions in phase 1");
+        }
+    }
+
+    // =========================================================
+    // Multiple rounds (repeats > 1)
+    // =========================================================
+
+    @Nested
+    class MultipleRounds {
+
+        @Test
+        void roundTable_multipleRounds_executesDiscussionPhasesMultipleTimes() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 3,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob", 2, null));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice opinion");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob opinion");
+            stubAgent("cccccccccccccccccccccccc", "Final synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNotNull(result.getSynthesizedAnswer());
+            // Round 1: 2 independent opinions + Rounds 2-3: 2x2=4 context opinions + 1
+            // synthesis = 7
+            long opinionCount = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.OPINION)
+                    .count();
+            assertTrue(opinionCount >= 6,
+                    "Expected at least 6 opinions for 3 rounds with 2 agents, got " + opinionCount);
+        }
+
+        @Test
+        void customPhase_withRepeats_executesMultipleTimes() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("RepeatingOpinion", PhaseType.OPINION,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, null, 3)));
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Opinion iteration");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            long opinionCount = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.OPINION)
+                    .count();
+            assertEquals(3, opinionCount, "Expected 3 opinions from 3 repeats");
+        }
+    }
+
+    // =========================================================
+    // Discussion with DEBATE style
+    // =========================================================
+
+    @Nested
+    class DebateStyle {
+
+        @Test
+        void debate_proConRebuttalsAndJudgment() throws Exception {
+            var cfg = config(DiscussionStyle.DEBATE, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "ProAgent", 1, "PRO"),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "ConAgent", 2, "CON"));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Pro argument");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Con argument");
+            stubAgent("cccccccccccccccccccccccc", "Judgment synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNotNull(result.getSynthesizedAnswer());
+            // DEBATE has 5 phases: ARGUE(PRO), ARGUE(CON), REBUTTAL(PRO), REBUTTAL(CON),
+            // SYNTHESIS
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.ARGUMENT),
+                    "Expected ARGUMENT entries");
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.REBUTTAL),
+                    "Expected REBUTTAL entries");
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SYNTHESIS),
+                    "Expected SYNTHESIS entry");
+        }
+
+        @Test
+        void debate_teamSideInjectedCorrectly() throws Exception {
+            var cfg = config(DiscussionStyle.DEBATE, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "ProAgent", 1, "PRO"),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "ConAgent", 2, "CON"));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "For the motion");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Against the motion");
+            stubAgent("cccccccccccccccccccccccc", "The motion passes");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Verify both agents participated
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> "aaaaaaaaaaaaaaaaaaaaaaaa".equals(e.speakerAgentId())));
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> "bbbbbbbbbbbbbbbbbbbbbbbb".equals(e.speakerAgentId())));
+        }
+    }
+
+    // =========================================================
+    // Discussion with PEER_REVIEW style
+    // =========================================================
+
+    @Nested
+    class PeerReviewStyle {
+
+        @Test
+        void peerReview_fullCycle() throws Exception {
+            var cfg = config(DiscussionStyle.PEER_REVIEW, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob", 2, null));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice's response");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob's response");
+            stubAgent("cccccccccccccccccccccccc", "Synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNotNull(result.getSynthesizedAnswer());
+            // PEER_REVIEW has: OPINION (parallel) → CRITIQUE (peer-targeted) → REVISION
+            // (parallel) → SYNTHESIS
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.OPINION));
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.CRITIQUE));
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.REVISION));
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SYNTHESIS));
+        }
+    }
+
+    // =========================================================
+    // Discussion with DELPHI style (anonymous rounds)
+    // =========================================================
+
+    @Nested
+    class DelphiStyle {
+
+        @Test
+        void delphi_anonymousRounds() throws Exception {
+            var cfg = config(DiscussionStyle.DELPHI, 3,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob", 2, null));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice opinion");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob opinion");
+            stubAgent("cccccccccccccccccccccccc", "Delphi synthesis");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNotNull(result.getSynthesizedAnswer());
+            // DELPHI with 3 rounds: Round1 (independent) + Round2 + Round3 (anonymous) +
+            // Synthesis
+            long opinionCount = result.getTranscript().stream()
+                    .filter(e -> e.type() == TranscriptEntryType.OPINION)
+                    .count();
+            assertTrue(opinionCount >= 6,
+                    "Expected at least 6 opinions (3 rounds × 2 agents), got " + opinionCount);
+        }
+    }
+
+    // =========================================================
+    // extractResponse edge cases
+    // =========================================================
+
+    @Nested
+    class ExtractResponseEdgeCases {
+
+        @Test
+        void nullSnapshot_returnsEmptyString() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Op", PhaseType.OPINION)));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("aaaaaaaaaaaaaaaaaaaaaaaa"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+
+            // Handler called with null snapshot
+            doAnswer(inv -> {
+                ConversationResponseHandler handler = inv.getArgument(8);
+                handler.onComplete(null);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+
+        @Test
+        void emptyConversationOutputs_returnsEmptyString() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Op", PhaseType.OPINION)));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("aaaaaaaaaaaaaaaaaaaaaaaa"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+
+            doAnswer(inv -> {
+                ConversationResponseHandler handler = inv.getArgument(8);
+                var snapshot = new SimpleConversationMemorySnapshot();
+                snapshot.setConversationOutputs(new ArrayList<>());
+                handler.onComplete(snapshot);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+        }
+
+        @Test
+        void outputWithNoOutputKey_returnsNull() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Op", PhaseType.OPINION)));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("aaaaaaaaaaaaaaaaaaaaaaaa"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+
+            // Output map with only non-output keys (e.g., 'actions', 'input')
+            doAnswer(inv -> {
+                ConversationResponseHandler handler = inv.getArgument(8);
+                var snapshot = new SimpleConversationMemorySnapshot();
+                var output = new ConversationOutput();
+                output.put("actions", List.of("action1"));
+                output.put("input", "some input");
+                snapshot.setConversationOutputs(new ArrayList<>(List.of(output)));
+                handler.onComplete(snapshot);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // The output had no 'output' key, so extractResponse returns null
+            // The transcript entry content should reflect this
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.OPINION
+                            && "aaaaaaaaaaaaaaaaaaaaaaaa".equals(e.speakerAgentId())));
+        }
+
+        @Test
+        void snapshotWithErrorState_producesErrorMessage() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Op", PhaseType.OPINION)));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("aaaaaaaaaaaaaaaaaaaaaaaa"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+
+            // Snapshot with ERROR state and no output keys
+            doAnswer(inv -> {
+                ConversationResponseHandler handler = inv.getArgument(8);
+                var snapshot = new SimpleConversationMemorySnapshot();
+                var output = new ConversationOutput();
+                output.put("actions", List.of("action1"));
+                snapshot.setConversationOutputs(new ArrayList<>(List.of(output)));
+                snapshot.setConversationState(ConversationState.ERROR);
+                handler.onComplete(snapshot);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Should contain the error message from ERROR state fallback
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.OPINION
+                            && e.content() != null
+                            && e.content().contains("Agent failed")));
+        }
+
+        @Test
+        void outputWithFlatTextKeys_extractsCorrectly() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Op", PhaseType.OPINION)));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(mock(IAgent.class));
+            when(conversationService.startConversation(any(), eq("aaaaaaaaaaaaaaaaaaaaaaaa"), any(), any()))
+                    .thenReturn(new IConversationService.ConversationResult("conv-a1", null));
+
+            // Output with "output:text:0" flat key
+            doAnswer(inv -> {
+                ConversationResponseHandler handler = inv.getArgument(8);
+                var snapshot = new SimpleConversationMemorySnapshot();
+                var output = new ConversationOutput();
+                output.put("output:text:0", "Flat text output");
+                snapshot.setConversationOutputs(new ArrayList<>(List.of(output)));
+                handler.onComplete(snapshot);
+                return null;
+            }).when(conversationService).say(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa"),
+                    anyString(), any(), any(), any(), any(InputData.class),
+                    anyBoolean(), any(ConversationResponseHandler.class));
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.OPINION
+                            && "Flat text output".equals(e.content())));
+        }
+    }
+
+    // =========================================================
+    // startAndDiscussAsync error handling (FAILED state)
+    // =========================================================
+
+    @Nested
+    class AsyncErrorHandling {
+
+        @Test
+        void startAndDiscussAsync_discussThrows_setsFailedState() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.ABORT, 0,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+
+            // Agent not deployed + FAIL policy → discussion will throw
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(null);
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            var result = service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, listener);
+
+            assertNotNull(result);
+            assertEquals("gc-1", result.getId());
+
+            // Wait for async thread to complete and set FAILED state
+            Thread.sleep(2000);
+
+            // Listener should have received onGroupError
+            verify(listener, atLeastOnce()).onGroupError(any(GroupConversationEventSink.GroupErrorEvent.class));
+        }
+
+        @Test
+        void startAndDiscussAsync_nullListener_noNPEOnError() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.ABORT, 0,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("aaaaaaaaaaaaaaaaaaaaaaaa")))
+                    .thenReturn(null);
+
+            // Null listener — should not throw NPE
+            var result = service.startAndDiscussAsync(GROUP_ID, QUESTION, USER_ID, null);
+
+            assertNotNull(result);
+            Thread.sleep(2000);
+            // Should not throw NPE — just verify it didn't crash
+        }
+    }
+
+    // =========================================================
+    // Group-of-groups (nested group discussions)
+    // =========================================================
+
+    @Nested
+    class GroupOfGroups {
+
+        @Test
+        void groupMember_delegatesToSubGroup() throws Exception {
+            // Parent group has a GROUP member pointing to a sub-group
+            String parentGroupId = "parent-group-id";
+            String subGroupId = "sub-group-id-00";
+
+            var parentCfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember(subGroupId, "SubGroupTeam", 1, null, MemberType.GROUP));
+            parentCfg.setPhases(List.of(
+                    new DiscussionPhase("OpinionPhase", PhaseType.OPINION)));
+            setupStore(parentGroupId, parentCfg);
+
+            // Sub-group config
+            var subCfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            subCfg.setPhases(List.of(
+                    new DiscussionPhase("SubOpinion", PhaseType.OPINION)));
+            setupStore(subGroupId, subCfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice sub-group opinion");
+
+            var result = service.discuss(parentGroupId, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // The sub-group's response should appear in the parent transcript
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> subGroupId.equals(e.speakerAgentId())
+                            && e.content() != null
+                            && e.content().contains("Alice sub-group opinion")));
+        }
+
+        @Test
+        void groupMember_depthExceeded_producesSkippedEntry() throws Exception {
+            String parentGroupId = "parent-group-id";
+            String subGroupId = "sub-group-id-00";
+
+            var parentCfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember(subGroupId, "SubGroupTeam", 1, null, MemberType.GROUP));
+            parentCfg.setPhases(List.of(
+                    new DiscussionPhase("OpinionPhase", PhaseType.OPINION)));
+            setupStore(parentGroupId, parentCfg);
+
+            // Sub-group config (will be at depth 4 > maxDepth 3)
+            var subCfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null));
+            subCfg.setPhases(List.of(
+                    new DiscussionPhase("SubOpinion", PhaseType.OPINION)));
+            setupStore(subGroupId, subCfg);
+
+            // Start parent at depth 3, so sub-group will be at depth 4 (exceeds maxDepth 3)
+            var result = service.discuss(parentGroupId, QUESTION, USER_ID, 3);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Sub-group should produce a SKIPPED entry due to depth exceeded
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SKIPPED
+                            && e.errorReason() != null
+                            && e.errorReason().contains("depth")),
+                    "Expected SKIPPED entry for depth exceeded sub-group");
+        }
+
+        @Test
+        void groupMember_subGroupFails_handledByPolicy() throws Exception {
+            String parentGroupId = "parent-group-id";
+            String subGroupId = "sub-group-id-00";
+
+            var parentCfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember(subGroupId, "SubGroupTeam", 1, null, MemberType.GROUP));
+            parentCfg.setPhases(List.of(
+                    new DiscussionPhase("OpinionPhase", PhaseType.OPINION)));
+            setupStore(parentGroupId, parentCfg);
+
+            // Sub-group does NOT exist → ResourceNotFoundException
+            when(groupStore.getCurrentResourceId(subGroupId)).thenReturn(null);
+
+            var result = service.discuss(parentGroupId, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            // Sub-group failure should produce a SKIPPED entry (default policy is SKIP)
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.SKIPPED
+                            && subGroupId.equals(e.speakerAgentId())));
+        }
+    }
+
+    // =========================================================
+    // DEVIL_ADVOCATE style (CHALLENGE + DEFENSE phases)
+    // =========================================================
+
+    @Nested
+    class DevilAdvocateStyle {
+
+        @Test
+        void devilAdvocate_challengeAndDefense() throws Exception {
+            var cfg = config(DiscussionStyle.DEVIL_ADVOCATE, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Expert", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Devil", 2, "DEVIL_ADVOCATE"));
+            cfg.setModeratorAgentId("cccccccccccccccccccccccc");
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Expert opinion");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "I challenge that");
+            stubAgent("cccccccccccccccccccccccc", "Synthesis after debate");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertNotNull(result.getSynthesizedAnswer());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.CHALLENGE));
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.DEFENSE));
+        }
+    }
+
+    // =========================================================
+    // Context scope: OWN_FEEDBACK
+    // =========================================================
+
+    @Nested
+    class ContextScopeOwnFeedback {
+
+        @Test
+        void ownFeedbackScope_onlyIncludesFeedbackTargetedAtSpeaker() throws Exception {
+            var cfg = config(DiscussionStyle.CUSTOM, 1,
+                    new GroupMember("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice", 1, null),
+                    new GroupMember("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob", 2, null));
+            cfg.setPhases(List.of(
+                    new DiscussionPhase("Opinions", PhaseType.OPINION,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.NONE, false, null, 1),
+                    new DiscussionPhase("PeerCritique", PhaseType.CRITIQUE,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.FULL, true, null, 1),
+                    new DiscussionPhase("Revision", PhaseType.REVISION,
+                            "ALL", TurnOrder.SEQUENTIAL, ContextScope.OWN_FEEDBACK, false, null, 1)));
+            setupStore(cfg);
+            stubAgent("aaaaaaaaaaaaaaaaaaaaaaaa", "Alice revised");
+            stubAgent("bbbbbbbbbbbbbbbbbbbbbbbb", "Bob revised");
+
+            var result = service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            assertEquals(GroupConversationState.COMPLETED, result.getState());
+            assertTrue(result.getTranscript().stream()
+                    .anyMatch(e -> e.type() == TranscriptEntryType.REVISION));
+        }
+    }
+
+    // =========================================================
+    // Regression guards for bugs the direct-invocation tests could not see.
+    // Each of these was a surviving mutant: the fix could be reverted with the
+    // whole suite still green.
+    // =========================================================
+
+    @Nested
+    class MergeRegressionGuards {
+
+        @Test
+        @DisplayName("a failed discussion streams a CURATED error — never the raw exception text")
+        void failedDiscussion_doesNotLeakRawExceptionTextToTheListener() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setProtocol(new ProtocolConfig(60,
+                    ProtocolConfig.MemberFailurePolicy.SKIP, 2,
+                    ProtocolConfig.MemberUnavailablePolicy.FAIL));
+            setupStore(cfg);
+            // Agent unavailable + FAIL policy => executeDiscussion throws.
+            when(agentFactory.getLatestReadyAgent(any(Environment.class), eq("a1")))
+                    .thenReturn(null);
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            assertThrows(GroupDiscussionException.class,
+                    () -> service.discuss(GROUP_ID, QUESTION, USER_ID, 0, listener));
+
+            var captor = ArgumentCaptor.forClass(GroupConversationEventSink.GroupErrorEvent.class);
+            verify(listener, atLeastOnce()).onGroupError(captor.capture());
+
+            // The listener installed by RestGroupConversation forwards this text straight
+            // to the browser over SSE. The raw message can carry LLM/DB/driver detail and
+            // the caller's own input, so it must never be the event payload.
+            for (var event : captor.getAllValues()) {
+                String text = String.valueOf(event.error());
+                assertFalse(text.contains("a1"),
+                        "the SSE error event must not carry the raw exception text: " + text);
+                assertFalse(text.toLowerCase().contains("agent unavailable"),
+                        "the SSE error event must be curated, not the raw message: " + text);
+            }
+        }
+
+        @Test
+        @DisplayName("a continuation re-runs from the FIRST phase (startPhaseIndex 0), not from phase 1")
+        void continuation_restartsAtPhaseZero() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+
+            var completed = new GroupConversation();
+            completed.setId("gc-1");
+            completed.setGroupId(GROUP_ID);
+            completed.setState(GroupConversation.GroupConversationState.COMPLETED);
+            completed.setRound(1);
+            when(conversationStore.read("gc-1")).thenReturn(completed);
+            when(conversationStore.compareAndSetState("gc-1",
+                    GroupConversation.GroupConversationState.COMPLETED,
+                    GroupConversation.GroupConversationState.IN_PROGRESS)).thenReturn(true);
+
+            var listener = mock(GroupDiscussionEventListener.class);
+
+            service.continueDiscussion("gc-1", "round two question", listener);
+
+            // A continuation re-runs the WHOLE protocol. If startPhaseIndex were anything
+            // but 0, phase 0 would be silently skipped and the round would be incomplete.
+            var phases = ArgumentCaptor.forClass(GroupConversationEventSink.PhaseStartEvent.class);
+            verify(listener, atLeastOnce()).onPhaseStart(phases.capture());
+            assertTrue(phases.getAllValues().stream().anyMatch(p -> p.phaseIndex() == 0),
+                    "the first phase must run on a continuation round");
+            // It is a new ROUND, not a new discussion.
+            verify(listener).onRoundStart(any(GroupConversationEventSink.RoundStartEvent.class));
+            verify(listener, never()).onGroupStart(any(GroupConversationEventSink.GroupStartEvent.class));
+        }
+
+        @Test
+        @DisplayName("ephemeral agents survive a COMPLETED round (follow-ups reuse them) but are reclaimed on failure")
+        void ephemeralCleanup_isDeferredForCompleted_butRunsOnFailure() throws Exception {
+            var cfg = config(DiscussionStyle.ROUND_TABLE, 1,
+                    new GroupMember("a1", "Alice", 1, null));
+            cfg.setModeratorAgentId("mod");
+            setupStore(cfg);
+            stubAgent("a1", "Opinion");
+            stubAgent("mod", "Synthesis");
+            // A dynamically-created agent that a follow-up/continue would want to reuse.
+            when(conversationStore.create(any())).thenAnswer(inv -> {
+                GroupConversation gc = inv.getArgument(0);
+                gc.getCreatedAgentIds().add("ephemeral-1");
+                return "gc-1";
+            });
+
+            service.discuss(GROUP_ID, QUESTION, USER_ID, 0);
+
+            // COMPLETED must DEFER cleanup to close/delete — otherwise a follow-up or a
+            // continuation has no agents left to talk to.
+            verify(agentStore, never()).deleteAllPermanently(anyString());
+        }
+    }
+}

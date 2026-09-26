@@ -1,0 +1,6 @@
+services:
+  eddi:
+    build:
+      context: .
+      dockerfile: "./src/main/docker/Dockerfile"
+    image: labsai/eddi:local

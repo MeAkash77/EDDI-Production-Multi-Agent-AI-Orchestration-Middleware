@@ -1,0 +1,301 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.configs.groups.rest;
+
+import ai.labs.eddi.configs.descriptors.IDocumentDescriptorStore;
+import ai.labs.eddi.engine.security.spaces.ResourceAccessGuard;
+import ai.labs.eddi.configs.groups.IAgentGroupStore;
+import ai.labs.eddi.configs.groups.IGroupWorkspaceStore;
+import ai.labs.eddi.configs.groups.IRestAgentGroupStore;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration;
+import ai.labs.eddi.configs.groups.model.GroupWorkspace;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.DiscussionStyle;
+import ai.labs.eddi.configs.groups.model.DiscussionStylePresets;
+import ai.labs.eddi.configs.rest.RestVersionInfo;
+import ai.labs.eddi.configs.schema.IJsonSchemaCreator;
+import ai.labs.eddi.engine.schedule.IScheduleStore;
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.datastore.IResourceStore.IResourceId;
+import ai.labs.eddi.configs.descriptors.model.DocumentDescriptor;
+import ai.labs.eddi.utils.RestUtilities;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
+
+import static ai.labs.eddi.utils.LogSanitizer.sanitize;
+
+import java.net.URI;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import static ai.labs.eddi.engine.exception.SneakyThrow.sneakyThrow;
+
+/**
+ * REST implementation for group configuration CRUD.
+ *
+ * @author ginccc
+ */
+@ApplicationScoped
+public class RestAgentGroupStore implements IRestAgentGroupStore {
+    private static final Logger LOG = Logger.getLogger(RestAgentGroupStore.class);
+
+    private final IAgentGroupStore groupStore;
+    private final IDocumentDescriptorStore documentDescriptorStore;
+    private final ResourceAccessGuard resourceAccessGuard;
+    private final IJsonSchemaCreator jsonSchemaCreator;
+    private final IGroupWorkspaceStore workspaceStore;
+    private final IScheduleStore scheduleStore;
+    private final RestVersionInfo<AgentGroupConfiguration> restVersionInfo;
+
+    @Inject
+    public RestAgentGroupStore(IAgentGroupStore groupStore, IDocumentDescriptorStore documentDescriptorStore, IJsonSchemaCreator jsonSchemaCreator,
+            IGroupWorkspaceStore workspaceStore, IScheduleStore scheduleStore,
+            ResourceAccessGuard resourceAccessGuard) {
+        this.resourceAccessGuard = resourceAccessGuard;
+        restVersionInfo = new RestVersionInfo<>(resourceURI, groupStore, documentDescriptorStore, resourceAccessGuard);
+        this.groupStore = groupStore;
+        this.documentDescriptorStore = documentDescriptorStore;
+        this.jsonSchemaCreator = jsonSchemaCreator;
+        this.workspaceStore = workspaceStore;
+        this.scheduleStore = scheduleStore;
+    }
+
+    @Override
+    public Response readJsonSchema() {
+        try {
+            return Response.ok(jsonSchemaCreator.generateSchema(AgentGroupConfiguration.class)).build();
+        } catch (Exception e) {
+            throw sneakyThrow(e);
+        }
+    }
+
+    @Override
+    public Response readDiscussionStyles() {
+        var styles = Arrays.stream(DiscussionStyle.values()).map(s -> {
+            var phases = DiscussionStylePresets.expand(s, 2);
+            var phaseNames = phases.stream().map(p -> p.name()).toList();
+            return Map.of("style", s.name(), "phases", phaseNames, "description", describeStyle(s));
+        }).toList();
+        return Response.ok(styles).build();
+    }
+
+    private static String describeStyle(DiscussionStyle style) {
+        return switch (style) {
+            case ROUND_TABLE -> "Open discussion with multiple opinion rounds and moderator synthesis";
+            case PEER_REVIEW -> "Each member gives an opinion, then critiques every peer, then revises";
+            case DEVIL_ADVOCATE -> "One designated challenger argues against the group consensus";
+            case DELPHI -> "Anonymous opinion rounds to reduce groupthink and achieve convergence";
+            case DEBATE -> "Structured pro/con argumentation with rebuttal and judge";
+            case TASK_FORCE -> "Collaborative task accomplishment: plan, execute in parallel, verify, synthesize";
+            case NEGOTIATION -> "Trade, not win/lose: positions, opening proposals, bargaining with a concession "
+                    + "ledger, arbitration only if no agreement, synthesis";
+            case CUSTOM -> "User-defined phases for full control over the discussion flow";
+        };
+    }
+
+    @Override
+    public List<DocumentDescriptor> readGroupDescriptors(String filter, Integer index, Integer limit) {
+        return restVersionInfo.readDescriptors(filter, index, limit);
+    }
+
+    @Override
+    public AgentGroupConfiguration readGroup(String id, Integer version) {
+        return restVersionInfo.read(id, version);
+    }
+
+    /**
+     * Every member agent must be one the caller may actually converse with.
+     * <p>
+     * A group's member turns run system-initiated, deliberately below the USE gate
+     * — no interactive caller exists then. So recruiting an agent into a group is
+     * the moment to check: without this, adding a colleague's private agent as a
+     * member is a standing bypass of the gate on {@code /agents/{id}/start}, with
+     * the group discussion as the read-out channel.
+     * <p>
+     * Nested groups are checked as agents here; an id that names a group rather
+     * than an agent resolves against its own descriptor, which is the right subject
+     * either way.
+     */
+    private void requireUseOnMembers(AgentGroupConfiguration configuration) {
+        if (configuration == null || configuration.getMembers() == null) {
+            return;
+        }
+        for (var member : configuration.getMembers()) {
+            if (member != null && member.agentId() != null && !member.agentId().isBlank()) {
+                resourceAccessGuard.requireAgentUseAccess(member.agentId());
+            }
+        }
+    }
+    @Override
+    public Response updateGroup(String id, Integer version, AgentGroupConfiguration groupConfiguration) {
+        requireUseOnMembers(groupConfiguration);
+        Response response = restVersionInfo.update(id, version, groupConfiguration);
+        syncDescriptor(id, groupConfiguration);
+        return response;
+    }
+
+    @Override
+    public Response createGroup(AgentGroupConfiguration groupConfiguration) {
+        requireUseOnMembers(groupConfiguration);
+        Response response = restVersionInfo.create(groupConfiguration);
+        // Sync name/description from config onto the descriptor
+        URI location = response.getLocation();
+        if (location != null) {
+            try {
+                var resourceId = RestUtilities.extractResourceId(location);
+                syncDescriptor(resourceId.getId(), groupConfiguration);
+            } catch (Exception e) {
+                LOG.warn("Failed to sync group descriptor name/description on create", e);
+            }
+        }
+        return response;
+    }
+
+    @Override
+    public Response duplicateGroup(String id, Integer version) {
+        restVersionInfo.validateParameters(id, version);
+        AgentGroupConfiguration config = restVersionInfo.read(id, version);
+        Response response = restVersionInfo.create(config);
+        // Sync descriptor for the duplicate too
+        URI location = response.getLocation();
+        if (location != null) {
+            try {
+                var resourceId = RestUtilities.extractResourceId(location);
+                syncDescriptor(resourceId.getId(), config);
+            } catch (Exception e) {
+                LOG.warn("Failed to sync group descriptor name/description on duplicate", e);
+            }
+        }
+        return response;
+    }
+
+    @Override
+    public Response deleteGroup(String id, Integer version, Boolean permanent) {
+        Response response = restVersionInfo.delete(id, version, permanent);
+        // I13: a permanently deleted group takes its standing workspace with it —
+        // backlog, cadences and metrics are meaningless without the config they
+        // belong to, and an orphaned cadence would keep firing into errors. A
+        // soft (versioned) delete keeps the workspace: the group can come back.
+        if (Boolean.TRUE.equals(permanent) && response.getStatus() < 300) {
+            try {
+                // Review finding: cadence ScheduleConfigurations outlive the
+                // workspace — enabled and due, the fire executor keeps selecting
+                // them and every fire errors with "No workspace exists". Retire
+                // the schedules BEFORE the workspace so a crash between the two
+                // leaves the recoverable order (schedules gone, workspace still
+                // deletable), never the orphaned one.
+                GroupWorkspace workspace = workspaceStore.find(id);
+                if (workspace != null) {
+                    for (GroupWorkspace.Cadence cadence : workspace.getCadences()) {
+                        try {
+                            scheduleStore.deleteSchedule(cadence.scheduleRef());
+                        } catch (Exception e) {
+                            LOG.warnf("Could not delete schedule %s of cadence %s while deleting group %s: %s",
+                                    cadence.scheduleRef(), cadence.cadenceId(), sanitize(id), e.getMessage());
+                        }
+                    }
+                }
+                workspaceStore.deleteByGroupId(id);
+            } catch (Exception e) {
+                LOG.errorf(e, "Failed to cascade workspace deletion for group %s", sanitize(id));
+            }
+        }
+        return response;
+    }
+
+    @Override
+    public String getResourceURI() {
+        return restVersionInfo.getResourceURI();
+    }
+
+    @Override
+    public IResourceStore.IResourceId getCurrentResourceId(String id) throws IResourceStore.ResourceNotFoundException {
+        return groupStore.getCurrentResourceId(id);
+    }
+
+    /**
+     * Sync the group config's name and description onto the DocumentDescriptor so
+     * that the descriptors endpoint returns meaningful display information.
+     */
+    private void syncDescriptor(String resourceId, AgentGroupConfiguration config) {
+        try {
+            IResourceId currentResourceId = groupStore.getCurrentResourceId(resourceId);
+            int version = currentResourceId.getVersion();
+
+            // Try to read the descriptor at the current resource version.
+            // On CREATE the descriptor may not exist yet (DocumentDescriptorFilter
+            // creates it in a ContainerResponseFilter that runs AFTER this method).
+            // On UPDATE the descriptor still lives at version-1 until the filter
+            // promotes it — reading the new version would fail too.
+            DocumentDescriptor descriptor = null;
+            int descriptorVersion = version;
+            try {
+                descriptor = documentDescriptorStore.readDescriptor(resourceId, version);
+            } catch (IResourceStore.ResourceNotFoundException ignored) {
+                // Fall through — try the previous version (update path)
+            }
+
+            if (descriptor == null && version > 1) {
+                try {
+                    descriptor = documentDescriptorStore.readDescriptor(resourceId, version - 1);
+                    descriptorVersion = version - 1;
+                } catch (IResourceStore.ResourceNotFoundException ignored) {
+                    // Fall through — create path
+                }
+            }
+
+            if (descriptor == null) {
+                // No descriptor at any version — brand-new resource (create path).
+                descriptor = new DocumentDescriptor();
+                descriptor.setResource(RestUtilities.createURI(resourceURI, resourceId,
+                        versionQueryParam, version));
+                Date now = new Date(System.currentTimeMillis());
+                descriptor.setCreatedOn(now);
+                descriptor.setLastModifiedOn(now);
+                if (config.getName() != null) {
+                    descriptor.setName(config.getName());
+                }
+                if (config.getDescription() != null) {
+                    descriptor.setDescription(config.getDescription());
+                }
+                // Stamped like any other newly created resource: this path runs when the
+                // descriptor filter has not (yet) produced one, and an unstamped descriptor
+                // would leave the group unowned.
+                resourceAccessGuard.stampNewDescriptor(descriptor);
+                try {
+                    documentDescriptorStore.createDescriptor(resourceId, version, descriptor);
+                } catch (IResourceStore.ResourceStoreException ignored) {
+                    // Another request/response filter may have created the descriptor
+                    // after our lookup but before createDescriptor. Apply the same data
+                    // to the existing descriptor instead of treating this as a failure.
+                    documentDescriptorStore.setDescriptor(resourceId, version, descriptor);
+                }
+                return;
+            }
+
+            // Descriptor exists — update name/description if changed.
+            boolean changed = false;
+            if (config.getName() != null && !config.getName().equals(descriptor.getName())) {
+                descriptor.setName(config.getName());
+                changed = true;
+            }
+            if (config.getDescription() != null && !config.getDescription().equals(descriptor.getDescription())) {
+                descriptor.setDescription(config.getDescription());
+                changed = true;
+            }
+
+            if (changed) {
+                descriptor.setLastModifiedOn(new Date(System.currentTimeMillis()));
+                documentDescriptorStore.setDescriptor(resourceId, descriptorVersion, descriptor);
+            }
+        } catch (Exception e) {
+            LOG.warnf(e, "Failed to sync group descriptor name/description for id=%s", sanitize(resourceId));
+        }
+    }
+
+}

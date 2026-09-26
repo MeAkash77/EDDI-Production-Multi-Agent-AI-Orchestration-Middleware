@@ -1,0 +1,425 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory.rest;
+
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.engine.attachments.IAttachmentStore;
+import ai.labs.eddi.engine.attachments.IAttachmentStore.Attachment;
+import ai.labs.eddi.engine.memory.descriptor.IConversationDescriptorStore;
+import ai.labs.eddi.engine.security.ConversationAccessGuard;
+import io.quarkus.security.ForbiddenException;
+import jakarta.annotation.security.RolesAllowed;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.Suspended;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.eclipse.microprofile.context.ManagedExecutor;
+import org.eclipse.microprofile.openapi.annotations.Operation;
+import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
+import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.eclipse.microprofile.openapi.annotations.tags.Tag;
+import org.jboss.logging.Logger;
+import org.jboss.resteasy.reactive.RestForm;
+import org.jboss.resteasy.reactive.multipart.FileUpload;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.regex.Pattern;
+
+import static ai.labs.eddi.utils.LogSanitizer.sanitize;
+
+/**
+ * REST endpoint for uploading and listing binary attachments on a conversation.
+ * <p>
+ * Accepts multipart file uploads and stores them via the configured
+ * {@link IAttachmentStore} (GridFS or PostgreSQL BYTEA). Returns a storage
+ * reference that can be used in subsequent conversation turns to forward
+ * attachments to multimodal LLM models.
+ * <p>
+ * <strong>Access control:</strong> every endpoint here is conversation-scoped
+ * and takes the conversationId from the path. {@code IAttachmentStore} only
+ * verifies that the NAMED conversation owns the blob — a check the caller
+ * satisfies by choosing the name — so it says nothing about the CALLER. Each
+ * method therefore asserts caller-owns-conversation through
+ * {@link ConversationAccessGuard} first, the same gate {@code RestAgentEngine}
+ * uses.
+ *
+ * @since 6.0.0
+ */
+@Path("/conversations")
+@Tag(name = "Conversations / Attachments", description = "Upload and manage binary conversation attachments")
+@RolesAllowed({"eddi-admin", "eddi-editor", "eddi-user"})
+public class RestAttachmentUpload {
+
+    private static final Logger LOGGER = Logger.getLogger(RestAttachmentUpload.class);
+
+    /**
+     * Allowed pattern for the optional tenantId query parameter. Alphanumeric plus
+     * dash/underscore, max 64 characters.
+     */
+    private static final Pattern TENANT_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{1,64}$");
+
+    private final IAttachmentStore attachmentStore;
+    private final ConversationAccessGuard conversationAccessGuard;
+    private final IConversationDescriptorStore conversationDescriptorStore;
+    private final ManagedExecutor managedExecutor;
+    private final long maxUploadBytes;
+    private final long maxForwardBytes;
+
+    @Inject
+    public RestAttachmentUpload(IAttachmentStore attachmentStore,
+            ConversationAccessGuard conversationAccessGuard,
+            IConversationDescriptorStore conversationDescriptorStore,
+            ManagedExecutor managedExecutor,
+            @ConfigProperty(name = "eddi.attachments.max-size-bytes",
+                            defaultValue = "20971520") long maxUploadBytes,
+            @ConfigProperty(name = "eddi.attachments.max-forward-bytes",
+                            defaultValue = "10485760") long maxForwardBytes) {
+        this.attachmentStore = attachmentStore;
+        this.conversationAccessGuard = conversationAccessGuard;
+        this.conversationDescriptorStore = conversationDescriptorStore;
+        this.managedExecutor = managedExecutor;
+        this.maxUploadBytes = maxUploadBytes;
+        this.maxForwardBytes = maxForwardBytes;
+    }
+
+    /**
+     * Ownership gate for every attachment endpoint. Always invoked on the REQUEST
+     * thread, before any async hop — {@link ConversationAccessGuard} reads the
+     * request-scoped {@code SecurityIdentity}, which is gone once the work moves
+     * onto {@link ManagedExecutor}.
+     * <p>
+     * Two things must hold, and both are asserted here:
+     * <ol>
+     * <li><strong>The CALLER owns the conversation</strong> (finding A2).
+     * {@code IAttachmentStore} only verifies that the conversation NAMED in the
+     * path owns the blob, and the caller picks that name, so that check is
+     * self-satisfying and says nothing about who is asking.
+     * {@link ConversationAccessGuard#requireExistingConversationOwner} is the
+     * shared gate for this.</li>
+     * <li><strong>The conversation actually exists</strong> (fail-closed). Plain
+     * {@link ConversationAccessGuard#requireConversationOwner} deliberately admits
+     * a conversation whose descriptor is missing: on {@code RestAgentEngine} that
+     * is harmless because the operation itself then 404s, and the leniency exists
+     * for legacy conversations that predate ownership stamping. The attachment
+     * store has no such backstop — it happily CREATES a record for any id and
+     * serves it back — so an unknown conversationId turned these endpoints into a
+     * shared, cross-user blob namespace: user A uploads under an invented id, user
+     * B reads it back from the same invented id. A conversation that was never
+     * created is not a legacy conversation; it is a 404.</li>
+     * </ol>
+     * The guard's {@code requireExistingConversationOwner} already folds the
+     * existence check in, so the local descriptor read below is a deliberate second
+     * gate: it keeps the fail-closed behaviour anchored in this endpoint rather
+     * than depending on which guard method a future edit happens to call.
+     */
+    private void requireExistingConversationOwner(String conversationId) {
+        conversationAccessGuard.requireExistingConversationOwner(conversationId);
+        try {
+            if (conversationDescriptorStore.readDescriptor(conversationId, 0) == null) {
+                throw new NotFoundException("Conversation '" + sanitize(conversationId) + "' not found");
+            }
+        } catch (IResourceStore.ResourceNotFoundException e) {
+            throw new NotFoundException("Conversation '" + sanitize(conversationId) + "' not found");
+        } catch (IResourceStore.ResourceStoreException e) {
+            LOGGER.warnf("Could not verify conversation '%s' for an attachment operation: %s",
+                    sanitize(conversationId), e.getMessage());
+            throw new ForbiddenException("Access denied: unable to verify conversation");
+        }
+    }
+
+    @POST
+    @Path("/{conversationId}/attachments")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(
+               operationId = "uploadAttachment",
+               summary = "Upload a file attachment",
+               description = "Upload a binary file to attach to a conversation. "
+                       + "Returns a storage reference usable in the "
+                       + "'attachment_url' context field or via STORED content source.")
+    @APIResponse(responseCode = "201", description = "Attachment stored. Response contains storageRef.")
+    @APIResponse(responseCode = "400", description = "No file provided, file too large, or MIME mismatch.")
+    @APIResponse(responseCode = "500", description = "Storage error.")
+    public void uploadAttachment(
+                                 @Parameter(description = "Conversation to attach the file to.")
+                                 @PathParam("conversationId") String conversationId,
+                                 @RestForm("file") FileUpload file,
+                                 // Security note: tenantId is client-supplied and NOT
+                                 // authenticated. It is sanitized (alphanumeric + dash/underscore,
+                                 // max 64 chars) to prevent injection, but must not be used for
+                                 // security-critical decisions (quota enforcement, data segregation)
+                                 // until multi-tenancy auth wiring derives it from the principal.
+                                 @Parameter(description = "Optional tenant identifier for multi-tenant isolation.")
+                                 @QueryParam("tenantId") String tenantId,
+                                 @Suspended AsyncResponse asyncResponse) {
+
+        // On the request thread, before the async hop: the guard reads the caller's
+        // SecurityIdentity, which is request-scoped.
+        requireExistingConversationOwner(conversationId);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                if (file == null || file.fileName() == null) {
+                    asyncResponse.resume(Response.status(Response.Status.BAD_REQUEST)
+                            .entity(Map.of("error", "No file provided"))
+                            .build());
+                    return;
+                }
+
+                // Sanitize optional tenantId
+                String safeTenantId = sanitizeTenantId(tenantId);
+
+                String fileName = file.fileName();
+                String mimeType = file.contentType() != null ? file.contentType() : "application/octet-stream";
+
+                // Early size guard — reject before reading into memory
+                long fileSize = Files.size(file.uploadedFile());
+                if (fileSize > maxUploadBytes) {
+                    LOGGER.warnf("Attachment rejected for conversation '%s': %s (%d bytes exceeds %d byte limit)",
+                            sanitize(conversationId), sanitize(fileName), fileSize, maxUploadBytes);
+                    asyncResponse.resume(Response.status(Response.Status.BAD_REQUEST)
+                            .entity(Map.of(
+                                    "error", String.format("File too large: %d bytes (max %d)", fileSize, maxUploadBytes),
+                                    "code", "ATTACHMENT_TOO_LARGE"))
+                            .build());
+                    return;
+                }
+
+                byte[] bytes = Files.readAllBytes(file.uploadedFile());
+
+                Attachment attachment = attachmentStore.store(
+                        bytes, mimeType, fileName, conversationId, safeTenantId);
+
+                LOGGER.infof("Attachment uploaded for conversation '%s': %s (%s, %d bytes) → %s",
+                        sanitize(conversationId), sanitize(fileName), attachment.mimeType(),
+                        attachment.sizeBytes(), attachment.storageRef());
+
+                asyncResponse.resume(Response.status(Response.Status.CREATED)
+                        .entity(Map.of(
+                                "storageRef", attachment.storageRef(),
+                                "fileName", attachment.filename() != null ? attachment.filename() : "",
+                                "mimeType", attachment.mimeType(),
+                                "sizeBytes", attachment.sizeBytes(),
+                                "conversationId", attachment.conversationId(),
+                                // Uploads may be larger than what is inlined to the LLM: warn now,
+                                // not silently at forward time. Oversize files remain retrievable
+                                // via the readAttachment tool / download endpoint.
+                                "forwardableInline", attachment.sizeBytes() <= maxForwardBytes))
+                        .build());
+
+            } catch (IAttachmentStore.AttachmentStoreException e) {
+                LOGGER.warnf("Attachment upload rejected for conversation '%s': %s",
+                        sanitize(conversationId), e.getMessage());
+                asyncResponse.resume(Response.status(Response.Status.BAD_REQUEST)
+                        .entity(Map.of(
+                                "error", e.getMessage(),
+                                "code", "ATTACHMENT_REJECTED"))
+                        .build());
+            } catch (IOException e) {
+                LOGGER.errorf(e, "Failed to read uploaded file for conversation '%s'",
+                        sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of(
+                                "error", "Failed to process upload",
+                                "code", "ATTACHMENT_UPLOAD_FAILED"))
+                        .build());
+            } catch (Exception e) {
+                LOGGER.errorf(e, "Unexpected error during attachment upload for conversation '%s'",
+                        sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of(
+                                "error", "Internal error",
+                                "code", "ATTACHMENT_UPLOAD_FAILED"))
+                        .build());
+            }
+        }, managedExecutor);
+    }
+
+    @GET
+    @Path("/{conversationId}/attachments")
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(
+               operationId = "listAttachments",
+               summary = "List attachments for a conversation",
+               description = "Returns metadata for all attachments stored against this conversation.")
+    @APIResponse(responseCode = "200", description = "List of attachment metadata.")
+    public void listAttachments(
+                                @Parameter(description = "Conversation ID to list attachments for.")
+                                @PathParam("conversationId") String conversationId,
+                                @Suspended AsyncResponse asyncResponse) {
+        requireExistingConversationOwner(conversationId);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                List<Attachment> attachments = attachmentStore.listByConversation(conversationId);
+                asyncResponse.resume(Response.ok(attachments).build());
+            } catch (Exception e) {
+                LOGGER.errorf(e, "Failed to list attachments for conversation '%s'", sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of("error", "Failed to list attachments")).build());
+            }
+        }, managedExecutor);
+    }
+
+    @GET
+    @Path("/{conversationId}/attachments/{storageRef}")
+    @Operation(
+               operationId = "downloadAttachment",
+               summary = "Download a single attachment",
+               description = "Returns the raw bytes of one attachment (buffered, not chunked). Access is checked against "
+                       + "the owning conversation (owner or explicit grant); references are "
+                       + "unguessable.")
+    @APIResponse(responseCode = "200", description = "Attachment bytes with Content-Type and Content-Disposition.")
+    @APIResponse(responseCode = "403", description = "The conversation is not permitted to access this attachment.")
+    @APIResponse(responseCode = "404", description = "Attachment not found.")
+    public void downloadAttachment(
+                                   @Parameter(description = "Owning conversation ID.")
+                                   @PathParam("conversationId") String conversationId,
+                                   @Parameter(description = "Storage reference of the attachment.")
+                                   @PathParam("storageRef") String storageRef,
+                                   @Suspended AsyncResponse asyncResponse) {
+        requireExistingConversationOwner(conversationId);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                Attachment meta = attachmentStore.getMetadata(storageRef, conversationId);
+                byte[] bytes = attachmentStore.load(storageRef, conversationId);
+                String downloadName = sanitizeContentDisposition(
+                        meta.filename() != null ? meta.filename() : "attachment");
+                asyncResponse.resume(Response.ok(bytes)
+                        .header("Content-Type", meta.mimeType() != null ? meta.mimeType() : "application/octet-stream")
+                        .header("Content-Disposition", "attachment; filename=\"" + downloadName + "\"")
+                        .build());
+            } catch (IAttachmentStore.AttachmentAccessDeniedException e) {
+                LOGGER.debugf("Attachment download denied for conversation '%s': %s",
+                        sanitize(conversationId), e.getMessage());
+                asyncResponse.resume(Response.status(Response.Status.FORBIDDEN)
+                        .entity(Map.of("error", e.getMessage(), "code", "ATTACHMENT_ACCESS_DENIED"))
+                        .build());
+            } catch (IAttachmentStore.AttachmentNotFoundException e) {
+                LOGGER.debugf("Attachment download not found for conversation '%s': %s",
+                        sanitize(conversationId), e.getMessage());
+                asyncResponse.resume(Response.status(Response.Status.NOT_FOUND)
+                        .entity(Map.of("error", e.getMessage(), "code", "ATTACHMENT_NOT_FOUND"))
+                        .build());
+            } catch (IAttachmentStore.AttachmentStoreException e) {
+                // A store/backend failure (not a missing blob) — surface as 500 and
+                // log at ERROR so outages are not silently misreported as 404.
+                LOGGER.errorf(e, "Attachment store error downloading attachment for conversation '%s'",
+                        sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of("error", "Failed to download attachment", "code", "ATTACHMENT_STORE_ERROR"))
+                        .build());
+            } catch (Exception e) {
+                LOGGER.errorf(e, "Failed to download attachment for conversation '%s'", sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of("error", "Failed to download attachment")).build());
+            }
+        }, managedExecutor);
+    }
+
+    @DELETE
+    @Path("/{conversationId}/attachments/{storageRef}")
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(
+               operationId = "deleteAttachment",
+               summary = "Delete a single attachment",
+               description = "Removes one attachment. Restricted to the owning conversation.")
+    @APIResponse(responseCode = "200", description = "Attachment deleted.")
+    @APIResponse(responseCode = "403", description = "The conversation does not own this attachment.")
+    @APIResponse(responseCode = "404", description = "Attachment not found.")
+    public void deleteAttachment(
+                                 @Parameter(description = "Owning conversation ID.")
+                                 @PathParam("conversationId") String conversationId,
+                                 @Parameter(description = "Storage reference of the attachment.")
+                                 @PathParam("storageRef") String storageRef,
+                                 @Suspended AsyncResponse asyncResponse) {
+        requireExistingConversationOwner(conversationId);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                boolean deleted = attachmentStore.delete(storageRef, conversationId);
+                if (deleted) {
+                    asyncResponse.resume(Response.ok(Map.of(
+                            "storageRef", storageRef, "deleted", true)).build());
+                } else {
+                    asyncResponse.resume(Response.status(Response.Status.NOT_FOUND)
+                            .entity(Map.of("error", "Attachment not found", "code", "ATTACHMENT_NOT_FOUND"))
+                            .build());
+                }
+            } catch (IAttachmentStore.AttachmentAccessDeniedException e) {
+                LOGGER.debugf("Attachment delete denied for conversation '%s': %s",
+                        sanitize(conversationId), e.getMessage());
+                asyncResponse.resume(Response.status(Response.Status.FORBIDDEN)
+                        .entity(Map.of("error", e.getMessage(), "code", "ATTACHMENT_ACCESS_DENIED"))
+                        .build());
+            } catch (Exception e) {
+                LOGGER.errorf(e, "Failed to delete attachment for conversation '%s'", sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of("error", "Failed to delete attachment")).build());
+            }
+        }, managedExecutor);
+    }
+
+    @DELETE
+    @Path("/{conversationId}/attachments")
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(
+               operationId = "deleteAttachments",
+               summary = "Delete all attachments for a conversation",
+               description = "Removes all stored attachments for a conversation (GDPR erasure).")
+    @APIResponse(responseCode = "200", description = "Attachments deleted.")
+    public void deleteAttachments(
+                                  @Parameter(description = "Conversation ID to delete attachments for.")
+                                  @PathParam("conversationId") String conversationId,
+                                  @Suspended AsyncResponse asyncResponse) {
+        requireExistingConversationOwner(conversationId);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                long deleted = attachmentStore.deleteByConversation(conversationId);
+                asyncResponse.resume(Response.ok(Map.of(
+                        "conversationId", conversationId,
+                        "deletedCount", deleted)).build());
+            } catch (Exception e) {
+                LOGGER.errorf(e, "Failed to delete attachments for conversation '%s'", sanitize(conversationId));
+                asyncResponse.resume(Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                        .entity(Map.of("error", "Failed to delete attachments")).build());
+            }
+        }, managedExecutor);
+    }
+
+    /**
+     * Sanitize the optional tenant ID parameter: if it doesn't match the allowed
+     * pattern, treat it as absent (null).
+     */
+    private static String sanitizeTenantId(String tenantId) {
+        if (tenantId == null || tenantId.isBlank()) {
+            return null;
+        }
+        if (!TENANT_ID_PATTERN.matcher(tenantId).matches()) {
+            LOGGER.warnf("Rejected invalid tenantId: '%s'", sanitize(tenantId));
+            return null;
+        }
+        return tenantId;
+    }
+
+    /**
+     * Strip characters that could break out of the quoted
+     * {@code Content-Disposition} filename or inject headers (quotes, backslashes,
+     * control characters).
+     */
+    private static String sanitizeContentDisposition(String filename) {
+        String cleaned = filename.replaceAll("[\"\\\\\\r\\n]", "_").trim();
+        return cleaned.isEmpty() ? "attachment" : cleaned;
+    }
+}

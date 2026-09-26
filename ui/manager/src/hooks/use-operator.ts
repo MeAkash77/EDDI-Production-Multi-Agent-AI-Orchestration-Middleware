@@ -1,0 +1,629 @@
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  readOperatorConfig,
+  assertProvisioned,
+  runOperatorCanary,
+  reactivateOperator,
+  type CanaryResult,
+  writeOperatorConfig,
+  readOperatorStatus,
+  deactivateOperator,
+  resetOperator,
+  provisionOperator,
+  resolveAgentVersion,
+  fetchOpenApiSpec,
+  findMissingEndpoints,
+  defaultOperatorConfig,
+  verifyGateInstalled,
+  reportOperatorGateStatus,
+  fetchPlatformSelfUrl,
+  resolveOperatorApiBaseUrl,
+  isNotFound,
+  type PlatformSelfUrl,
+  type GateVerificationResult,
+  type OperatorConfig,
+  type FetchedSpec,
+} from "@/lib/api/operator";
+import { undeployAgent, deleteAgent, getAgentCurrentVersion } from "@/lib/api/agents";
+import { endpointsForScope } from "@/lib/operator/tool-scopes";
+import {
+  enforceGateDryRun,
+  runBackgroundWriteProbe,
+  type WriteProbeReport,
+} from "@/lib/operator/write-canary";
+
+/* ─── Query Keys ─── */
+
+export const operatorKeys = {
+  all: ["operator"] as const,
+  config: ["operator", "config"] as const,
+  status: (agentId: string, version: number) =>
+    ["operator", "status", agentId, version] as const,
+  gate: (agentId: string) => ["operator", "gate", agentId] as const,
+  selfUrl: ["operator", "self-url"] as const,
+};
+
+/* ─── Config ─── */
+
+/**
+ * The operator config blob. `null` means "never activated".
+ *
+ * `enabled` exists for callers that mount somewhere this read is not
+ * guaranteed to be permitted. The config lives in the global variable store,
+ * which is `@RolesAllowed({"eddi-admin", "eddi-editor"})` on the backend — so
+ * for any other role (`eddi-approver`, most notably) this 403s rather than
+ * 404s, and `readOperatorConfig` rethrows anything that is not a 404. A caller
+ * mounted on every page would turn that into a failed request on every
+ * navigation for every non-admin. Defaults to `true`: the operator screen and
+ * the dashboard card are admin surfaces already, and an admin who genuinely
+ * cannot read it needs the error, not silence.
+ */
+export function useOperatorConfig(enabled = true) {
+  return useQuery({
+    queryKey: operatorKeys.config,
+    queryFn: readOperatorConfig,
+    staleTime: 30_000,
+    enabled,
+  });
+}
+
+/**
+ * Deployment status of the operator agent.
+ *
+ * Only polls while the operator is enabled and fully provisioned — an agent id
+ * without a version cannot be queried, since the endpoint requires one.
+ */
+export function useOperatorStatus(config: OperatorConfig | null | undefined) {
+  const agentId = config?.agentId ?? "";
+  const version = config?.version ?? 0;
+  const ready = Boolean(config?.enabled && agentId && version > 0);
+  return useQuery({
+    queryKey: operatorKeys.status(agentId, version),
+    queryFn: () => readOperatorStatus(config!),
+    enabled: ready,
+    refetchInterval: (query) =>
+      query.state.data?.status === "IN_PROGRESS" ? 2_000 : 15_000,
+  });
+}
+
+/**
+ * The address EDDI reports it can reach itself at.
+ *
+ * Read so the activation form can PREFILL the platform base URL rather than
+ * leaving an admin to guess it — and so the form can say whether the deployment
+ * chose the address (`eddi.self.base-url`) or it was derived from the HTTP port.
+ *
+ * `null` is a meaningful answer: the backend predates the endpoint. The form
+ * treats that as "you may have to fill this in yourself" instead of an error.
+ * `staleTime: Infinity` because this is deployment configuration — it cannot
+ * change without a restart, which ends this session anyway.
+ */
+export function usePlatformSelfUrl(enabled = true) {
+  return useQuery<PlatformSelfUrl | null>({
+    queryKey: operatorKeys.selfUrl,
+    queryFn: fetchPlatformSelfUrl,
+    enabled,
+    staleTime: Infinity,
+    // A failure here is an answer the form has to show (a 403, a 500), not a
+    // blip worth ~7 s of backoff with the field stuck on "…".
+    retry: false,
+  });
+}
+
+/* ─── Activation ─── */
+
+/** Progress stages surfaced while activation runs. */
+export type ActivationStage =
+  | "idle"
+  | "validating"
+  | "provisioning"
+  | "resolving-version"
+  | "saving"
+  | "verifying-gate"
+  | "done";
+
+/**
+ * What activation returns: the saved config plus the DETERMINISTIC check
+ * outcomes. The LLM probes (read canary, live write probe) no longer block
+ * activation — run them afterwards via {@link runPostActivationProbes}, which
+ * needs the `spec` carried here.
+ */
+export interface ActivationOutcome {
+  config: OperatorConfig;
+  gate: GateVerificationResult;
+  /**
+   * Whether gate-dry-run deterministically verified the stored policy gates
+   * the probe's target write. `null` for read_only (nothing to verify);
+   * `false` means the backend predates gate-dry-run — NOT that the gate is
+   * broken (a proven-broken policy throws and rolls back instead).
+   */
+  policyVerified: boolean | null;
+  /** The spec activation provisioned against, for the background probes. */
+  spec: FetchedSpec;
+  /**
+   * Set when the operator this activation replaced could not be retired, so it
+   * is probably STILL DEPLOYED alongside the new one.
+   *
+   * This used to be a bare `catch {}`. The consequence was not cosmetic: a
+   * reconfigure that changed only the model left two `READY` operators on the
+   * instance, the UI silently addressed the new one, and an engineer debugging a
+   * broken operator repaired the agent that was no longer in use — the fix
+   * changed nothing and the real cause stayed hidden. A failure here has to
+   * reach the screen.
+   */
+  supersededWarning: string | null;
+}
+
+export interface ActivateParams {
+  agentName: string;
+  config: OperatorConfig;
+  apiKey: string;
+  baseUrl?: string;
+  onStage?: (stage: ActivationStage) => void;
+}
+
+/**
+ * Provision the operator from scratch and persist the config.
+ *
+ * `setup-api` always builds a new agent, so a re-provision retires the one it
+ * replaced instead of leaving it deployed. Merely re-enabling a disabled
+ * operator should go through `useReactivateOperator`, which redeploys the
+ * existing agent rather than rebuilding it.
+ *
+ * Ordering matters: the config is written only once the agent is confirmed
+ * deployed and its version resolved, so a half-provisioned operator is never
+ * recorded as enabled.
+ */
+export function useActivateOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (params: ActivateParams) => {
+      const { agentName, config, apiKey, baseUrl, onStage } = params;
+
+      // Fail before creating anything if the deployment's spec doesn't actually
+      // expose the endpoints we intend to bind — otherwise the operator would
+      // come up "READY" with silently missing tools.
+      onStage?.("validating");
+      const spec = await fetchOpenApiSpec();
+      const missing = findMissingEndpoints(spec, endpointsForScope(config.scope));
+      if (missing.length > 0) {
+        throw new Error(
+          `This EDDI deployment does not expose ${missing.length} endpoint(s) the operator needs: ${missing.join(", ")}`,
+        );
+      }
+
+      // The address the generated tools will target. Resolved HERE, before
+      // anything is created, because it is the single field that decides whether
+      // the operator can function at all — and because the resolved value is then
+      // persisted on the config, so the operator screen can show it and a later
+      // reconfigure reuses the admin's choice instead of re-deriving it.
+      const apiBaseUrl = await resolveOperatorApiBaseUrl(config);
+      const effectiveConfig: OperatorConfig = { ...config, apiBaseUrl };
+
+      // The stored config this activation replaces, captured BEFORE anything is
+      // written, so a replacement that fails verification can hand the deployment
+      // back to it. Best-effort: without it, a failed reconfigure still rolls the
+      // new agent back, it just cannot re-point the config at the old one.
+      const previous = config.agentId ? await readOperatorConfig().catch(() => null) : null;
+
+      onStage?.("provisioning");
+      const result = await provisionOperator({ agentName, config: effectiveConfig, apiKey, baseUrl, spec });
+      // 201 does not mean deployed, and the id can come back as "unknown".
+      assertProvisioned(result);
+
+      // Everything from here to the config write is rolled back on failure.
+      // provisionOperator DEPLOYS the agent, so a throw in any of these steps
+      // used to leave a live agent bound to the whole admin-API surface and
+      // running as the caller's identity — while the operator screen still said
+      // "off", because the config variable it reads was never written. It was
+      // invisible, unmanaged, and a retry made a second one:
+      // removeSupersededAgent only ever cleans up the agent recorded in the
+      // config. The gate checks below already roll back for exactly this
+      // reason; these three steps simply never got the same treatment.
+      let version: number;
+      let next: OperatorConfig;
+      try {
+        onStage?.("resolving-version");
+        version = await resolveAgentVersion(result);
+
+        onStage?.("saving");
+        next = {
+          ...effectiveConfig,
+          enabled: true,
+          agentId: result.agentId,
+          version,
+        };
+        await writeOperatorConfig(next);
+      } catch (provisioningError) {
+        // Best-effort: the original failure is what the admin needs to see, and
+        // a cleanup that itself fails must not replace it. `version` may be
+        // unresolved, so fall back to 1 — the version provisionOperator creates.
+        try {
+          await removeSupersededAgent({ ...effectiveConfig, agentId: result.agentId, version: 1 });
+        } catch {
+          // Left deployed; the rethrown error below is still the honest report.
+        }
+        throw provisioningError;
+      }
+
+      // Read the gate back from the document we just created — never trust that
+      // sending hitlConfig means it landed. This is what actually proves
+      // isWriteScopeAvailable's "backend accepts hitlConfig" fact.
+      //
+      // For read_only this stays REPORTED, not enforced: a caught exception or a
+      // negative result means an operator that can only read is also unverified,
+      // which is useless rather than dangerous.
+      //
+      // For read_write it is ENFORCED, and that distinction is load-bearing.
+      // `isWriteScopeAvailable` no longer demands a gate verified on a PREVIOUS
+      // operator, on the stated grounds that activation proves the gate about the
+      // agent it actually creates — so this read-back has to be a gate rather
+      // than a status line, or that justification is false. Reporting it and
+      // proceeding would leave exactly the hole the old two-step bootstrap
+      // existed to close.
+      //
+      // The gate dry-run below is NOT a substitute for this check. It
+      // classifies one endpoint (`PATCH /descriptorstore/descriptors/{id}`),
+      // so it proves the patch pattern is gated and says nothing about
+      // `http.post:*`, `http.put:*` or `http.delete:*`. A document whose gate
+      // covers only some write methods passes the dry-run while leaving the
+      // rest ungated; `gateLooksInstalled` is what inspects the whole pattern
+      // set. The two are complementary: this one checks the pattern set is
+      // complete, the dry-run checks the classifier actually gates the target.
+      onStage?.("verifying-gate");
+      let gate: GateVerificationResult;
+      let policyVerified: boolean | null;
+      try {
+        gate = await verifyGateInstalled(result.agentId);
+        await reportOperatorGateStatus(gate.verified);
+        if (next.scope === "read_write" && !gate.verified) {
+          await rollBackUnsafeOperator(
+            next,
+            `The approval gate could not be verified on the operator's own agent document${gate.reason ? ` (${gate.reason})` : ""}.`,
+          );
+        }
+
+        // The deterministic half of write verification (backend gate-dry-run):
+        // classifies the probe's target write against the STORED policy — pure
+        // function of policy + call address, cannot flake, writes nothing. A
+        // proven-ungated policy (or a failed verification) rolls back fail-closed
+        // inside. This is the ONLY write check activation still waits on.
+        //
+        // The LLM probes — read canary and live write probe — deliberately do
+        // NOT run here anymore. Each drives a real model conversation and was
+        // the bulk of the activation wait (a minute of "connection check" after
+        // the operator was already deployed and usable), and an inconclusive
+        // outcome proved nothing anyway. They run in the background via
+        // runPostActivationProbes once the admin is already in the chat; the
+        // write probe still tears the operator down on a PROVEN gate breach.
+        //
+        // `next`, NOT `config`: the check has to run against the agent that was
+        // just provisioned. `config` still carries the PREVIOUS agentId, which on
+        // a reconfigure is still deployed at this point — retired only below, once
+        // the replacement has passed every check that can roll it back.
+        policyVerified = await enforceGateDryRun(next, spec);
+      } catch (verificationError) {
+        await handBackToPredecessor(verificationError, previous, config, result.agentId);
+        throw verificationError;
+      }
+
+      // Retire the agent this activation replaced, so repeated reconfiguration
+      // doesn't accumulate deployed operators.
+      //
+      // Only NOW, after the gate read-back and the dry-run: either can roll the
+      // replacement back, and retiring the predecessor before them left a
+      // deployment with no operator at all whenever they did.
+      //
+      // Reported, not swallowed. `setup-api` always builds a NEW agent id, so a
+      // reconfigure is a replacement, and a replacement whose retirement quietly
+      // failed is the worst of both worlds: two deployed operators, both READY,
+      // with nothing on screen saying which one the UI is talking to. That is not
+      // a hypothetical — it happened on a reconfigure that changed only the model,
+      // and the ensuing debugging session repaired the abandoned agent.
+      let supersededWarning: string | null = null;
+      if (config.agentId && config.agentId !== result.agentId && config.version == null) {
+        // A config that recorded the agent but not its version (written before
+        // version tracking) cannot be undeployed or deleted — both endpoints need
+        // the version. removeSupersededAgent would return silently and leave two
+        // operators running, which is exactly the state this exists to report.
+        supersededWarning =
+          `The new operator agent (${result.agentId}) is live, but the one it replaced (${config.agentId}) ` +
+          "has no recorded version, so it could not be removed automatically. It may still be deployed and answering. " +
+          "Delete it from the Agents screen — and note that this screen now talks to the NEW agent, " +
+          "so changes made to the old one will have no effect.";
+      } else if (config.agentId && config.agentId !== result.agentId) {
+        try {
+          await removeSupersededAgent(config);
+        } catch (removalError) {
+          const detail =
+            removalError instanceof Error ? removalError.message : String(removalError);
+          supersededWarning =
+            `The new operator agent (${result.agentId}) is live, but the one it replaced (${config.agentId}) ` +
+            `could not be removed (${detail}). It may still be deployed and answering. ` +
+            "Delete it from the Agents screen — and note that this screen now talks to the NEW agent, " +
+            "so changes made to the old one will have no effect.";
+        }
+      }
+
+      onStage?.("done");
+      return { config: next, gate, policyVerified, spec, supersededWarning };
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: operatorKeys.all });
+    },
+    // A failed activation mutates server state as surely as a successful one:
+    // the provisioning rollback above and `enforceGateDryRun`'s
+    // `resetOperator` both DELETE agents and clear the config variable before
+    // throwing. Without this the cache still holds the pre-activation config,
+    // so cancelling out of the form lands on a page reporting an active
+    // operator, with Check-connection / Deactivate / Delete all pointed at an
+    // agent id that no longer exists — every one of them a 404. Invalidating on
+    // both outcomes is the only version of this that matches what the server
+    // actually did.
+    onError: () => {
+      qc.invalidateQueries({ queryKey: operatorKeys.all });
+    },
+  });
+}
+
+/** Callbacks through which the background probes report — see runPostActivationProbes. */
+export interface PostActivationProbeCallbacks {
+  /** The read canary's outcome (one real read through a real conversation). */
+  onReadResult: (result: CanaryResult) => void;
+  /**
+   * The live write probe's outcome (read_write only). `report.tornDown` means
+   * the probe PROVED the gate broken and the operator was already removed —
+   * the UI must re-read the config, not just show a warning.
+   */
+  onWriteResult?: (report: WriteProbeReport) => void;
+}
+
+/**
+ * The LLM probes that used to block activation, now run AFTER it: one real
+ * read (the canary) and — for read_write — one real gated write that must
+ * pause. Fire-and-forget from the activation success handler; each result is
+ * delivered through the callbacks as it arrives, in parallel.
+ *
+ * Deliberately NOT a mutation hook: nothing here belongs to a component's
+ * lifecycle. The probes must keep running (and the write probe must keep its
+ * power to tear down a provably-ungated operator) even if the admin navigates
+ * away from the operator page mid-probe.
+ */
+export async function runPostActivationProbes(
+  outcome: ActivationOutcome,
+  callbacks: PostActivationProbeCallbacks,
+): Promise<void> {
+  const { config, spec, policyVerified } = outcome;
+  await Promise.all([
+    runOperatorCanary(config)
+      .catch(
+        (error: unknown): CanaryResult => ({
+          ok: false,
+          toolCalls: 0,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      .then((result) => callbacks.onReadResult(result)),
+    config.scope === "read_write"
+      ? runBackgroundWriteProbe(config, spec, policyVerified === true).then((report) => {
+          if (report) callbacks.onWriteResult?.(report);
+        })
+      : Promise.resolve(),
+  ]);
+}
+
+/**
+ * Tear down an operator that is already DEPLOYED but failed a safety check, and
+ * throw with the reason.
+ *
+ * Shares `enforceWriteCanaryGate`'s contract deliberately, because the situation
+ * is identical: provisioning deploys before any check runs, so by the time a
+ * check fails there are live write tools reachable right now. Reporting and
+ * moving on would leave them reachable. `resetOperator` (undeploy, delete, clear
+ * the config variable) rather than discarding the local object, because the
+ * caller already persisted the config — anything less leaves it pointing at an
+ * agent this just deleted.
+ *
+ * A failed rollback is called out explicitly rather than surfacing as a bare
+ * transport error, for the same reason as there: "Failed to fetch" reads as a
+ * retryable blip, and the admin would never learn a write-capable operator is
+ * still live.
+ */
+async function rollBackUnsafeOperator(config: OperatorConfig, failure: string): Promise<never> {
+  try {
+    await resetOperator(config);
+  } catch (rollbackError) {
+    const detail = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+    throw new Error(
+      `${failure} Rolling it back ALSO failed (${detail}). The operator is still deployed with ` +
+        "write tools and an unverified gate — remove it manually from the operator screen now.",
+    );
+  }
+  throw new Error(
+    `${failure} The operator has been deactivated and removed rather than left deployed ` +
+      "with write tools behind a gate that could not be verified.",
+  );
+}
+
+/**
+ * After a replacement failed verification, decide what happens to the operator
+ * it was replacing — which, because retirement waits for verification, is
+ * still deployed.
+ *
+ * The predecessor is NEVER retired on this path. Activation failed, so the one
+ * operator known to work is the last thing to destroy; the worst outcome here
+ * is two deployed operators and an error that names both, never zero.
+ *
+ * What happens to the config depends on whether the replacement still EXISTS,
+ * asked of the agent store directly rather than inferred from the config
+ * variable: `resetOperator` deletes the agent before it clears the variable, so
+ * a failed clear leaves a config naming an agent that is already gone.
+ *
+ * - Replacement gone: write the predecessor's stored config back, so the screen
+ *   and the deployment agree the old operator is the active one.
+ * - Replacement still there (its rollback failed, or a check threw without
+ *   rolling back): leave both, and say so.
+ * - Cannot tell: change nothing, and say that.
+ *
+ * Never throws: the verification failure is what the admin needs to see, so
+ * this only ever appends to its message.
+ */
+async function handBackToPredecessor(
+  verificationError: unknown,
+  previous: OperatorConfig | null,
+  config: OperatorConfig,
+  newAgentId: string,
+): Promise<void> {
+  if (!config.agentId || config.agentId === newAgentId) return;
+  const append = (note: string) => {
+    if (verificationError instanceof Error) verificationError.message = `${verificationError.message} ${note}`;
+  };
+  const replacement = await agentPresence(newAgentId);
+  if (replacement === "unknown") {
+    append(
+      `Whether the new agent (${newAgentId}) was removed could not be confirmed. The operator it was replacing (${config.agentId}) was left deployed — check the Agents screen before reconfiguring.`,
+    );
+    return;
+  }
+  if (replacement === "present") {
+    append(
+      `The new agent (${newAgentId}) is still present, and the operator it was replacing (${config.agentId}) was left deployed as well — remove the one you do not want from the Agents screen.`,
+    );
+    return;
+  }
+  if (previous?.agentId !== config.agentId) {
+    append(
+      `The operator it was replacing (${config.agentId}) was left deployed, but its configuration could not be restored — reconfigure the operator to manage it again.`,
+    );
+    return;
+  }
+  try {
+    await writeOperatorConfig(previous);
+    append(`The operator it was replacing (${config.agentId}) was left in place and is still the active one.`);
+  } catch {
+    append(
+      `The operator it was replacing (${config.agentId}) was left deployed, but restoring its configuration failed — reconfigure the operator to manage it again.`,
+    );
+  }
+}
+
+/**
+ * Whether an agent still exists, via `/currentversion`: 200 is "present", 404
+ * "absent", anything else "unknown". Not the version-less
+ * `GET /agentstore/agents/{id}` — that answers 400 for an existing agent and an
+ * unknown id alike, so every answer would have been "unknown".
+ */
+async function agentPresence(agentId: string): Promise<"present" | "absent" | "unknown"> {
+  try {
+    await getAgentCurrentVersion(agentId);
+    return "present";
+  } catch (error) {
+    return isNotFound(error) ? "absent" : "unknown";
+  }
+}
+
+/**
+ * Remove a superseded operator agent without touching the config variable — by
+ * this point the variable already points at the replacement.
+ */
+async function removeSupersededAgent(config: OperatorConfig): Promise<void> {
+  if (!config.agentId || config.version == null) return;
+  try {
+    // `endAllActiveConversations`, for the same reason deactivateOperator and
+    // resetOperator pass it: the backend refuses (409) to undeploy an agent that
+    // still has active conversations, and the superseded operator's active
+    // conversation is almost always the admin's own operator chat — on the very
+    // screen the Reconfigure button lives on. Without the flag, having USED the
+    // operator was enough to make its replacement leave it deployed.
+    await undeployAgent(config.environment, config.agentId, config.version, {
+      endAllActiveConversations: true,
+    });
+  } catch {
+    // Already undeployed, or the environment is gone — the delete below is what
+    // actually retires it, and its failure is NOT swallowed.
+  }
+  await deleteAgent(config.agentId, config.version, {
+    cascade: true,
+    permanent: true,
+  });
+}
+
+/** Re-enable a configured-but-disabled operator by redeploying its agent. */
+export function useReactivateOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (config: OperatorConfig) => reactivateOperator(config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: operatorKeys.all });
+    },
+  });
+}
+
+/** Re-run the probe read on demand, from the operator screen. */
+export function useOperatorCanary() {
+  return useMutation({
+    mutationFn: (config: OperatorConfig) => runOperatorCanary(config),
+  });
+}
+
+/**
+ * Continuously re-verifies the tool-approval gate on the live agent document.
+ *
+ * Verification is continuous, not one-time: `eddi.hitl.tool.enabled=false` (or
+ * any other deployment-level change) can be flipped after activation and
+ * nothing else would report it. `staleTime: 0` makes every mount — i.e. every
+ * time the operator page is opened — re-check rather than serve a cached
+ * "verified" from a stale mount. This is a MONITORING surface (the status
+ * panel's gate badge, plus the metrics gauge the docs' alert watches) — it no
+ * longer gates offering write scope, which activation itself enforces via the
+ * gate read-back and the write canary's rollback.
+ */
+export function useVerifyOperatorGate(config: OperatorConfig | null | undefined) {
+  const agentId = config?.agentId ?? "";
+  const ready = Boolean(config?.enabled && agentId);
+  return useQuery({
+    queryKey: operatorKeys.gate(agentId),
+    queryFn: async () => {
+      const result = await verifyGateInstalled(agentId);
+      // Piggybacks on traffic that already has to happen for the status
+      // panel, rather than opening a separate poll: every time an admin looks
+      // at this page, the gauge that "the alert is on it dropping to 0"
+      // refers to (docs/hitl.md, EDDI backend repo) gets refreshed too.
+      await reportOperatorGateStatus(result.verified);
+      return result;
+    },
+    enabled: ready,
+    staleTime: 0,
+  });
+}
+
+/* ─── Kill switch ─── */
+
+/** Undeploy the operator and mark it disabled. Reversible by re-activating. */
+export function useDeactivateOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (config: OperatorConfig) => deactivateOperator(config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: operatorKeys.all });
+    },
+  });
+}
+
+/** Delete the operator agent and its config entirely. */
+export function useResetOperator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (config: OperatorConfig) => resetOperator(config),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: operatorKeys.all });
+    },
+  });
+}
+
+/* ─── Helpers ─── */
+
+/** The config to seed the activation form with. */
+export function seedConfig(existing: OperatorConfig | null | undefined): OperatorConfig {
+  return existing ?? defaultOperatorConfig();
+}

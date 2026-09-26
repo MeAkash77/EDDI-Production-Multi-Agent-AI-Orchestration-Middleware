@@ -1,0 +1,49 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.configs.output.model;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * @author ginccc
+ */
+
+public class OutputConfigurationSet {
+    private String lang;
+    private List<OutputConfiguration> outputSet = new ArrayList<>();
+
+    public String getLang() {
+        return lang;
+    }
+
+    public void setLang(String lang) {
+        this.lang = lang;
+    }
+
+    public List<OutputConfiguration> getOutputSet() {
+        return outputSet;
+    }
+
+    public void setOutputSet(List<OutputConfiguration> outputSet) {
+        this.outputSet = outputSet;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o)
+            return true;
+        if (o == null || getClass() != o.getClass())
+            return false;
+        OutputConfigurationSet that = (OutputConfigurationSet) o;
+        return Objects.equals(lang, that.lang) && Objects.equals(outputSet, that.outputSet);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(lang, outputSet);
+    }
+}

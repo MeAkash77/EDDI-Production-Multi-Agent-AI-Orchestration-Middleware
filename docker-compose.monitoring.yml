@@ -1,0 +1,80 @@
+# Docker Compose overlay for EDDI monitoring stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# Access (host ports; override any of them in .env):
+#   Prometheus:  http://localhost:9090   PROMETHEUS_PORT
+#   Grafana:     http://localhost:3000   GRAFANA_PORT     (admin/admin)
+#   Jaeger UI:   http://localhost:16686  JAEGER_PORT
+#   Jaeger OTLP: 4317 / 4318             OTLP_GRPC_PORT / OTLP_HTTP_PORT
+#
+# These are host bindings only -- the containers reach each other on the compose
+# network using the service name and the internal port (prometheus:9090,
+# jaeger:4317), so moving a host port here changes nothing inside the stack.
+# The installers resolve them against what is already listening; 3000 in
+# particular is a busy port on a development machine.
+#
+# EDDI must set these in its environment:
+#   QUARKUS_OTEL_SDK_DISABLED=false
+#   QUARKUS_OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+
+services:
+  # Override EDDI service to enable OTel tracing and point to Jaeger
+  eddi:
+    environment:
+      QUARKUS_OTEL_SDK_DISABLED: "false"
+      QUARKUS_OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: eddi-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./docs/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: eddi-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./docs/monitoring/eddi-grafana-dashboard.json:/var/lib/grafana/dashboards/eddi.json:ro
+      # The provider globs this directory, so a second dashboard needs no
+      # provisioning change. Was stranded in a top-level grafana-data/ left over
+      # from the bind-mount era and provisioned by nothing.
+      - ./docs/monitoring/eddi-operations-dashboard.json:/var/lib/grafana/dashboards/eddi-operations.json:ro
+      # Full Metrics Reference — one panel group per subsystem, covering every
+      # meter EDDI registers. The operations dashboard stays the front door;
+      # this is where you go when the KPI you need is not on it.
+      - ./docs/monitoring/eddi-full-metrics-dashboard.json:/var/lib/grafana/dashboards/eddi-full-metrics.json:ro
+      - ./docs/monitoring/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./docs/monitoring/grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/jaeger:2.7.0
+    container_name: eddi-jaeger
+    ports:
+      - "${JAEGER_PORT:-16686}:16686"
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

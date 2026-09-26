@@ -1,0 +1,114 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "eddi.fullname" . }}-postgres
+  labels:
+    {{- include "eddi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+type: Opaque
+stringData:
+  # POSTGRES_* are consumed by the postgres container itself, which only reads
+  # its bootstrap configuration from environment variables.
+  POSTGRES_DB: {{ .Values.postgres.database | quote }}
+  POSTGRES_USER: {{ .Values.postgres.username | quote }}
+  {{- $pgPassword := required "postgres.password is required when postgres.enabled=true — the chart no longer ships a default. Generate one: openssl rand -base64 24" .Values.postgres.password }}
+  POSTGRES_PASSWORD: {{ $pgPassword | quote }}
+  # Consumed by EDDI as a mounted config FILE (see the projected volume in
+  # deployment.yaml), not as environment variables.
+  postgres-secrets.properties: |
+    quarkus.datasource.username={{ .Values.postgres.username }}
+    quarkus.datasource.password={{ $pgPassword }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "eddi.fullname" . }}-postgres
+  labels:
+    {{- include "eddi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  serviceName: {{ include "eddi.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "eddi.fullname" . }}-postgres
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "eddi.fullname" . }}-postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: eddi
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          ports:
+            - containerPort: 5432
+              name: postgres
+          # Named keys, not `envFrom: secretRef`. The Secret above also carries
+          # postgres-secrets.properties (mounted into EDDI as a file), and that
+          # key is not a legal C_IDENTIFIER — with envFrom the kubelet skipped
+          # it and emitted an InvalidEnvironmentVariableNames warning event on
+          # every pod start and restart.
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "eddi.fullname" . }}-postgres
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "eddi.fullname" . }}-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "eddi.fullname" . }}-postgres
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.username | quote }}, "-d", {{ .Values.postgres.database | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.postgres.storage.storageClassName }}
+        storageClassName: {{ .Values.postgres.storage.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "eddi.fullname" . }}-postgres
+  labels:
+    {{- include "eddi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "eddi.fullname" . }}-postgres
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end }}

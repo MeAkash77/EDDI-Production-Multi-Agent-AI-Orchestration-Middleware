@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+    EDDI Checkstyle Configuration
+    Pragmatic checks for a large enterprise codebase.
+    Focus: correctness and safety over style preferences.
+    See: https://checkstyle.org/checks.html
+-->
+<module name="Checker">
+    <property name="severity" value="warning"/>
+    <property name="charset" value="UTF-8"/>
+
+    <!-- Suppress checks in generated/test files -->
+    <module name="SuppressionSingleFilter">
+        <property name="checks" value=".*"/>
+        <property name="files" value=".*[\\/]target[\\/].*"/>
+    </module>
+
+    <!-- Suppress MethodName in MCP tools — MCP protocol requires snake_case -->
+    <module name="SuppressionSingleFilter">
+        <property name="checks" value="MethodName"/>
+        <property name="files" value=".*[\\/]mcp[\\/]Mcp.*\.java$"/>
+    </module>
+
+    <!-- File-level checks -->
+    <module name="FileLength">
+        <property name="max" value="2000"/>
+    </module>
+
+    <!-- Line length: 150 (realistic for Java with generics/annotations) -->
+    <module name="LineLength">
+        <property name="max" value="150"/>
+        <property name="ignorePattern" value="^package.*|^import.*|a href|href|http://|https://|ftp://"/>
+    </module>
+
+    <module name="FileTabCharacter">
+        <property name="eachLine" value="true"/>
+    </module>
+
+    <module name="TreeWalker">
+        <!-- Naming conventions -->
+        <module name="TypeName"/>
+        <module name="MethodName"/>
+        <module name="LocalVariableName"/>
+        <module name="MemberName"/>
+        <module name="ParameterName"/>
+        <module name="PackageName"/>
+
+        <!-- Constants: allow UPPER_CASE and camelCase (many legacy constants) -->
+        <module name="ConstantName">
+            <property name="format" value="^[a-zA-Z][a-zA-Z0-9_]*$"/>
+        </module>
+
+        <!-- Import checks. severity="error" promotes these above the Checker's
+             default "warning", which is what makes them BLOCKING: the pom sets
+             violationSeverity=error, so only rules marked here can fail a build.
+             AGENTS.md §4.7 makes them mandatory ("Don't leave unused imports behind
+             after a refactor"); everything else in this file stays advisory. -->
+        <module name="RedundantImport">
+            <property name="severity" value="error"/>
+        </module>
+        <module name="UnusedImports">
+            <property name="severity" value="error"/>
+        </module>
+
+        <!-- Whitespace — only critical ones -->
+        <module name="GenericWhitespace"/>
+
+        <!-- Coding — safety checks (catch real bugs) -->
+        <module name="EqualsHashCode"/>
+        <module name="SimplifyBooleanExpression"/>
+        <module name="SimplifyBooleanReturn"/>
+        <module name="StringLiteralEquality"/>
+        <module name="OneStatementPerLine"/>
+        <module name="MultipleVariableDeclarations"/>
+        <module name="FallThrough"/>
+        <module name="MissingSwitchDefault">
+            <!-- Allow in switch expressions and pattern matching -->
+            <property name="severity" value="info"/>
+        </module>
+
+        <!-- Modifiers -->
+        <module name="ModifierOrder"/>
+    </module>
+</module>

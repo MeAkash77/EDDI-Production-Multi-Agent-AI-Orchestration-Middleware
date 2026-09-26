@@ -1,0 +1,120 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory.model;
+
+import ai.labs.eddi.engine.memory.IData;
+
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+
+/**
+ * @author ginccc
+ */
+public class Data<T> implements IData<T> {
+    private final String key;
+    private List<T> possibleResults;
+    private T result;
+    private final Date timestamp;
+    private String originWorkflowId;
+    private boolean isPublic;
+    private boolean committed = true;
+
+    public Data(String key, T result) {
+        this(key, result, Collections.singletonList(result), new Date(System.currentTimeMillis()));
+    }
+
+    public Data(String key, T result, List<T> possibleResults) {
+        this(key, result, possibleResults, new Date(System.currentTimeMillis()));
+    }
+
+    public Data(String key, T result, List<T> possibleResults, Date timestamp) {
+        this(key, result, possibleResults, timestamp, false);
+    }
+
+    public Data(String key, T result, List<T> possibleResults, Date timestamp, boolean isPublic) {
+        this.key = key;
+        this.result = result == null ? chooseRandomResult(possibleResults) : result;
+        this.possibleResults = possibleResults;
+        this.timestamp = timestamp;
+        this.isPublic = isPublic;
+    }
+
+    private T chooseRandomResult(List<T> results) {
+        if (!results.isEmpty()) {
+            // ThreadLocalRandom avoids allocating (and seeding) a Random for every
+            // Data instance constructed during a turn.
+            return results.get(ThreadLocalRandom.current().nextInt(results.size()));
+        }
+
+        return null;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return this == o || o instanceof Data<?> data && key.equals(data.key);
+    }
+
+    @Override
+    public int hashCode() {
+        return key != null ? key.hashCode() : 0;
+    }
+
+    @Override
+    public String toString() {
+        return "result" + "{key='" + key + '\'' + ", result=" + result + '}';
+    }
+
+    public final String getKey() {
+        return key;
+    }
+
+    public List<T> getPossibleResults() {
+        return possibleResults;
+    }
+
+    public void setPossibleResults(List<T> possibleResults) {
+        this.possibleResults = possibleResults;
+    }
+
+    public T getResult() {
+        return result;
+    }
+
+    public void setResult(T result) {
+        this.result = result;
+    }
+
+    public final Date getTimestamp() {
+        return timestamp;
+    }
+
+    public String getOriginWorkflowId() {
+        return originWorkflowId;
+    }
+
+    public void setOriginWorkflowId(String originWorkflowId) {
+        this.originWorkflowId = originWorkflowId;
+    }
+
+    public boolean isPublic() {
+        return isPublic;
+    }
+
+    public void setPublic(boolean isPublic) {
+        this.isPublic = isPublic;
+    }
+
+    @Override
+    public boolean isCommitted() {
+        return committed;
+    }
+
+    @Override
+    public void setCommitted(boolean committed) {
+        this.committed = committed;
+    }
+}

@@ -1,0 +1,982 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.tenancy;
+
+import ai.labs.eddi.engine.tenancy.model.QuotaCheckResult;
+import ai.labs.eddi.engine.tenancy.model.TenantQuota;
+import ai.labs.eddi.engine.tenancy.model.UsageSnapshot;
+import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
+
+import javax.sql.DataSource;
+import java.sql.*;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.YearMonth;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.*;
+
+/**
+ * Unit tests for {@link PostgresTenantQuotaStore}. Mocks the full JDBC chain:
+ * DataSource → Connection → Statement/PreparedStatement → ResultSet.
+ */
+class PostgresTenantQuotaStoreTest {
+
+    private static final String TENANT_ID = "tenant-abc";
+
+    private DataSource dataSource;
+    private Connection connection;
+    private Statement statement;
+    private PreparedStatement preparedStatement;
+    private ResultSet resultSet;
+
+    @SuppressWarnings("unchecked")
+    private Instance<DataSource> dataSourceInstance;
+
+    private PostgresTenantQuotaStore sut;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        dataSource = mock(DataSource.class);
+        connection = mock(Connection.class);
+        statement = mock(Statement.class);
+        preparedStatement = mock(PreparedStatement.class);
+        resultSet = mock(ResultSet.class);
+
+        lenient().when(dataSource.getConnection()).thenReturn(connection);
+        lenient().when(connection.createStatement()).thenReturn(statement);
+        lenient().when(connection.prepareStatement(anyString())).thenReturn(preparedStatement);
+        lenient().when(preparedStatement.executeQuery()).thenReturn(resultSet);
+
+        dataSourceInstance = mock(Instance.class);
+        lenient().when(dataSourceInstance.get()).thenReturn(dataSource);
+
+        sut = new PostgresTenantQuotaStore(dataSourceInstance);
+    }
+
+    /**
+     * Returns the single prepared statement containing {@code marker}, with runs of
+     * whitespace collapsed so assertions do not depend on SQL indentation.
+     */
+    private static String capturedStatement(Connection conn, String marker) throws SQLException {
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(conn, atLeastOnce()).prepareStatement(sqlCaptor.capture());
+        return sqlCaptor.getAllValues().stream()
+                .map(sql -> sql.replaceAll("\\s+", " ").trim())
+                .filter(sql -> sql.contains(marker))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no prepared statement contained: " + marker));
+    }
+
+    // ─── Schema initialization ────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("Schema initialization")
+    class SchemaInit {
+
+        @Test
+        @DisplayName("should create tables on first access")
+        void ensureSchema_createsTablesOnFirstAccess() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.getQuota(TENANT_ID);
+
+            verify(statement, times(2)).execute(anyString());
+        }
+
+        @Test
+        @DisplayName("should only create tables once across multiple calls")
+        void ensureSchema_idempotent() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.getQuota(TENANT_ID);
+            sut.getQuota(TENANT_ID);
+
+            // Statement.execute called only 2 times (for the 2 CREATE TABLE statements)
+            verify(statement, times(2)).execute(anyString());
+        }
+
+        /**
+         * Schema init runs before every method and takes a connection, so on a database
+         * unreachable since startup this — not the method the caller invoked — is where
+         * the outage surfaces. A plain {@code RuntimeException} here slipped past
+         * {@code TenantQuotaService}'s gates, which match the refusal type, and left
+         * that window answering an opaque 500 while the same outage a moment later
+         * answered 503.
+         */
+        @Test
+        @DisplayName("should refuse as an accounting outage when schema creation fails")
+        void ensureSchema_failsWithSQLException() throws Exception {
+            when(connection.createStatement()).thenThrow(new SQLException("DB down"));
+
+            var thrown = assertThrows(QuotaAccountingUnavailableException.class, () -> sut.getQuota(TENANT_ID));
+
+            assertInstanceOf(SQLException.class, thrown.getCause(),
+                    "a schema failure is unreadable without the driver's own stack");
+        }
+    }
+
+    // ─── getQuota ──────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("getQuota")
+    class GetQuota {
+
+        @Test
+        @DisplayName("should return TenantQuota when found")
+        void getQuota_found() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getString("tenant_id")).thenReturn(TENANT_ID);
+            when(resultSet.getInt("max_conversations_per_day")).thenReturn(100);
+            when(resultSet.getInt("max_agents_per_tenant")).thenReturn(5);
+            when(resultSet.getInt("max_api_calls_per_minute")).thenReturn(60);
+            when(resultSet.getDouble("max_monthly_cost_usd")).thenReturn(500.0);
+            when(resultSet.getBoolean("enabled")).thenReturn(true);
+
+            TenantQuota quota = sut.getQuota(TENANT_ID);
+
+            assertNotNull(quota);
+            assertEquals(TENANT_ID, quota.tenantId());
+            assertEquals(100, quota.maxConversationsPerDay());
+            assertEquals(5, quota.maxAgentsPerTenant());
+            assertEquals(60, quota.maxApiCallsPerMinute());
+            assertEquals(500.0, quota.maxMonthlyCostUsd());
+            assertTrue(quota.enabled());
+        }
+
+        @Test
+        @DisplayName("should return null when not found")
+        void getQuota_notFound() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            TenantQuota quota = sut.getQuota(TENANT_ID);
+
+            assertNull(quota);
+        }
+
+        /**
+         * Finding f2-01. This used to assert {@code null}, i.e. fail-open — and
+         * {@code null} from {@code getQuota} means "no quota configured", which
+         * {@code TenantQuotaService} treats as unlimited. So one outage produced two
+         * opposite policies depending on which call happened to fail first: the read
+         * silently switched enforcement off for every tenant, the write refused with an
+         * honest 503. The read runs first at every gate, so fail-open won in practice
+         * and the write-side refusal was mostly unreachable.
+         */
+        @Test
+        @DisplayName("should refuse honestly, not fail open, on SQLException")
+        void getQuota_sqlException() throws Exception {
+            // After schema init, the second getConnection call throws
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // for ensureSchema
+                    .thenThrow(new SQLException("connection error"));
+
+            var thrown = assertThrows(QuotaAccountingUnavailableException.class, () -> sut.getQuota(TENANT_ID));
+
+            assertEquals(ITenantQuotaStore.ACCOUNTING_UNAVAILABLE, thrown.getMessage(),
+                    "the same reason MongoTenantQuotaStore gives, so the 503 body is identical on both backends");
+            assertInstanceOf(SQLException.class, thrown.getCause(), "the driver exception stays attached");
+        }
+    }
+
+    // ─── setQuota ──────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("setQuota")
+    class SetQuota {
+
+        @Test
+        @DisplayName("should upsert quota configuration")
+        void setQuota_success() throws Exception {
+            TenantQuota quota = new TenantQuota(TENANT_ID, 100, 5, 60, 500.0, true);
+            when(preparedStatement.executeUpdate()).thenReturn(1);
+
+            sut.setQuota(quota);
+
+            verify(preparedStatement).setString(1, TENANT_ID);
+            verify(preparedStatement).setInt(2, 100);
+            verify(preparedStatement).setInt(3, 5);
+            verify(preparedStatement).setInt(4, 60);
+            verify(preparedStatement).setDouble(5, 500.0);
+            verify(preparedStatement).setBoolean(6, true);
+            verify(preparedStatement).executeUpdate();
+        }
+
+        @Test
+        @DisplayName("should handle SQL exception gracefully")
+        void setQuota_sqlException() throws Exception {
+            TenantQuota quota = new TenantQuota(TENANT_ID, 100, 5, 60, 500.0, true);
+            // After schema init, the second getConnection call throws
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("write error"));
+
+            assertDoesNotThrow(() -> sut.setQuota(quota));
+        }
+    }
+
+    // ─── listQuotas ────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("listQuotas")
+    class ListQuotas {
+
+        @Test
+        @DisplayName("should return empty list when no quotas")
+        void listQuotas_empty() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            List<TenantQuota> result = sut.listQuotas();
+
+            assertNotNull(result);
+            assertTrue(result.isEmpty());
+        }
+
+        @Test
+        @DisplayName("should return multiple quotas")
+        void listQuotas_multiple() throws Exception {
+            when(resultSet.next()).thenReturn(true, true, false);
+            when(resultSet.getString("tenant_id")).thenReturn("t1", "t2");
+            when(resultSet.getInt("max_conversations_per_day")).thenReturn(10, 20);
+            when(resultSet.getInt("max_agents_per_tenant")).thenReturn(-1, -1);
+            when(resultSet.getInt("max_api_calls_per_minute")).thenReturn(-1, -1);
+            when(resultSet.getDouble("max_monthly_cost_usd")).thenReturn(-1.0, -1.0);
+            when(resultSet.getBoolean("enabled")).thenReturn(true, false);
+
+            List<TenantQuota> result = sut.listQuotas();
+
+            assertEquals(2, result.size());
+            assertEquals("t1", result.get(0).tenantId());
+            assertEquals("t2", result.get(1).tenantId());
+        }
+
+        @Test
+        @DisplayName("should return empty list on SQL exception")
+        void listQuotas_sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("read error"));
+
+            List<TenantQuota> result = sut.listQuotas();
+
+            assertNotNull(result);
+            assertTrue(result.isEmpty());
+        }
+    }
+
+    // ─── deleteQuota ───────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("deleteQuota")
+    class DeleteQuota {
+
+        @Test
+        @DisplayName("should delete from both tables in a transaction")
+        void deleteQuota_success() throws Exception {
+            when(preparedStatement.executeUpdate()).thenReturn(1);
+
+            sut.deleteQuota(TENANT_ID);
+
+            verify(connection).setAutoCommit(false);
+            // Two delete statements
+            verify(preparedStatement, times(2)).setString(1, TENANT_ID);
+            verify(preparedStatement, times(2)).executeUpdate();
+            verify(connection).commit();
+            verify(connection).setAutoCommit(true);
+        }
+
+        @Test
+        @DisplayName("should rollback on inner SQL exception")
+        void deleteQuota_rollbackOnFailure() throws Exception {
+            // First executeUpdate succeeds, second fails
+            when(preparedStatement.executeUpdate())
+                    .thenReturn(1)
+                    .thenThrow(new SQLException("delete failed"));
+
+            assertDoesNotThrow(() -> sut.deleteQuota(TENANT_ID));
+
+            verify(connection).rollback();
+            verify(connection).setAutoCommit(true);
+        }
+
+        @Test
+        @DisplayName("should handle outer connection exception gracefully")
+        void deleteQuota_connectionException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("connection refused"));
+
+            assertDoesNotThrow(() -> sut.deleteQuota(TENANT_ID));
+        }
+    }
+
+    // ─── tryIncrementConversations ─────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("tryIncrementConversations")
+    class TryIncrementConversations {
+
+        @Test
+        @DisplayName("should return OK immediately when limit < 0 (unlimited)")
+        void unlimited() {
+            QuotaCheckResult result = sut.tryIncrementConversations(TENANT_ID, -1);
+
+            assertEquals(QuotaCheckResult.OK, result);
+        }
+
+        @Test
+        @DisplayName("should return OK when atomic increment succeeds within window")
+        void withinLimit() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getInt(1)).thenReturn(5);
+
+            QuotaCheckResult result = sut.tryIncrementConversations(TENANT_ID, 10);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should fallback to upsert and return OK when window is stale and under limit")
+        void staleWindowReset() throws Exception {
+            // First query (atomic increment) returns no rows
+            ResultSet rs1 = mock(ResultSet.class);
+            when(rs1.next()).thenReturn(false);
+
+            // Second query (upsert) returns rows under limit
+            ResultSet rs2 = mock(ResultSet.class);
+            when(rs2.next()).thenReturn(true);
+            when(rs2.getInt(1)).thenReturn(1);
+
+            PreparedStatement ps1 = mock(PreparedStatement.class);
+            when(ps1.executeQuery()).thenReturn(rs1);
+
+            PreparedStatement ps2 = mock(PreparedStatement.class);
+            when(ps2.executeQuery()).thenReturn(rs2);
+
+            // Schema init connection
+            Connection schemaConn = mock(Connection.class);
+            when(schemaConn.createStatement()).thenReturn(statement);
+
+            // Operation connection
+            Connection opConn = mock(Connection.class);
+            when(opConn.prepareStatement(anyString())).thenReturn(ps1, ps2);
+
+            when(dataSource.getConnection()).thenReturn(schemaConn, opConn);
+
+            QuotaCheckResult result = sut.tryIncrementConversations(TENANT_ID, 10);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should return denied when limit is reached")
+        void limitReached() throws Exception {
+            // At the limit with a current window BOTH conditional increments miss:
+            // `conversations_today < limit` is false, and the materialise-or-roll
+            // statement is a no-op because the window has not expired.
+            when(resultSet.next()).thenReturn(false);
+
+            QuotaCheckResult result = sut.tryIncrementConversations(TENANT_ID, 10);
+
+            assertFalse(result.allowed());
+            assertNotNull(result.reason());
+            assertTrue(result.reason().contains("10"));
+        }
+
+        @Test
+        @DisplayName("the materialise-or-roll statement must be guarded by an expired day window")
+        void rollStatementGuardedByExpiredWindow() throws Exception {
+            // Structural guard. The at-limit *behaviour* cannot be observed through a
+            // mocked JDBC layer — whether the DO UPDATE fires is decided by Postgres,
+            // not by this code — so the behavioural proof lives in
+            // TenantQuotaStoreParityTest. What IS observable here is the clause that
+            // makes the difference: without it a row whose window is still current is
+            // rewritten and reported as an acquisition, and the daily cap never binds.
+            when(resultSet.next()).thenReturn(false);
+
+            sut.tryIncrementConversations(TENANT_ID, 10);
+
+            String upsert = capturedStatement(connection, "ON CONFLICT (tenant_id) DO UPDATE");
+            assertTrue(upsert.contains("WHERE tenant_usage.day_start <"),
+                    "materialise-or-roll must skip a current window, was: " + upsert);
+            assertTrue(upsert.contains("conversations_today = 0"),
+                    "the roll must reset to zero and let the increment statement do the counting, was: " + upsert);
+        }
+
+        /**
+         * Finding m3. The fast path matched the window with {@code day_start = ?}, so a
+         * stored window that is <em>ahead</em> of the caller's clock was unmatchable in
+         * every direction: the fast path missed (M+1 != M), the materialise-or-roll
+         * missed (its guard is {@code stored < now}), and the retry missed — so a node
+         * whose clock stepped backwards (NTP correction, VM suspend/resume) or lagged
+         * another instance by a minute denied every single request with "limit reached"
+         * until wall-clock time caught up. MongoDB's equivalent predicate is
+         * {@code gte} and allowed the same request.
+         */
+        @Test
+        @DisplayName("the fast-path window match tolerates a stored window ahead of this node's clock")
+        void fastPathWindowMatchIsInclusive() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.tryIncrementConversations(TENANT_ID, 10);
+
+            String increment = capturedStatement(connection, "conversations_today = conversations_today + 1");
+            assertTrue(increment.contains("day_start >= ?"),
+                    "an exact match denies every request on a clock-skewed node, was: " + increment);
+        }
+
+        /**
+         * The cost of finding m3's fix, pinned so it is a decision rather than a
+         * surprise.
+         * <p>
+         * The fast path now counts into a window that is <em>ahead</em> of this node's
+         * clock ({@code day_start >= ?}), while the materialise-or-roll still only ever
+         * moves a window <em>forward</em> ({@code tenant_usage.day_start < ?}). For
+         * ordinary skew that is exactly right — a window an instant ahead is the
+         * current window, and MongoDB has always treated it that way. For a row whose
+         * {@code day_start} is far in the future (a corrupted or badly skewed write)
+         * the two clauses combine into a trap: the counter is incremented but never
+         * reset, so once it reaches the limit the tenant sits at "Daily conversation
+         * limit reached" until wall-clock time passes the stored date.
+         * <p>
+         * That is still strictly better than the old behaviour, which denied
+         * <em>immediately</em> on any future window rather than only after the limit
+         * was spent, and it matches the MongoDB backend. But it is a new failure mode,
+         * so both halves are asserted together: change either clause in isolation and
+         * this test says which invariant moved.
+         */
+        @Test
+        @DisplayName("a window ahead of the clock is counted into, and is never rolled backwards")
+        void aFutureWindowIsCountedIntoButNeverRolledBack() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.tryIncrementConversations(TENANT_ID, 10);
+
+            String increment = capturedStatement(connection, "conversations_today = conversations_today + 1");
+            String upsert = capturedStatement(connection, "ON CONFLICT (tenant_id) DO UPDATE");
+
+            assertTrue(increment.contains("day_start >= ?"),
+                    "a future window is treated as current and counted into, was: " + increment);
+            assertTrue(upsert.contains("WHERE tenant_usage.day_start < ?"),
+                    "and it is never rolled back, so the counter it holds is never reset, was: " + upsert);
+        }
+
+        /**
+         * Finding 18. Still fail-closed on a store error — a lost increment silently
+         * voids a limit that IS configured — but the reason must not be "Daily
+         * conversation limit reached (10)". That told the caller a 429 with
+         * {@code Retry-After} for what is an infrastructure fault and spiked the
+         * denied-counter metric as if the tenant were over quota.
+         */
+        @Test
+        @DisplayName("a SQL exception denies with an accounting-unavailable reason, not a fake limit breach")
+        void sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db error"));
+
+            QuotaCheckResult result = sut.tryIncrementConversations(TENANT_ID, 10);
+
+            assertFalse(result.allowed());
+            assertEquals(PostgresTenantQuotaStore.ACCOUNTING_UNAVAILABLE, result.reason());
+            assertFalse(result.reason().contains("Daily conversation limit"),
+                    "an outage must be distinguishable from a tenant that is genuinely over quota");
+            // Wording alone is not a signal anything reads: without the flag this
+            // still incremented eddi.tenant.quota.denied and answered 429 with
+            // Retry-After: 60, exactly like an exhausted allowance.
+            assertTrue(result.accountingUnavailable(),
+                    "the refusal must be machine-distinguishable, not just differently worded");
+        }
+    }
+
+    // ─── tryIncrementApiCalls ──────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("tryIncrementApiCalls")
+    class TryIncrementApiCalls {
+
+        @Test
+        @DisplayName("should return OK when limit < 0 (unlimited)")
+        void unlimited() {
+            QuotaCheckResult result = sut.tryIncrementApiCalls(TENANT_ID, -1);
+
+            assertEquals(QuotaCheckResult.OK, result);
+        }
+
+        @Test
+        @DisplayName("should return OK when atomic increment succeeds")
+        void withinLimit() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getInt(1)).thenReturn(3);
+
+            QuotaCheckResult result = sut.tryIncrementApiCalls(TENANT_ID, 60);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should return denied when rate limit reached")
+        void limitReached() throws Exception {
+            // See TryIncrementConversations.limitReached — at the limit with a current
+            // window both conditional increments miss and the roll is a no-op.
+            when(resultSet.next()).thenReturn(false);
+
+            QuotaCheckResult result = sut.tryIncrementApiCalls(TENANT_ID, 60);
+
+            assertFalse(result.allowed());
+            assertTrue(result.reason().contains("60/min"));
+        }
+
+        @Test
+        @DisplayName("the materialise-or-roll statement must be guarded by an expired minute window")
+        void rollStatementGuardedByExpiredWindow() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.tryIncrementApiCalls(TENANT_ID, 60);
+
+            String upsert = capturedStatement(connection, "ON CONFLICT (tenant_id) DO UPDATE");
+            assertTrue(upsert.contains("WHERE tenant_usage.minute_start <"),
+                    "materialise-or-roll must skip a current window, was: " + upsert);
+            assertTrue(upsert.contains("api_calls_this_minute = 0"),
+                    "the roll must reset to zero and let the increment statement do the counting, was: " + upsert);
+        }
+
+        /**
+         * The per-minute twin of
+         * {@code TryIncrementConversations.fastPathWindowMatchIsInclusive} — finding m3
+         * relaxed both predicates but only the daily one was fenced. This is the one
+         * that bites first: a minute of clock skew between two instances is ordinary,
+         * and with an exact match the lagging node denied every {@code say} with "API
+         * rate limit reached" until wall-clock time caught up.
+         */
+        @Test
+        @DisplayName("the fast-path window match tolerates a stored minute window ahead of this node's clock")
+        void fastPathWindowMatchIsInclusive() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            sut.tryIncrementApiCalls(TENANT_ID, 60);
+
+            String increment = capturedStatement(connection, "api_calls_this_minute = api_calls_this_minute + 1");
+            assertTrue(increment.contains("minute_start >= ?"),
+                    "an exact match denies every request on a clock-skewed node, was: " + increment);
+        }
+
+        /** See {@code TryIncrementConversations.sqlException} — finding 18. */
+        @Test
+        @DisplayName("a SQL exception denies with an accounting-unavailable reason, not a fake rate-limit breach")
+        void sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db error"));
+
+            QuotaCheckResult result = sut.tryIncrementApiCalls(TENANT_ID, 10);
+
+            assertFalse(result.allowed());
+            assertEquals(PostgresTenantQuotaStore.ACCOUNTING_UNAVAILABLE, result.reason());
+            assertFalse(result.reason().contains("API rate limit"),
+                    "an outage must be distinguishable from a tenant that is genuinely over quota");
+            assertTrue(result.accountingUnavailable(),
+                    "the refusal must be machine-distinguishable, not just differently worded");
+        }
+    }
+
+    // ─── tryAddCost ────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("tryAddCost")
+    class TryAddCost {
+
+        @Test
+        @DisplayName("should return OK when cost is within budget")
+        void withinBudget() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getDouble(1)).thenReturn(50.0);
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, 100.0);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should return denied when cost exceeds budget")
+        void overBudget() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getDouble(1)).thenReturn(150.0);
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, 100.0);
+
+            assertFalse(result.allowed());
+            assertTrue(result.reason().contains("Monthly cost budget exceeded"));
+        }
+
+        @Test
+        @DisplayName("should return denied at exactly the limit, matching checkCostBudget")
+        void exactlyAtLimit() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getDouble(1)).thenReturn(100.0);
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, 100.0);
+
+            // TenantQuotaService.checkCostBudget denies on `currentCost >= limit`, so
+            // post-call accounting must use >= too or the two disagree at the boundary.
+            assertFalse(result.allowed(), "at exactly the limit the budget is spent");
+        }
+
+        @Test
+        @DisplayName("should return OK when limit is negative (unlimited)")
+        void unlimitedBudget() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getDouble(1)).thenReturn(9999.0);
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, -1.0);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should return OK when no rows returned (new month)")
+        void noRowsReturned() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, 100.0);
+
+            assertTrue(result.allowed());
+        }
+
+        @Test
+        @DisplayName("should fail closed (deny) on SQL exception — safety measure")
+        void failClosed() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db crash"));
+
+            QuotaCheckResult result = sut.tryAddCost(TENANT_ID, 10.0, 100.0);
+
+            assertFalse(result.allowed());
+            // Both fields, and the shared constant rather than a substring of a
+            // wording private to this gate. reason() reaches the client verbatim
+            // (ConversationService builds the 503 body from it), so a cost outage that
+            // reads differently from a conversation outage is the same outage
+            // described two ways. The substring assertion could not see that.
+            assertTrue(result.accountingUnavailable(),
+                    "503 quota_accounting_unavailable, not 429 quota_exceeded: nothing is over a limit");
+            assertEquals(PostgresTenantQuotaStore.ACCOUNTING_UNAVAILABLE, result.reason(),
+                    "the same reason MongoTenantQuotaStore gives, so parity holds on the wire too");
+        }
+    }
+
+    // ─── getUsage ──────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("getUsage")
+    class GetUsage {
+
+        @Test
+        @DisplayName("should return snapshot when tenant has usage data")
+        void usageFound() throws Exception {
+            // Windows in the CURRENT period — the fixture used to hold 1000L/2000L,
+            // millis in 1970, i.e. windows that expired half a century ago, which the
+            // read now zeroes out. "Now" is pinned rather than taken from the wall
+            // clock: with a system-clock store, a minute (or midnight UTC) rolling
+            // between the stub and the read would expire the window this test declares
+            // current and fail it at random.
+            Instant now = Instant.parse("2026-03-04T12:00:30Z");
+            var pinned = new PostgresTenantQuotaStore(dataSourceInstance, Clock.fixed(now, ZoneOffset.UTC));
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getInt("conversations_today")).thenReturn(5);
+            when(resultSet.getInt("api_calls_this_minute")).thenReturn(3);
+            when(resultSet.getDouble("monthly_cost_usd")).thenReturn(42.0);
+            when(resultSet.getLong("minute_start")).thenReturn(now.truncatedTo(ChronoUnit.MINUTES).toEpochMilli());
+            when(resultSet.getLong("day_start")).thenReturn(now.truncatedTo(ChronoUnit.DAYS).toEpochMilli());
+            when(resultSet.getString("cost_month")).thenReturn(YearMonth.from(now.atOffset(ZoneOffset.UTC)).toString());
+
+            UsageSnapshot snapshot = pinned.getUsage(TENANT_ID);
+
+            assertNotNull(snapshot);
+            assertEquals(TENANT_ID, snapshot.tenantId());
+            assertEquals(5, snapshot.conversationsToday());
+            assertEquals(3, snapshot.apiCallsThisMinute());
+            assertEquals(42.0, snapshot.monthlyCostUsd());
+        }
+
+        /**
+         * Finding 14. {@code ITenantQuotaStore.getUsage} documents that the snapshot
+         * "reflects current-window values only", and enforcement does roll the windows
+         * — but this read did not, so
+         * {@code GET /administration/quotas/&#123;id&#125;/usage} showed yesterday's
+         * {@code conversationsToday} and the last active minute's
+         * {@code apiCallsThisMinute} until the next increment happened to roll them. An
+         * operator saw a tenant "at its daily limit" the morning after while the very
+         * next request would have been allowed.
+         */
+        @Test
+        @DisplayName("expired windows read as zero, and the stored row is left untouched")
+        void expiredWindowsAreZeroedOnRead() throws Exception {
+            Instant now = Instant.parse("2026-03-04T12:00:30Z");
+            var pinned = new PostgresTenantQuotaStore(dataSourceInstance, Clock.fixed(now, ZoneOffset.UTC));
+
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getInt("conversations_today")).thenReturn(5);
+            when(resultSet.getInt("api_calls_this_minute")).thenReturn(3);
+            when(resultSet.getDouble("monthly_cost_usd")).thenReturn(42.0);
+            when(resultSet.getLong("minute_start")).thenReturn(Instant.parse("2026-03-04T11:59:00Z").toEpochMilli());
+            when(resultSet.getLong("day_start")).thenReturn(Instant.parse("2026-03-03T00:00:00Z").toEpochMilli());
+            when(resultSet.getString("cost_month")).thenReturn("2026-02");
+
+            UsageSnapshot snapshot = pinned.getUsage(TENANT_ID);
+
+            assertEquals(0, snapshot.conversationsToday(), "yesterday's daily counter is not today's");
+            assertEquals(0, snapshot.apiCallsThisMinute(), "the previous minute's rate counter is not this minute's");
+            assertEquals(0.0, snapshot.monthlyCostUsd(), "last month's spend is not this month's");
+            // A read must not write: the window starts are reported as stored so the
+            // caller can still see when the counters were last touched.
+            assertEquals(Instant.parse("2026-03-03T00:00:00Z"), snapshot.dayStart());
+            verify(preparedStatement, never()).executeUpdate();
+        }
+
+        @Test
+        @DisplayName("should return empty snapshot when no usage data")
+        void usageNotFound() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            UsageSnapshot snapshot = sut.getUsage(TENANT_ID);
+
+            assertNotNull(snapshot);
+            assertEquals(TENANT_ID, snapshot.tenantId());
+            assertEquals(0, snapshot.conversationsToday());
+        }
+
+        @Test
+        @DisplayName("should handle null cost_month in result set")
+        void nullCostMonth() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getInt("conversations_today")).thenReturn(1);
+            when(resultSet.getInt("api_calls_this_minute")).thenReturn(0);
+            when(resultSet.getDouble("monthly_cost_usd")).thenReturn(0.0);
+            when(resultSet.getLong("minute_start")).thenReturn(1000L);
+            when(resultSet.getLong("day_start")).thenReturn(2000L);
+            when(resultSet.getString("cost_month")).thenReturn(null);
+
+            UsageSnapshot snapshot = sut.getUsage(TENANT_ID);
+
+            assertNotNull(snapshot);
+            assertNotNull(snapshot.costMonth());
+        }
+
+        @Test
+        @DisplayName("should return empty snapshot on SQL exception")
+        void sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db error"));
+
+            UsageSnapshot snapshot = sut.getUsage(TENANT_ID);
+
+            assertNotNull(snapshot);
+            assertEquals(TENANT_ID, snapshot.tenantId());
+            assertEquals(0, snapshot.conversationsToday());
+        }
+    }
+
+    // ─── getMonthlyCost ────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("getMonthlyCost")
+    class GetMonthlyCost {
+
+        @Test
+        @DisplayName("should return cost when current month matches")
+        void currentMonthMatch() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getString("cost_month")).thenReturn(YearMonth.now(ZoneOffset.UTC).toString());
+            when(resultSet.getDouble("monthly_cost_usd")).thenReturn(123.45);
+
+            double cost = sut.getMonthlyCost(TENANT_ID);
+
+            assertEquals(123.45, cost);
+        }
+
+        @Test
+        @DisplayName("should return 0.0 when month is stale")
+        void staleMonth() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getString("cost_month")).thenReturn("2020-01");
+            when(resultSet.getDouble("monthly_cost_usd")).thenReturn(99.0);
+
+            double cost = sut.getMonthlyCost(TENANT_ID);
+
+            assertEquals(0.0, cost);
+        }
+
+        @Test
+        @DisplayName("should return 0.0 when cost_month is null")
+        void nullCostMonth() throws Exception {
+            when(resultSet.next()).thenReturn(true);
+            when(resultSet.getString("cost_month")).thenReturn(null);
+
+            double cost = sut.getMonthlyCost(TENANT_ID);
+
+            assertEquals(0.0, cost);
+        }
+
+        @Test
+        @DisplayName("should return 0.0 when no row found")
+        void noRow() throws Exception {
+            when(resultSet.next()).thenReturn(false);
+
+            double cost = sut.getMonthlyCost(TENANT_ID);
+
+            assertEquals(0.0, cost);
+        }
+
+        @Test
+        @DisplayName("should return 0.0 on SQL exception")
+        void sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db error"));
+
+            double cost = sut.getMonthlyCost(TENANT_ID);
+
+            assertEquals(0.0, cost);
+        }
+    }
+
+    // ─── resetUsage ────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("resetUsage")
+    class ResetUsage {
+
+        @Test
+        @DisplayName("should delete usage row for tenant")
+        void resetUsage_success() throws Exception {
+            when(preparedStatement.executeUpdate()).thenReturn(1);
+
+            sut.resetUsage(TENANT_ID);
+
+            verify(preparedStatement).setString(1, TENANT_ID);
+            verify(preparedStatement).executeUpdate();
+        }
+
+        @Test
+        @DisplayName("should handle SQL exception gracefully")
+        void resetUsage_sqlException() throws Exception {
+            when(dataSource.getConnection())
+                    .thenReturn(connection) // schema init
+                    .thenThrow(new SQLException("db error"));
+
+            assertDoesNotThrow(() -> sut.resetUsage(TENANT_ID));
+        }
+    }
+
+    // ─── Bootstrap ──────────────────────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("Bootstrap (CDI constructor)")
+    class Bootstrap {
+
+        @Test
+        @DisplayName("should bootstrap default quota via atomic INSERT ON CONFLICT DO NOTHING")
+        void bootstrapsAtomically() throws Exception {
+            // executeUpdate returns 1 (row was inserted — no prior quota existed)
+            when(preparedStatement.executeUpdate()).thenReturn(1);
+            // getQuota after bootstrap returns no rows (the bootstrap INSERT used a
+            // different PS)
+            when(resultSet.next()).thenReturn(false);
+
+            var bootstrapStore = new PostgresTenantQuotaStore(
+                    dataSourceInstance, "default", false, -1, -1, -1, -1.0);
+
+            // Trigger ensureSchema + bootstrap
+            bootstrapStore.getQuota("any");
+
+            // CREATE TABLE x2 + bootstrap INSERT + getQuota SELECT
+            verify(statement, times(2)).execute(anyString());
+            verify(preparedStatement, atLeastOnce()).executeUpdate();
+
+            // Assert the bootstrap used ON CONFLICT DO NOTHING (not DO UPDATE)
+            org.mockito.ArgumentCaptor<String> sqlCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
+            verify(connection, atLeastOnce()).prepareStatement(sqlCaptor.capture());
+            assertTrue(sqlCaptor.getAllValues().stream()
+                    .anyMatch(sql -> sql.contains("ON CONFLICT (tenant_id) DO NOTHING")));
+        }
+
+        /**
+         * Finding 17 on the PostgreSQL side. {@code ON CONFLICT DO NOTHING} means the
+         * properties take effect exactly once, on the first start against an empty
+         * database; an operator who later enables quotas or raises a limit by
+         * environment variable and redeploys changes nothing. The {@code inserted == 0}
+         * branch is what tells them so, and it happened to run in
+         * {@link #bootstrapsAtomically} only because Mockito's default
+         * {@code executeUpdate()} is 0 — nothing verified the extra SELECT or the
+         * comparison, so the whole branch could have been deleted silently.
+         */
+        @Test
+        @DisplayName("an existing row is re-read and compared against the configured properties")
+        void warnsWhenAStoredRowAlreadyExists() throws Exception {
+            // 0 rows inserted — ON CONFLICT DO NOTHING fired, the row was already there.
+            when(preparedStatement.executeUpdate()).thenReturn(0);
+            // First next() answers the bootstrap re-read; the second answers the
+            // getQuota("any") call that triggers ensureSchema.
+            when(resultSet.next()).thenReturn(true, false);
+            when(resultSet.getString("tenant_id")).thenReturn("default");
+            when(resultSet.getInt("max_conversations_per_day")).thenReturn(25);
+            when(resultSet.getInt("max_agents_per_tenant")).thenReturn(3);
+            when(resultSet.getInt("max_api_calls_per_minute")).thenReturn(7);
+            when(resultSet.getDouble("max_monthly_cost_usd")).thenReturn(12.5);
+            when(resultSet.getBoolean("enabled")).thenReturn(false);
+
+            try (MockedStatic<TenantQuotaBootstrapCheck> check = mockStatic(TenantQuotaBootstrapCheck.class)) {
+                var bootstrapStore = new PostgresTenantQuotaStore(
+                        dataSourceInstance, "default", true, 1000, 5, 60, 100.0);
+                bootstrapStore.getQuota("any");
+
+                ArgumentCaptor<TenantQuota> stored = ArgumentCaptor.forClass(TenantQuota.class);
+                ArgumentCaptor<TenantQuota> configured = ArgumentCaptor.forClass(TenantQuota.class);
+                check.verify(() -> TenantQuotaBootstrapCheck.warnIfStoredQuotaDiffersFromConfig(
+                        stored.capture(), configured.capture()));
+
+                assertEquals(new TenantQuota("default", 25, 3, 7, 12.5, false), stored.getValue(),
+                        "the stored row must be re-read with the same column names the INSERT writes");
+                assertEquals(new TenantQuota("default", 1000, 5, 60, 100.0, true), configured.getValue(),
+                        "and compared against what eddi.tenant.quota.* asks for");
+            }
+
+            assertEquals("SELECT * FROM tenant_quotas WHERE tenant_id = ?",
+                    capturedStatement(connection, "SELECT * FROM tenant_quotas"),
+                    "the divergence check needs the row, so the branch costs one extra SELECT per start");
+        }
+
+        /**
+         * The first-boot half: the INSERT applied the properties, so there is nothing
+         * to tell the operator.
+         */
+        @Test
+        @DisplayName("a genuine first boot does not run the divergence check")
+        void silentOnFirstBoot() throws Exception {
+            when(preparedStatement.executeUpdate()).thenReturn(1);
+            when(resultSet.next()).thenReturn(false);
+
+            try (MockedStatic<TenantQuotaBootstrapCheck> check = mockStatic(TenantQuotaBootstrapCheck.class)) {
+                var bootstrapStore = new PostgresTenantQuotaStore(
+                        dataSourceInstance, "default", true, 1000, 5, 60, 100.0);
+                bootstrapStore.getQuota("any");
+
+                check.verifyNoInteractions();
+            }
+        }
+    }
+}

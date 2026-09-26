@@ -1,0 +1,693 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.modules.templating.rest;
+
+import ai.labs.eddi.engine.security.spaces.ResourceAccessGuard;
+import ai.labs.eddi.configs.variables.GlobalVariableResolver;
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.engine.memory.IConversationMemory;
+import ai.labs.eddi.engine.memory.IConversationMemoryStore;
+import ai.labs.eddi.engine.memory.IMemoryItemConverter;
+import ai.labs.eddi.engine.memory.model.ConversationMemorySnapshot;
+import ai.labs.eddi.engine.security.ConversationAccessGuard;
+import ai.labs.eddi.modules.llm.impl.PromptSnippetService;
+import ai.labs.eddi.modules.templating.ITemplatingEngine;
+import io.quarkus.security.ForbiddenException;
+import jakarta.ws.rs.InternalServerErrorException;
+import jakarta.annotation.security.RolesAllowed;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Unit tests for {@link RestTemplatePreview}.
+ * <p>
+ * Covers: null/blank input handling, default sample data path, conversation
+ * memory loading, prompt snippet injection, variable flattening, template
+ * resolution errors, conversation not-found handling, and (A7) the
+ * per-conversation ownership gate on the real-data path.
+ */
+class RestTemplatePreviewTest {
+
+    private ITemplatingEngine templatingEngine;
+    private IConversationMemoryStore conversationMemoryStore;
+    private IMemoryItemConverter memoryItemConverter;
+    private PromptSnippetService promptSnippetService;
+    private ConversationAccessGuard conversationAccessGuard;
+    private ResourceAccessGuard resourceAccessGuard;
+    private GlobalVariableResolver globalVariableResolver;
+    private RestTemplatePreview restTemplatePreview;
+
+    @BeforeEach
+    void setUp() {
+        templatingEngine = mock(ITemplatingEngine.class);
+        conversationMemoryStore = mock(IConversationMemoryStore.class);
+        memoryItemConverter = mock(IMemoryItemConverter.class);
+        promptSnippetService = mock(PromptSnippetService.class);
+        conversationAccessGuard = mock(ConversationAccessGuard.class);
+        resourceAccessGuard = mock(ResourceAccessGuard.class);
+        when(promptSnippetService.getAll()).thenReturn(Map.of());
+        globalVariableResolver = mock(GlobalVariableResolver.class);
+        when(globalVariableResolver.getTemplateData()).thenReturn(Map.of());
+
+        restTemplatePreview = new RestTemplatePreview(
+                templatingEngine, conversationMemoryStore,
+                memoryItemConverter, promptSnippetService, conversationAccessGuard, resourceAccessGuard, globalVariableResolver);
+    }
+
+    // ==================== Global variables ====================
+
+    @Nested
+    class GlobalVariables {
+
+        @Test
+        @DisplayName("sample-data preview resolves {vars.*} from the deployment's global variables")
+        @SuppressWarnings("unchecked")
+        void sampleDataIncludesGlobalVariables() throws Exception {
+            when(globalVariableResolver.getTemplateData()).thenReturn(Map.of("default-model", "claude-sonnet-5"));
+            when(templatingEngine.processTemplate(anyString(), anyMap())).thenReturn("resolved");
+
+            var response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("{vars.default-model}", null));
+
+            assertNull(response.error());
+            assertTrue(response.availableVariables().contains("vars.default-model"), String.valueOf(response.availableVariables()));
+            verify(templatingEngine).processTemplate(eq("{vars.default-model}"),
+                    argThat(data -> Map.of("default-model", "claude-sonnet-5").equals(((Map<String, Object>) data).get("vars"))));
+        }
+
+        @Test
+        @DisplayName("vars already present in conversation data are not overwritten")
+        void conversationVarsWin() throws Exception {
+            var conversationData = new LinkedHashMap<String, Object>();
+            conversationData.put("vars", Map.of("default-model", "from-conversation"));
+            var snapshot = new ConversationMemorySnapshot();
+            snapshot.setConversationId("conv-1");
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-1")).thenReturn(snapshot);
+            when(memoryItemConverter.convert(any(IConversationMemory.class))).thenReturn(conversationData);
+            when(globalVariableResolver.getTemplateData()).thenReturn(Map.of("default-model", "global"));
+            when(templatingEngine.processTemplate(anyString(), anyMap())).thenReturn("resolved");
+
+            restTemplatePreview.previewTemplate(new TemplatePreviewRequest("{vars.default-model}", "conv-1"));
+
+            assertEquals(Map.of("default-model", "from-conversation"), conversationData.get("vars"));
+        }
+    }
+
+    // ==================== Null / Blank Input ====================
+
+    @Nested
+    class NullAndBlankInput {
+
+        @Test
+        void shouldReturnEmptyResponseForNullRequest() {
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(null);
+
+            assertEquals("", response.resolved());
+            assertTrue(response.availableVariables().isEmpty());
+            assertTrue(response.variableValues().isEmpty());
+            assertNull(response.error());
+        }
+
+        @Test
+        void shouldReturnEmptyResponseForNullTemplate() {
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest(null, null));
+
+            assertEquals("", response.resolved());
+            assertTrue(response.availableVariables().isEmpty());
+            assertNull(response.error());
+        }
+
+        @Test
+        void shouldReturnEmptyResponseForBlankTemplate() {
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("   ", null));
+
+            assertEquals("", response.resolved());
+            assertTrue(response.availableVariables().isEmpty());
+            assertNull(response.error());
+        }
+
+        @Test
+        void shouldReturnEmptyResponseForEmptyTemplate() {
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("", null));
+
+            assertEquals("", response.resolved());
+            assertNull(response.error());
+        }
+
+        @Test
+        void shouldNotCallTemplatingEngineForEmptyInput() throws Exception {
+            restTemplatePreview.previewTemplate(new TemplatePreviewRequest("", null));
+
+            verifyNoInteractions(templatingEngine);
+        }
+
+        @Test
+        void shouldNotCallTemplatingEngineForWhitespaceInput() throws Exception {
+            restTemplatePreview.previewTemplate(new TemplatePreviewRequest("   ", null));
+
+            verifyNoInteractions(templatingEngine);
+        }
+    }
+
+    // ==================== Default Sample Data ====================
+
+    @Nested
+    class DefaultSampleData {
+
+        @Test
+        void shouldUseDefaultDataWhenNoConversationId() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("resolved output");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("Hello {name}", null));
+
+            assertEquals("resolved output", response.resolved());
+            assertNull(response.error());
+            // Should never touch the memory store
+            verifyNoInteractions(conversationMemoryStore);
+        }
+
+        @Test
+        void shouldUseDefaultDataWhenConversationIdIsBlank() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("resolved");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("Hello", "   "));
+
+            assertEquals("resolved", response.resolved());
+            verifyNoInteractions(conversationMemoryStore);
+        }
+
+        @Test
+        void shouldProvideKnownSampleVariables() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("template", null));
+
+            List<String> vars = response.availableVariables();
+            // Verify key sample data paths are flattened
+            assertTrue(vars.contains("properties.userName"), "Should have properties.userName");
+            assertTrue(vars.contains("properties.language"), "Should have properties.language");
+            assertTrue(vars.contains("properties.email"), "Should have properties.email");
+            assertTrue(vars.contains("memory.current.input"), "Should have memory.current.input");
+            assertTrue(vars.contains("memory.current.actions"), "Should have memory.current.actions");
+            assertTrue(vars.contains("memory.last.input"), "Should have memory.last.input");
+            assertTrue(vars.contains("memory.last.output"), "Should have memory.last.output");
+            assertTrue(vars.contains("memory.past"), "Should have memory.past");
+            assertTrue(vars.contains("context.output"), "Should have context.output");
+            assertTrue(vars.contains("userInfo.userId"), "Should have userInfo.userId");
+            assertTrue(vars.contains("conversationInfo.conversationId"), "Should have conversationInfo.conversationId");
+            assertTrue(vars.contains("conversationInfo.agentId"), "Should have conversationInfo.agentId");
+            assertTrue(vars.contains("conversationInfo.agentVersion"), "Should have conversationInfo.agentVersion");
+            assertTrue(vars.contains("input"), "Should have top-level input");
+        }
+
+        @Test
+        void shouldPopulateVariableValuesForSampleData() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(new TemplatePreviewRequest("template", null));
+
+            Map<String, Object> values = response.variableValues();
+            assertEquals("Alice", values.get("properties.userName"));
+            assertEquals("en", values.get("properties.language"));
+            assertEquals("alice@example.com", values.get("properties.email"));
+            assertEquals("user-12345", values.get("userInfo.userId"));
+            assertEquals("conv-67890", values.get("conversationInfo.conversationId"));
+            assertEquals("agent-abc", values.get("conversationInfo.agentId"));
+            assertEquals("1", values.get("conversationInfo.agentVersion"));
+            assertEquals("What is my order status?", values.get("input"));
+        }
+    }
+
+    // ==================== Conversation Memory Loading ====================
+
+    @Nested
+    class ConversationMemoryLoading {
+
+        @Test
+        void shouldLoadRealConversationData() throws Exception {
+            var snapshot = new ConversationMemorySnapshot();
+            snapshot.setConversationId("conv-123");
+            snapshot.setAgentId("agent-1");
+            snapshot.setAgentVersion(1);
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-123"))
+                    .thenReturn(snapshot);
+
+            Map<String, Object> mockData = new LinkedHashMap<>();
+            mockData.put("properties", Map.of("foo", "bar"));
+            mockData.put("input", "hello");
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(mockData);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("resolved from real data");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{{properties.foo}}", "conv-123"));
+
+            assertEquals("resolved from real data", response.resolved());
+            assertNull(response.error());
+            verify(conversationMemoryStore).loadConversationMemorySnapshot("conv-123");
+        }
+
+        @Test
+        void shouldReturnErrorWhenConversationNotFound() throws Exception {
+            when(conversationMemoryStore.loadConversationMemorySnapshot("missing-conv"))
+                    .thenThrow(new IResourceStore.ResourceNotFoundException("Not found"));
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "missing-conv"));
+
+            assertNull(response.resolved());
+            assertNotNull(response.error());
+            assertTrue(response.error().contains("missing-conv"),
+                    "Error should reference the conversation ID");
+            assertTrue(response.availableVariables().isEmpty());
+        }
+
+        /**
+         * This used to assert that a store failure produced the same "conversation not
+         * found" response as a genuinely missing conversation — pinning behaviour that
+         * told an operator mid-outage to go looking for a conversation that was there
+         * all along. A store failure is now a server error, and the driver message
+         * stays in the log.
+         */
+        @Test
+        void shouldReportAStoreFailureAsAServerErrorRatherThanNotFound() throws Exception {
+            when(conversationMemoryStore.loadConversationMemorySnapshot("bad-conv"))
+                    .thenThrow(new IResourceStore.ResourceStoreException("DB error"));
+
+            var thrown = assertThrows(InternalServerErrorException.class, () -> restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "bad-conv")));
+
+            assertFalse(thrown.getMessage().toLowerCase().contains("not found"), thrown.getMessage());
+            assertFalse(thrown.getMessage().contains("DB error"),
+                    "the driver message must not reach the client: " + thrown.getMessage());
+            assertTrue(thrown.getMessage().contains("correlationId"), thrown.getMessage());
+        }
+
+        @Test
+        void shouldNotCallTemplatingEngineWhenConversationNotFound() throws Exception {
+            when(conversationMemoryStore.loadConversationMemorySnapshot("missing"))
+                    .thenThrow(new IResourceStore.ResourceNotFoundException("nope"));
+
+            restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "missing"));
+
+            verifyNoInteractions(templatingEngine);
+        }
+    }
+
+    // ==================== Prompt Snippet Injection ====================
+
+    @Nested
+    class PromptSnippetInjection {
+
+        @Test
+        void shouldInjectSnippetsIntoTemplateData() throws Exception {
+            Map<String, Object> snippets = Map.of("safety", "Always verify facts.");
+            when(promptSnippetService.getAll()).thenReturn(snippets);
+            // A caller who sees everything anyway gets the real contents.
+            when(resourceAccessGuard.seesEverything()).thenReturn(true);
+            when(templatingEngine.processTemplate(eq("{{snippets.safety}}"), anyMap()))
+                    .thenAnswer(inv -> {
+                        Map<String, Object> data = inv.getArgument(1);
+                        // Verify snippets are present in the data passed to the engine
+                        assertNotNull(data.get("snippets"), "snippets should be injected");
+                        return "Always verify facts.";
+                    });
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{{snippets.safety}}", null));
+
+            assertEquals("Always verify facts.", response.resolved());
+        }
+
+        @Test
+        void shouldIncludeSnippetKeysInAvailableVariables() throws Exception {
+            Map<String, Object> snippets = Map.of("greeting", "Hello!", "farewell", "Goodbye!");
+            when(promptSnippetService.getAll()).thenReturn(snippets);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", null));
+
+            List<String> vars = response.availableVariables();
+            assertTrue(vars.contains("snippets.greeting"), "Should list snippets.greeting");
+            assertTrue(vars.contains("snippets.farewell"), "Should list snippets.farewell");
+        }
+
+        @Test
+        @DisplayName("a restricted caller cannot read snippet contents back through their own template")
+        void shouldNotLeakSnippetContentsThroughTheRenderedTemplate() throws Exception {
+            // The exfiltration this guards against: the reference panel redacts snippet
+            // contents but hands out the NAMES, and the caller supplies the template. So
+            // redacting only the panel is no protection — one call lists the names, a
+            // second renders "{snippets.<name>}". The contents must be gone from the map
+            // the engine renders against, not just from the panel.
+            Map<String, Object> snippets = Map.of("victimSecret", "Bob's proprietary prompt.");
+            when(promptSnippetService.getAll()).thenReturn(snippets);
+            when(resourceAccessGuard.seesEverything()).thenReturn(false);
+
+            Map<String, Object> rendered = new LinkedHashMap<>();
+            when(templatingEngine.processTemplate(eq("{snippets.victimSecret}"), anyMap()))
+                    .thenAnswer(inv -> {
+                        rendered.putAll(inv.getArgument(1));
+                        return "irrelevant";
+                    });
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{snippets.victimSecret}", null));
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> renderedSnippets = (Map<String, Object>) rendered.get("snippets");
+            assertNotNull(renderedSnippets, "the key stays, so the preview can still say which references resolve");
+            assertTrue(renderedSnippets.containsKey("victimSecret"), "names are not the secret");
+            assertEquals("<redacted>", renderedSnippets.get("victimSecret"), "contents must not reach the engine");
+            assertEquals("<redacted>", response.variableValues().get("snippets.victimSecret"));
+        }
+
+        @Test
+        void shouldNotAddSnippetsKeyWhenSnippetsAreEmpty() throws Exception {
+            when(promptSnippetService.getAll()).thenReturn(Map.of());
+            when(templatingEngine.processTemplate(eq("test"), anyMap()))
+                    .thenAnswer(inv -> {
+                        Map<String, Object> data = inv.getArgument(1);
+                        assertNull(data.get("snippets"), "snippets key should not exist when empty");
+                        return "test";
+                    });
+
+            restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("test", null));
+        }
+    }
+
+    // ==================== Template Resolution ====================
+
+    @Nested
+    class TemplateResolution {
+
+        @Test
+        void shouldResolveTemplateWithSampleData() throws Exception {
+            when(templatingEngine.processTemplate(eq("Hello {properties.userName}!"), anyMap()))
+                    .thenReturn("Hello Alice!");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("Hello {properties.userName}!", null));
+
+            assertEquals("Hello Alice!", response.resolved());
+            assertNull(response.error());
+        }
+
+        @Test
+        void shouldReturnErrorOnTemplateEngineException() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenThrow(new ITemplatingEngine.TemplateEngineException(
+                            "Rendering error: missing key", null));
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{invalid.template}", null));
+
+            assertNull(response.resolved());
+            assertNotNull(response.error());
+            assertTrue(response.error().contains("Rendering error"));
+        }
+
+        @Test
+        void shouldStillReturnVariablesOnTemplateError() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenThrow(new ITemplatingEngine.TemplateEngineException("bad template", null));
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{broken}", null));
+
+            assertNotNull(response.error());
+            // Variables should still be populated for the reference panel
+            assertFalse(response.availableVariables().isEmpty(),
+                    "Variables should be returned even on template error");
+            assertFalse(response.variableValues().isEmpty(),
+                    "Variable values should be returned even on template error");
+        }
+
+        @Test
+        void shouldPassTemplateStringVerbatimToEngine() throws Exception {
+            String verbatimTemplate = "  \n{{complex.template}} with {{nested.values}}\n  ";
+            when(templatingEngine.processTemplate(eq(verbatimTemplate), anyMap()))
+                    .thenReturn("resolved");
+
+            restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest(verbatimTemplate, null));
+
+            verify(templatingEngine).processTemplate(eq(verbatimTemplate), anyMap());
+        }
+    }
+
+    // ==================== Variable Flattening ====================
+
+    @Nested
+    class VariableFlattening {
+
+        @Test
+        void shouldFlattenNestedMapsIntoDotPaths() throws Exception {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("level1", Map.of("level2", Map.of("leaf", "value")));
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-flat"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(data);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "conv-flat"));
+
+            assertTrue(response.availableVariables().contains("level1.level2.leaf"));
+            assertEquals("value", response.variableValues().get("level1.level2.leaf"));
+        }
+
+        @Test
+        void shouldTruncateLongStringValues() throws Exception {
+            String longString = "x".repeat(300);
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("longField", longString);
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-long"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(data);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "conv-long"));
+
+            String truncated = (String) response.variableValues().get("longField");
+            assertNotNull(truncated);
+            assertEquals(201, truncated.length(), "Should be exactly 200 chars + 1 ellipsis character");
+            assertTrue(truncated.startsWith("x".repeat(200)), "First 200 chars should be preserved");
+            assertTrue(truncated.endsWith("…"), "Should end with ellipsis");
+        }
+
+        @Test
+        void shouldShowListSizeInsteadOfContent() throws Exception {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("items", List.of("a", "b", "c"));
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-list"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(data);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "conv-list"));
+
+            assertEquals("3 items", response.variableValues().get("items"));
+        }
+
+        @Test
+        void shouldRespectMaxDepthLimit() throws Exception {
+            // Build a linear chain: a.b.c.d.e.f = "deepValue"
+            // maxDepth is 4, so flattening should stop at depth 4
+            Map<String, Object> level5 = new LinkedHashMap<>();
+            level5.put("f", "deepValue");
+            Map<String, Object> level4 = new LinkedHashMap<>();
+            level4.put("e", level5);
+            Map<String, Object> level3 = new LinkedHashMap<>();
+            level3.put("d", level4);
+            Map<String, Object> level2 = new LinkedHashMap<>();
+            level2.put("c", level3);
+            Map<String, Object> level1 = new LinkedHashMap<>();
+            level1.put("b", level2);
+            Map<String, Object> root = new LinkedHashMap<>();
+            root.put("a", level1);
+            // Also add a shallow key to verify it still works
+            root.put("shallow", "yes");
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-deep"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(root);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "conv-deep"));
+
+            List<String> vars = response.availableVariables();
+            // Shallow key always works
+            assertTrue(vars.contains("shallow"), "Shallow key should be present");
+            // Depth 4: a.b.c.d is at depth 4, but d holds a map (level4),
+            // so it would recurse into d—but that's the 4th recursion which
+            // hits maxDepth=0 and stops. So a.b.c.d won't appear as a leaf.
+            // Depth 3: a.b.c is at depth 3, d is a non-empty map at depth 4 → stops
+            // The 5th and 6th levels (a.b.c.d.e, a.b.c.d.e.f) must NOT appear
+            assertFalse(vars.contains("a.b.c.d.e.f"),
+                    "6-deep key must not appear (exceeds maxDepth)");
+            assertFalse(vars.contains("a.b.c.d.e"),
+                    "5-deep key must not appear (exceeds maxDepth)");
+        }
+
+        @Test
+        void shouldHandleEmptyMapCorrectly() throws Exception {
+            Map<String, Object> data = new LinkedHashMap<>();
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-empty"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(data);
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("template", "conv-empty"));
+
+            assertTrue(response.availableVariables().isEmpty());
+            assertTrue(response.variableValues().isEmpty());
+        }
+    }
+
+    // ==================== Integration-style ====================
+
+    @Nested
+    class EndToEnd {
+
+        @Test
+        void shouldCombineSnippetsAndConversationData() throws Exception {
+            // Real conversation data
+            Map<String, Object> convData = new LinkedHashMap<>();
+            convData.put("properties", Map.of("name", "Bob"));
+
+            when(conversationMemoryStore.loadConversationMemorySnapshot("conv-e2e"))
+                    .thenReturn(new ConversationMemorySnapshot());
+            when(memoryItemConverter.convert(any(IConversationMemory.class)))
+                    .thenReturn(convData);
+
+            // Snippets
+            when(promptSnippetService.getAll()).thenReturn(Map.of("tone", "formal"));
+
+            when(templatingEngine.processTemplate(eq("Hello {properties.name}, tone={snippets.tone}"), anyMap()))
+                    .thenReturn("Hello Bob, tone=formal");
+
+            TemplatePreviewResponse response = restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("Hello {properties.name}, tone={snippets.tone}", "conv-e2e"));
+
+            assertEquals("Hello Bob, tone=formal", response.resolved());
+            assertNull(response.error());
+
+            // Both conversation vars and snippet vars should appear
+            assertTrue(response.availableVariables().contains("properties.name"));
+            assertTrue(response.availableVariables().contains("snippets.tone"));
+        }
+
+        @Test
+        void shouldAlwaysCallPromptSnippetService() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap()))
+                    .thenReturn("ok");
+
+            restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("test", null));
+
+            verify(promptSnippetService).getAll();
+        }
+    }
+
+    // ==================== A7: conversation ownership ====================
+
+    @Nested
+    class ConversationOwnership {
+
+        @Test
+        void shouldRejectPreviewAgainstAForeignConversation() throws Exception {
+            when(conversationAccessGuard.requireExistingConversationOwner("someone-elses-conv"))
+                    .thenThrow(new ForbiddenException("Access denied: you do not own this conversation"));
+
+            assertThrows(ForbiddenException.class, () -> restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{properties.email}", "someone-elses-conv")));
+        }
+
+        @Test
+        void shouldNotLeakMemoryOrVariableValuesWhenOwnershipIsDenied() throws Exception {
+            when(conversationAccessGuard.requireExistingConversationOwner("someone-elses-conv"))
+                    .thenThrow(new ForbiddenException("Access denied: you do not own this conversation"));
+
+            assertThrows(ForbiddenException.class, () -> restTemplatePreview.previewTemplate(
+                    new TemplatePreviewRequest("{properties.email}", "someone-elses-conv")));
+
+            // Neither the snapshot nor the flattened variable dump may be produced
+            verifyNoInteractions(conversationMemoryStore);
+            verifyNoInteractions(memoryItemConverter);
+            verifyNoInteractions(templatingEngine);
+        }
+
+        @Test
+        void shouldCheckOwnershipBeforeLoadingTheSnapshot() throws Exception {
+            var snapshot = new ConversationMemorySnapshot();
+            when(conversationMemoryStore.loadConversationMemorySnapshot("own-conv")).thenReturn(snapshot);
+            when(memoryItemConverter.convert(any(IConversationMemory.class))).thenReturn(new LinkedHashMap<>());
+            when(templatingEngine.processTemplate(anyString(), anyMap())).thenReturn("ok");
+
+            restTemplatePreview.previewTemplate(new TemplatePreviewRequest("template", "own-conv"));
+
+            var order = inOrder(conversationAccessGuard, conversationMemoryStore);
+            order.verify(conversationAccessGuard).requireExistingConversationOwner("own-conv");
+            order.verify(conversationMemoryStore).loadConversationMemorySnapshot("own-conv");
+        }
+
+        @Test
+        void shouldNotGuardTheSampleDataPath() throws Exception {
+            when(templatingEngine.processTemplate(anyString(), anyMap())).thenReturn("ok");
+
+            restTemplatePreview.previewTemplate(new TemplatePreviewRequest("template", null));
+
+            verifyNoInteractions(conversationAccessGuard);
+        }
+    }
+
+    // ==================== A7: role gate ====================
+
+    @Test
+    void restInterfaceShouldBeRestrictedToAuthoringRoles() {
+        RolesAllowed roles = IRestTemplatePreview.class.getAnnotation(RolesAllowed.class);
+
+        assertNotNull(roles, "/administration/preview must not be role-less — it renders "
+                + "caller-supplied templates against real conversation memory");
+        assertEquals(List.of("eddi-admin", "eddi-editor"), List.of(roles.value()));
+    }
+}

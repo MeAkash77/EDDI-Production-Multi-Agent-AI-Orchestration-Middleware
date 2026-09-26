@@ -1,0 +1,175 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.triggermanagement.mongo;
+
+import ai.labs.eddi.engine.triggermanagement.IUserConversationStore;
+import ai.labs.eddi.datastore.IResourceStore;
+import ai.labs.eddi.datastore.IResourceStore.ResourceAlreadyExistsException;
+import ai.labs.eddi.datastore.serialization.IDocumentBuilder;
+import ai.labs.eddi.datastore.serialization.IJsonSerialization;
+import ai.labs.eddi.engine.triggermanagement.model.UserConversation;
+import ai.labs.eddi.utils.RuntimeUtilities;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
+import io.quarkus.arc.DefaultBean;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.bson.Document;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * MongoDB implementation of {@link IUserConversationStore}. Annotated
+ * {@code @DefaultBean} so PostgreSQL can override.
+ *
+ * @author ginccc
+ */
+@ApplicationScoped
+@DefaultBean
+public class UserConversationStore implements IUserConversationStore {
+    private static final String COLLECTION_USER_CONVERSATIONS = "userconversations";
+    private static final String INTENT_FIELD = "intent";
+    private static final String USER_ID_FIELD = "userId";
+    private static final String CONVERSATION_ID_FIELD = "conversationId";
+    private final MongoCollection<Document> collection;
+    private final IDocumentBuilder documentBuilder;
+    private final IJsonSerialization jsonSerialization;
+    private final UserConversationResourceStore userConversationStore;
+
+    @Inject
+    public UserConversationStore(MongoDatabase database, IJsonSerialization jsonSerialization, IDocumentBuilder documentBuilder) {
+        this.jsonSerialization = jsonSerialization;
+        RuntimeUtilities.checkNotNull(database, "database");
+        this.collection = database.getCollection(COLLECTION_USER_CONVERSATIONS);
+        this.documentBuilder = documentBuilder;
+        this.userConversationStore = new UserConversationResourceStore();
+        collection.createIndex(Indexes.compoundIndex(Indexes.ascending(INTENT_FIELD), Indexes.ascending(USER_ID_FIELD)),
+                new IndexOptions().unique(true));
+        // Backs readUserConversationByConversationId — the reverse lookup used after
+        // a HITL resume to find the originating Slack thread. Without this, every
+        // such lookup is a full collection scan.
+        collection.createIndex(Indexes.ascending(CONVERSATION_ID_FIELD));
+    }
+
+    @Override
+    public UserConversation readUserConversation(String intent, String userId) throws IResourceStore.ResourceStoreException {
+        RuntimeUtilities.checkNotNull(intent, INTENT_FIELD);
+        RuntimeUtilities.checkNotNull(userId, USER_ID_FIELD);
+
+        return userConversationStore.readUserConversation(intent, userId);
+    }
+
+    @Override
+    public UserConversation readUserConversationByConversationId(String conversationId) throws IResourceStore.ResourceStoreException {
+        RuntimeUtilities.checkNotNull(conversationId, CONVERSATION_ID_FIELD);
+        try {
+            Document document = collection.find(new Document(CONVERSATION_ID_FIELD, conversationId)).first();
+            if (document == null) {
+                return null;
+            }
+            return documentBuilder.build(document, UserConversation.class);
+        } catch (IOException e) {
+            throw new IResourceStore.ResourceStoreException(e.getLocalizedMessage(), e);
+        }
+    }
+
+    @Override
+    public void createUserConversation(UserConversation userConversation)
+            throws IResourceStore.ResourceStoreException, ResourceAlreadyExistsException {
+        RuntimeUtilities.checkNotNull(userConversation, "userConversation");
+        RuntimeUtilities.checkNotNull(userConversation.getIntent(), "userConversation.intent");
+        RuntimeUtilities.checkNotNull(userConversation.getUserId(), "userConversation.userId");
+        RuntimeUtilities.checkNotNull(userConversation.getEnvironment(), "userConversation.environment");
+        RuntimeUtilities.checkNotNull(userConversation.getAgentId(), "userConversation.agentId");
+        RuntimeUtilities.checkNotNull(userConversation.getConversationId(), "userConversation.conversationId");
+
+        userConversationStore.createUserConversation(userConversation);
+    }
+
+    @Override
+    public void deleteUserConversation(String intent, String userId) {
+        RuntimeUtilities.checkNotNull(intent, INTENT_FIELD);
+        RuntimeUtilities.checkNotNull(userId, USER_ID_FIELD);
+
+        userConversationStore.deleteUserConversation(intent, userId);
+    }
+
+    @Override
+    public long deleteAllForUser(String userId) {
+        return collection.deleteMany(new Document(USER_ID_FIELD, userId)).getDeletedCount();
+    }
+
+    @Override
+    public List<UserConversation> getAllForUser(String userId) throws IResourceStore.ResourceStoreException {
+        try {
+            List<UserConversation> results = new ArrayList<>();
+            collection.find(new Document(USER_ID_FIELD, userId))
+                    .forEach(doc -> {
+                        try {
+                            results.add(documentBuilder.build(doc, UserConversation.class));
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+            return results;
+        } catch (RuntimeException e) {
+            throw new IResourceStore.ResourceStoreException(e.getLocalizedMessage(), e);
+        }
+    }
+
+    private class UserConversationResourceStore {
+        UserConversation readUserConversation(String intent, String userId) throws IResourceStore.ResourceStoreException {
+
+            Document filter = new Document();
+            filter.put(INTENT_FIELD, intent);
+            filter.put(USER_ID_FIELD, userId);
+
+            try {
+                Document document = collection.find(filter).first();
+                if (document == null) {
+                    return null;
+                }
+                return documentBuilder.build(document, UserConversation.class);
+            } catch (IOException e) {
+                throw new IResourceStore.ResourceStoreException(e.getLocalizedMessage(), e);
+            }
+        }
+
+        void createUserConversation(UserConversation userConversation) throws IResourceStore.ResourceStoreException, ResourceAlreadyExistsException {
+
+            Document filter = new Document();
+            filter.put(INTENT_FIELD, userConversation.getIntent());
+            filter.put(USER_ID_FIELD, userConversation.getUserId());
+
+            Document existing = collection.find(filter).first();
+            if (existing != null) {
+                // a user conversation with the given intent was found, so we throw an error
+                String message = "UserConversation with intent=%s does already exist";
+                message = String.format(message, userConversation.getIntent());
+                throw new ResourceAlreadyExistsException(message);
+            }
+
+            // no user conversation with the given intent has been found, so we create a new
+            // one
+            collection.insertOne(createDocument(userConversation));
+        }
+
+        void deleteUserConversation(String intent, String userId) {
+            collection.deleteOne(new Document(INTENT_FIELD, intent).append(USER_ID_FIELD, userId));
+        }
+
+        private Document createDocument(UserConversation userConversation) throws IResourceStore.ResourceStoreException {
+            try {
+                return jsonSerialization.deserialize(jsonSerialization.serialize(userConversation), Document.class);
+            } catch (IOException e) {
+                throw new IResourceStore.ResourceStoreException(e.getLocalizedMessage(), e);
+            }
+        }
+    }
+}

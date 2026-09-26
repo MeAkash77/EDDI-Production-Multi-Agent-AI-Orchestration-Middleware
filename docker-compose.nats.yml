@@ -1,0 +1,52 @@
+# NATS JetStream overlay for EDDI.
+#
+# Usage — it is an OVERLAY and does not stand alone:
+#   docker compose -f docker-compose.yml -f docker-compose.nats.yml up
+#
+# It adds durable, scalable conversation message ordering (Phase 5) by pointing
+# the base file's `eddi` service at a JetStream server on the same network.
+#
+# It deliberately declares NOTHING the base file already provides. It used to
+# redefine `mongodb` and four keys on `eddi`, which silently broke the very
+# combination README.md documents ("overlays stack in any combination"):
+#   * MONGODB_CONNECTIONSTRING here dropped the credentials the base passes,
+#     while the base's MONGO_INITDB_ROOT_* kept auth switched ON in mongod — so
+#     EDDI authenticated as nobody and could not connect at all;
+#   * `mongo-data:/data/db` replaced the base's `mongodb-db` mount (volumes merge
+#     on the target path), so the stack came up against an empty volume with
+#     every agent and conversation still sitting in the old one — which is
+#     indistinguishable from data loss to the person looking at the screen;
+#   * `"27017:27017"` bound a second host port next to the base's
+#     `127.0.0.1:27017` (different host_ip, so both survive the merge);
+#   * `mongo:7.0` floated where the base pins `mongo:7.0.14`.
+#
+# If you want a standalone NATS + MongoDB + EDDI stack, compose the base file in
+# rather than duplicating its services here.
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  eddi:
+    environment:
+      EDDI_MESSAGING_TYPE: nats
+      EDDI_NATS_URL: nats://nats:4222
+    # Merges with the base file's `mongodb: condition: service_healthy`.
+    depends_on:
+      nats:
+        condition: service_healthy
+
+volumes:
+  nats-data:

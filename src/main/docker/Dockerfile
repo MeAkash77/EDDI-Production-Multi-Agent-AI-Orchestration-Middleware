@@ -1,0 +1,226 @@
+####
+# This Dockerfile is used in order to build a container that runs the Quarkus application in JVM mode
+#
+# Before building the container image run:
+#
+# ./mvnw package
+#
+# Then, build the image with:
+#
+# docker build -f src/main/docker/Dockerfile -t labsai/eddi .
+#
+# Then run the container using:
+#
+# docker run -i --rm -p 7070:7070 labsai/eddi
+#
+# If you want to include the debug port into your docker image
+# you will have to expose the debug port (default 5005 being the default) like this :  EXPOSE 8080 5005.
+# Additionally you will have to set -e JAVA_DEBUG=true and -e JAVA_DEBUG_PORT=*:5005
+# when running the container
+#
+# Then run the container using :
+#
+# docker run -i --rm -p 7070:7070 labsai/eddi
+#
+# This image uses the `run-java.sh` script to run the application.
+# This scripts computes the command line to execute your Java application, and
+# includes memory/GC tuning.
+# You can configure the behavior using the following environment properties:
+# - JAVA_OPTS: JVM options passed to the `java` command (example: "-verbose:class") - Be aware that this will override
+# the default JVM options, use `JAVA_OPTS_APPEND` to append options
+# - JAVA_OPTS_APPEND: User specified Java options to be appended to generated options
+#   in JAVA_OPTS (example: "-Dsome.property=foo")
+# - JAVA_MAX_MEM_RATIO: Is used when no `-Xmx` option is given in JAVA_OPTS. This is
+#   used to calculate a default maximal heap memory based on a containers restriction.
+#   If used in a container without any memory constraints for the container then this
+#   option has no effect. If there is a memory constraint then `-Xmx` is set to a ratio
+#   of the container available memory as set here. The default is `50` which means 50%
+#   of the available memory is used as an upper boundary. You can skip this mechanism by
+#   setting this value to `0` in which case no `-Xmx` option is added.
+# - JAVA_INITIAL_MEM_RATIO: Is used when no `-Xms` option is given in JAVA_OPTS. This
+#   is used to calculate a default initial heap memory based on the maximum heap memory.
+#   If used in a container without any memory constraints for the container then this
+#   option has no effect. If there is a memory constraint then `-Xms` is set to a ratio
+#   of the `-Xmx` memory as set here. The default is `25` which means 25% of the `-Xmx`
+#   is used as the initial heap size. You can skip this mechanism by setting this value
+#   to `0` in which case no `-Xms` option is added (example: "25")
+# - JAVA_MAX_INITIAL_MEM: Is used when no `-Xms` option is given in JAVA_OPTS.
+#   This is used to calculate the maximum value of the initial heap memory. If used in
+#   a container without any memory constraints for the container then this option has
+#   no effect. If there is a memory constraint then `-Xms` is limited to the value set
+#   here. The default is 4096MB which means the calculated value of `-Xms` never will
+#   be greater than 4096MB. The value of this variable is expressed in MB (example: "4096")
+# - JAVA_DIAGNOSTICS: Set this to get some diagnostics information to standard output
+#   when things are happening. This option, if set to true, will set
+#  `-XX:+UnlockDiagnosticVMOptions`. Disabled by default (example: "true").
+# - JAVA_DEBUG: If set remote debugging will be switched on. Disabled by default (example:
+#    true").
+# - JAVA_DEBUG_PORT: Port used for remote debugging. Defaults to 5005 (example: "8787").
+# - CONTAINER_CORE_LIMIT: A calculated core limit as described in
+#   https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt. (example: "2")
+# - CONTAINER_MAX_MEMORY: Memory limit given to the container (example: "1024").
+# - GC_MIN_HEAP_FREE_RATIO: Minimum percentage of heap free after GC to avoid expansion.
+#   (example: "20")
+# - GC_MAX_HEAP_FREE_RATIO: Maximum percentage of heap free after GC to avoid shrinking.
+#   (example: "40")
+# - GC_TIME_RATIO: Specifies the ratio of the time spent outside the garbage collection.
+#   (example: "4")
+# - GC_ADAPTIVE_SIZE_POLICY_WEIGHT: The weighting given to the current GC time versus
+#   previous GC times. (example: "90")
+# - GC_METASPACE_SIZE: The initial metaspace size. (example: "20")
+# - GC_MAX_METASPACE_SIZE: The maximum metaspace size. (example: "100")
+# - GC_CONTAINER_OPTIONS: Specify Java GC to use. The value of this variable should
+#   contain the necessary JRE command-line options to specify the required GC, which
+#   will override the default of `-XX:+UseParallelGC` (example: -XX:+UseG1GC).
+# - HTTPS_PROXY: The location of the https proxy. (example: "myuser@127.0.0.1:8080")
+# - HTTP_PROXY: The location of the http proxy. (example: "myuser@127.0.0.1:8080")
+# - NO_PROXY: A comma separated lists of hosts, IP addresses or domains that can be
+#   accessed directly. (example: "foo.example.com,bar.example.com")
+#
+###
+# Red Hat UBI 10 OpenJDK 25 runtime, pinned by digest for OpenSSF supply-chain
+# compliance. Ships the same JDK build as the UBI 9 image it replaced
+# (Red_Hat-25.0.4.1.1-1), so this is an OS-layer change only.
+#
+# Two operational consequences of RHEL 10, both deliberate:
+#
+#   1. Host CPU baseline. RHEL 10 raises the microarchitecture floor from
+#      x86-64-v2 to x86-64-v3 — its glibc declares
+#      GNU_PROPERTY_X86_ISA_1_NEEDED = v3, so on a host without AVX2/BMI2/FMA
+#      (pre-2013 Intel, pre-2015 AMD) the container refuses to start rather
+#      than misbehaving. Every current cloud instance type clears this.
+#   2. TLS. RHEL 10's crypto policy additionally disables the static-RSA
+#      TLS 1.2 suites, and Red Hat's OpenJDK inherits the policy through
+#      /etc/crypto-policies/back-ends/java.config. Endpoints that negotiate
+#      ECDHE — every current LLM provider — are unaffected; an endpoint
+#      offering only non-forward-secret suites will no longer connect.
+
+# --- Stage: docs ---
+# The four internal-only pages are pruned HERE, in a throwaway stage, so they
+# never enter a layer of the published image. They used to be copied in and then
+# `RUN rm`-ed, which only writes whiteout entries: the 1.1 MB engineering
+# changelog and the breach-response runbook (detection indicators, escalation
+# contacts) stayed byte-for-byte in the preceding COPY layer, recoverable by
+# anyone holding the image (`docker save ... | tar -x`). Only the runtime
+# filesystem view was ever cleaned, so the stated goal of the step was not
+# achieved and the image was ~1.2 MB larger than intended on every pull.
+#
+# Same digest as the runtime stage below, deliberately: base-image-check.yml
+# parses the LAST FROM line, and its sed rewrites every line carrying the pin,
+# so the two stages move together.
+FROM registry.access.redhat.com/ubi10/openjdk-25-runtime:1.24@sha256:c49d36c03d0a9472935b9f318f709c4cf158afa2dc204099f1f463cfbf9d4626 AS docs
+# COPY writes as root, and the UBI runtime base's default USER is 185, which
+# could not then delete from /docs.
+USER root
+COPY docs/*.md /docs/
+RUN rm -f /docs/changelog.md \
+      /docs/code-review-standards.md \
+      /docs/incident-response.md \
+      /docs/SUMMARY.md
+
+# --- Stage: runtime ---
+FROM registry.access.redhat.com/ubi10/openjdk-25-runtime:1.24@sha256:c49d36c03d0a9472935b9f318f709c4cf158afa2dc204099f1f463cfbf9d4626
+
+### Red Hat Container Certification — required labels
+# A sentinel default, so an un-parameterised build is obviously not a release.
+# CI passes the real version in the docker job AND in the PR preflight dry-run,
+# which used to certify an image carrying whatever this literal happened to say.
+ARG EDDI_VERSION=dev
+ARG EDDI_RELEASE=1
+
+LABEL name="labsai/eddi" \
+      vendor="LABS.AI" \
+      version="${EDDI_VERSION}" \
+      release="${EDDI_RELEASE}" \
+      summary="EDDI — Enterprise-grade Multi-Agent AI Orchestration Middleware" \
+      description="E.D.D.I is a prompt and conversation management middleware \
+      for Conversational AI APIs. It orchestrates multiple AI agents, manages stateful \
+      conversations, and integrates with LLM providers (OpenAI, Anthropic, Google Gemini, \
+      Ollama, Mistral, Azure OpenAI, Amazon Bedrock, and more) via a unified REST API. \
+      Built on Quarkus for cloud-native, high-performance operation." \
+      maintainer="LABS.AI GmbH <contact@labs.ai>" \
+      url="https://eddi.labs.ai" \
+      org.opencontainers.image.source="https://github.com/labsai/EDDI" \
+      io.k8s.display-name="EDDI AI Platform" \
+      io.k8s.description="Multi-Agent AI Orchestration Middleware" \
+      io.openshift.tags="ai,conversational-ai,llm,chatbot,multi-agent,quarkus"
+
+ENV LANG='C.utf8' LANGUAGE='C.utf8'
+
+USER root
+
+RUN mkdir -p /deployments/tmp/import && \
+      chown -R 185:0 /deployments/tmp && \
+      chmod -R 775 /deployments/tmp
+
+# Default location of eddi.audit.dead-letter-path — the audit ledger's last-resort
+# sink for entries it has to abandon. Nothing in this image created it, and UID 185
+# cannot create a directory under /opt at runtime, so on the documented
+# `docker run` / docker-compose quick start every dead-letter write threw
+# NoSuchFileException into a swallowed catch and the abandoned audit entries were
+# gone outright rather than recoverable. Only the Kubernetes manifests mount a
+# volume here; the image has to provide the directory for everyone else.
+RUN mkdir -p /opt/eddi/data && \
+      chown -R 185:0 /opt/eddi && \
+      chmod -R 775 /opt/eddi
+
+COPY --chown=185 target/quarkus-app/lib/ /deployments/lib/
+COPY --chown=185 target/quarkus-app/*.jar /deployments/
+COPY --chown=185 target/quarkus-app/app/ /deployments/app/
+COPY --chown=185 target/quarkus-app/quarkus/ /deployments/quarkus/
+COPY --chown=185 licenses/ /licenses/
+
+# Documentation served to MCP clients via McpDocResources (eddi://docs/*).
+#
+# Only the TOP-LEVEL *.md pages are ever reachable at runtime: listDocs() calls
+# Files.newDirectoryStream(docsDir, "*.md") — non-recursive — and readDoc()
+# rejects any name containing '/', so nothing under docs/agent-configs/,
+# docs/templates/, docs/creating-your-first-agent/ etc. can be requested.
+# Copying the whole tree (~2.2 MB) shipped those subdirectories as dead weight.
+#
+# The `docs` stage above has already dropped the internal-only pages: the 1.1 MB
+# running engineering changelog, the breach-response runbook (detection
+# indicators and escalation contacts), our internal code-review process, and the
+# GitBook table of contents (whose links point at subdirectories that are
+# intentionally not in the image). docs/security-review.md is kept - it is a
+# published OpenSSF Gold artefact.
+COPY --from=docs --chown=185 /docs/ /deployments/docs/
+
+# Run as non-root user (UID 185 = jboss user from UBI base image)
+# This is a security requirement — containers MUST NOT run as root
+USER 185
+EXPOSE 7070
+# JDK_JAVA_OPTIONS carries the Jlama Vector API flag. It makes the in-process
+# `jlama` LLM provider usable: Jlama picks its tensor backend once, at first use,
+# and with jdk.incubator.vector unresolved its MachineSpec probe throws inside a
+# catch(Throwable), the vector type stays NONE and it selects
+# NaiveTensorOperations — scalar Java matrix arithmetic, orders of magnitude
+# slower than SIMD and not usable for interactive chat. It degrades silently.
+#
+# Why JDK_JAVA_OPTIONS and not JAVA_OPTS_APPEND below: the java launcher reads
+# JDK_JAVA_OPTIONS itself, independently of run-java.sh. Both JAVA_OPTS and
+# JAVA_OPTS_APPEND are REPLACED wholesale when an operator sets them at runtime
+# (run-java.sh computes opts=${JAVA_OPTS-... ${JAVA_OPTS_APPEND}}, and an -e on
+# `docker run` overrides an ENV rather than appending to it), and operators do
+# exactly that — see docs/setup-eddi-on-aws-with-mongodb-atlas.md. Putting the
+# flag there would mean any such deployment silently loses it. Verified in this
+# base image at this digest: with JDK_JAVA_OPTIONS set, the module resolves even
+# when JAVA_OPTS or JAVA_OPTS_APPEND is overridden; without the flag entirely,
+# ModuleLayer.boot().findModule("jdk.incubator.vector") is empty.
+#
+# Keep in step with Dockerfile.demo (a bare `java` ENTRYPOINT, so it needs its
+# own copy), pom.xml (surefire argLine) and mise.toml; JlamaRuntimeFlagsTest
+# fails the build if any of them loses it. The JVM prints one
+# "NOTE: Picked up JDK_JAVA_OPTIONS" and one "Using incubator modules" line at
+# startup; both are expected.
+ENV JDK_JAVA_OPTIONS="--add-modules=jdk.incubator.vector"
+ENV JAVA_OPTS_APPEND="-Dquarkus.http.host=0.0.0.0 -Djava.util.logging.manager=org.jboss.logmanager.LogManager -Dfile.encoding=UTF8 -Deddi.docs.path=/deployments/docs"
+# for debugging:
+# ENV JAVA_OPTS_APPEND="-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005"
+ENV JAVA_APP_JAR="/deployments/quarkus-run.jar"
+
+# Docker-native healthcheck (supplements k8s liveness/readiness probes)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+      CMD curl -f http://localhost:7070/q/health/ready || exit 1
+
+ENTRYPOINT [ "/opt/jboss/container/java/run/run-java.sh" ]

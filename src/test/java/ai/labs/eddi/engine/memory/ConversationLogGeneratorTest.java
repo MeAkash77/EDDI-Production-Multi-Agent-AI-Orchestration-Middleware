@@ -1,0 +1,662 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.memory;
+
+import ai.labs.eddi.engine.memory.model.ConversationLog;
+import ai.labs.eddi.engine.memory.model.ConversationOutput;
+import ai.labs.eddi.modules.output.model.types.TextOutputItem;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Tests for {@link ConversationLogGenerator}.
+ */
+@DisplayName("ConversationLogGenerator")
+class ConversationLogGeneratorTest {
+
+    // ─── Construction ───────────────────────────────────────────
+
+    @Nested
+    @DisplayName("Error handling")
+    class ErrorHandling {
+
+        @Test
+        @DisplayName("null memory and snapshot — throws IllegalStateException")
+        void nullEverything() {
+            var generator = new ConversationLogGenerator((IConversationMemory) null);
+            assertThrows(IllegalStateException.class, generator::generate);
+        }
+    }
+
+    // ─── generate() branch coverage (compound conditions) ──────
+
+    @Nested
+    @DisplayName("generate branch coverage")
+    class GenerateBranches {
+
+        private IConversationMemory memoryWith(ConversationOutput output) {
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>(List.of(output)));
+            return memory;
+        }
+
+        @Test
+        @DisplayName("inputFiles first element not a Map → only text content")
+        void inputFilesFirstNotMap() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("context", Map.of("inputFiles", List.of("not-a-map")));
+            var log = new ConversationLogGenerator(memoryWith(output)).generate(-1, true);
+            assertEquals("hi", log.getMessages().getFirst().getContent().getLast().getValue());
+            assertEquals(1, log.getMessages().getFirst().getContent().size());
+        }
+
+        @Test
+        @DisplayName("context without inputFiles → only text content")
+        void contextWithoutInputFiles() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("context", Map.of("language", "en"));
+            var log = new ConversationLogGenerator(memoryWith(output)).generate(-1, true);
+            assertEquals(1, log.getMessages().getFirst().getContent().size());
+        }
+
+        @Test
+        @DisplayName("empty output list → no assistant message")
+        void emptyOutputList() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("output", new ArrayList<>());
+            var log = new ConversationLogGenerator(memoryWith(output)).generate(-1, true);
+            assertEquals(1, log.getMessages().size());
+        }
+    }
+
+    // ─── withAttachmentExtracts (direct branch coverage) ────────
+
+    @Nested
+    @DisplayName("withAttachmentExtracts helper")
+    class WithAttachmentExtracts {
+
+        private IConversationMemory.IConversationStepStack stackWith(List<String> extracts) {
+            var step = mock(IConversationMemory.IConversationStep.class);
+            @SuppressWarnings("unchecked")
+            IData<List<String>> data = mock(IData.class);
+            when(data.getResult()).thenReturn(extracts);
+            when(step.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS)).thenReturn(data);
+            var stack = mock(IConversationMemory.IConversationStepStack.class);
+            when(stack.size()).thenReturn(1);
+            when(stack.get(0)).thenReturn(step);
+            return stack;
+        }
+
+        @Test
+        void nullStack_returnsInput() {
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(null, 0, "hi"));
+        }
+
+        @Test
+        void nullInput_returnsNull() {
+            assertNull(ConversationLogGenerator.withAttachmentExtracts(stackWith(List.of("x")), 0, null));
+        }
+
+        @Test
+        void negativeIndex_returnsInput() {
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(stackWith(List.of("x")), -1, "hi"));
+        }
+
+        @Test
+        void indexOutOfRange_returnsInput() {
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(stackWith(List.of("x")), 5, "hi"));
+        }
+
+        @Test
+        void nullData_returnsInput() {
+            var step = mock(IConversationMemory.IConversationStep.class);
+            when(step.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS)).thenReturn(null);
+            var stack = mock(IConversationMemory.IConversationStepStack.class);
+            when(stack.size()).thenReturn(1);
+            when(stack.get(0)).thenReturn(step);
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(stack, 0, "hi"));
+        }
+
+        @Test
+        void nullResult_returnsInput() {
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(stackWith(null), 0, "hi"));
+        }
+
+        @Test
+        void emptyResult_returnsInput() {
+            assertEquals("hi", ConversationLogGenerator.withAttachmentExtracts(stackWith(List.of()), 0, "hi"));
+        }
+
+        @Test
+        void presentResult_appends() {
+            String out = ConversationLogGenerator.withAttachmentExtracts(stackWith(List.of("doc: text")), 0, "hi");
+            assertTrue(out.startsWith("hi"));
+            assertTrue(out.contains("doc: text"));
+        }
+    }
+
+    // ─── Attachment extract stitching ───────────────────────────
+
+    @Nested
+    @DisplayName("Attachment extract stitching")
+    class ExtractStitching {
+
+        private IConversationMemory memoryWithExtract(String input, List<String> extracts) {
+            var output = new ConversationOutput();
+            output.put("input", input);
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>(List.of(output)));
+
+            var step = mock(IConversationMemory.IConversationStep.class);
+            @SuppressWarnings("unchecked")
+            IData<List<String>> data = mock(IData.class);
+            when(data.getResult()).thenReturn(extracts);
+            when(step.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS)).thenReturn(data);
+
+            var stack = mock(IConversationMemory.IConversationStepStack.class);
+            when(stack.size()).thenReturn(1);
+            when(stack.get(0)).thenReturn(step);
+            when(memory.getAllSteps()).thenReturn(stack);
+            return memory;
+        }
+
+        @Test
+        @DisplayName("stitchExtracts=true appends extracts to the user turn")
+        void stitchesWhenEnabled() {
+            var memory = memoryWithExtract("Summarize this", List.of("report.pdf: quarterly numbers"));
+            var log = new ConversationLogGenerator(memory).generate(-1, true, true);
+
+            String userText = log.getMessages().getFirst().getContent().getLast().getValue();
+            assertTrue(userText.contains("Summarize this"));
+            assertTrue(userText.contains("quarterly numbers"), "extracts should be stitched: " + userText);
+        }
+
+        @Test
+        @DisplayName("stitchExtracts=false leaves the transcript clean")
+        void noStitchWhenDisabled() {
+            var memory = memoryWithExtract("Summarize this", List.of("report.pdf: quarterly numbers"));
+            var log = new ConversationLogGenerator(memory).generate(-1, true, false);
+
+            String userText = log.getMessages().getFirst().getContent().getLast().getValue();
+            assertEquals("Summarize this", userText);
+            verify(memory, never()).getAllSteps();
+        }
+
+        @Test
+        @DisplayName("no extracts on the step leaves input unchanged")
+        void noExtractsUnchanged() {
+            var memory = memoryWithExtract("Hi", List.of());
+            var log = new ConversationLogGenerator(memory).generate(-1, true, true);
+            assertEquals("Hi", log.getMessages().getFirst().getContent().getLast().getValue());
+        }
+
+        @Test
+        @DisplayName("multi-turn: extract lands on its own turn, not the mirror turn")
+        void stitchesOntoCorrectTurnAcrossTurns() {
+            // Three turns; the extract lives on the OLDEST turn (output index 0).
+            var out0 = new ConversationOutput();
+            out0.put("input", "turn0");
+            var out1 = new ConversationOutput();
+            out1.put("input", "turn1");
+            var out2 = new ConversationOutput();
+            out2.put("input", "turn2");
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>(List.of(out0, out1, out2)));
+
+            var oldestStep = mock(IConversationMemory.IConversationStep.class);
+            @SuppressWarnings("unchecked")
+            IData<List<String>> data = mock(IData.class);
+            when(data.getResult()).thenReturn(List.of("PDF EXTRACT"));
+            when(oldestStep.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS)).thenReturn(data);
+            var otherStep = mock(IConversationMemory.IConversationStep.class);
+            when(otherStep.getLatestData(MemoryKeys.ATTACHMENT_EXTRACTS)).thenReturn(null);
+
+            // Stack.get() is reverse-ordered: get(0)=newest(turn2) … get(2)=oldest(turn0).
+            var stack = mock(IConversationMemory.IConversationStepStack.class);
+            when(stack.size()).thenReturn(3);
+            when(stack.get(0)).thenReturn(otherStep);
+            when(stack.get(1)).thenReturn(otherStep);
+            when(stack.get(2)).thenReturn(oldestStep);
+            when(memory.getAllSteps()).thenReturn(stack);
+
+            var log = new ConversationLogGenerator(memory).generate(-1, true, true);
+
+            String turn0 = log.getMessages().get(0).getContent().getLast().getValue();
+            String turn2 = log.getMessages().get(2).getContent().getLast().getValue();
+            assertTrue(turn0.contains("PDF EXTRACT"), "extract must land on turn 0: " + turn0);
+            assertFalse(turn2.contains("PDF EXTRACT"), "extract must NOT leak onto turn 2: " + turn2);
+        }
+    }
+
+    // ─── Basic generation ───────────────────────────────────────
+
+    @Nested
+    @DisplayName("Basic log generation")
+    class BasicGeneration {
+
+        @Test
+        @DisplayName("logSize 0 — returns empty log")
+        void logSizeZero() {
+            var memory = mock(IConversationMemory.class);
+            var generator = new ConversationLogGenerator(memory);
+
+            ConversationLog log = generator.generate(0);
+            assertNotNull(log);
+            assertTrue(log.getMessages().isEmpty());
+        }
+
+        @Test
+        @DisplayName("empty conversation outputs — returns empty log")
+        void emptyOutputs() {
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>());
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            assertNotNull(log);
+            assertTrue(log.getMessages().isEmpty());
+        }
+
+        @Test
+        @DisplayName("single user input — generates user message")
+        void singleUserInput() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "Hello");
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            assertFalse(log.getMessages().isEmpty());
+            assertEquals("user", log.getMessages().getFirst().getRole());
+        }
+
+        @Test
+        @DisplayName("user input + Map output — generates user + assistant messages")
+        void inputAndMapOutput() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "What's up?");
+            output.put("output", List.of(Map.of("text", "Not much!")));
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("user", log.getMessages().get(0).getRole());
+            assertEquals("assistant", log.getMessages().get(1).getRole());
+            // Verify actual content value
+            var assistantContent = log.getMessages().get(1).getContent();
+            assertFalse(assistantContent.isEmpty());
+            assertEquals("Not much!", assistantContent.getFirst().getValue());
+        }
+
+        @Test
+        @DisplayName("user input + TextOutputItem output — generates assistant message")
+        void textOutputItemOutput() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "Hello");
+            var textItem = new TextOutputItem("Hi there!");
+            output.put("output", List.of(textItem));
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("assistant", log.getMessages().get(1).getRole());
+            // Verify actual text content
+            assertEquals("Hi there!", log.getMessages().get(1).getContent().getFirst().getValue());
+        }
+    }
+
+    // ─── Log size windowing ─────────────────────────────────────
+
+    @Nested
+    @DisplayName("Log size windowing")
+    class WindowTests {
+
+        @Test
+        @DisplayName("logSize limits output to last N entries")
+        void logSizeLimits() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            for (int i = 0; i < 5; i++) {
+                var output = new ConversationOutput();
+                output.put("input", "msg" + i);
+                outputs.add(output);
+            }
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate(2);
+
+            // Only last 2 outputs → 2 user messages
+            assertEquals(2, log.getMessages().size());
+        }
+
+        @Test
+        @DisplayName("logSize -1 — includes all entries")
+        void logSizeMinusOne() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            for (int i = 0; i < 3; i++) {
+                var output = new ConversationOutput();
+                output.put("input", "msg" + i);
+                outputs.add(output);
+            }
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate(-1);
+
+            assertEquals(3, log.getMessages().size());
+        }
+
+        @Test
+        @DisplayName("logSize > outputs — includes all")
+        void logSizeLarger() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "only");
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate(100);
+
+            assertEquals(1, log.getMessages().size());
+        }
+    }
+
+    // ─── includeFirstAgentMessage ────────────────────────────────
+
+    /**
+     * The flag exists to strip EDDI's opening greeting, which for an agent with an
+     * {@code ai.labs.output} step firing at {@code CONVERSATION_START} is the first
+     * message. It used to remove the first message <em>whatever its role</em>, and
+     * an agent with no output step opens on the USER's turn — so a one-turn history
+     * went out empty and Anthropic answered
+     * {@code invalid_request_error: messages: Field required}. Ollama accepts an
+     * empty message list, which is why a local smoke test never showed it.
+     */
+    @Nested
+    @DisplayName("includeFirstAgentMessage")
+    class IncludeFirstTests {
+
+        /** An output carrying only an agent message — the shape of a greeting turn. */
+        private ConversationOutput greeting(String text) {
+            var output = new ConversationOutput();
+            output.put("output", List.of(text));
+            return output;
+        }
+
+        private ConversationOutput turn(String input, String answer) {
+            var output = new ConversationOutput();
+            output.put("input", input);
+            output.put("output", List.of(answer));
+            return output;
+        }
+
+        private IConversationMemory memoryOf(ConversationOutput... outputs) {
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>(List.of(outputs)));
+            return memory;
+        }
+
+        @Test
+        @DisplayName("false + agent-first history — the greeting is dropped")
+        void agentFirstIsDropped() {
+            var memory = memoryOf(greeting("Hello, I am the probe agent."), turn("Say OK.", "OK"));
+
+            ConversationLog log = new ConversationLogGenerator(memory).generate(-1, false);
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("user", log.getMessages().getFirst().getRole());
+            assertEquals("Say OK.", log.getMessages().getFirst().getContent().getFirst().getValue());
+            assertEquals("assistant", log.getMessages().getLast().getRole());
+        }
+
+        @Test
+        @DisplayName("false + user-first history — the user turn SURVIVES")
+        void userFirstIsKept() {
+            // An agent with no ai.labs.output step: nothing greets, so message 0 is
+            // the user's. Removing it here is what emptied the history.
+            var memory = memoryOf(turn("Say OK.", "OK"));
+
+            ConversationLog log = new ConversationLogGenerator(memory).generate(-1, false);
+
+            assertEquals(2, log.getMessages().size(), "the user's own turn must never be dropped");
+            assertEquals("user", log.getMessages().getFirst().getRole());
+            assertEquals("Say OK.", log.getMessages().getFirst().getContent().getFirst().getValue());
+        }
+
+        @Test
+        @DisplayName("false + a single user turn — the log is never emptied")
+        void singleUserTurnIsNotEmptied() {
+            var output = new ConversationOutput();
+            output.put("input", "Say OK.");
+            var memory = memoryOf(output);
+
+            ConversationLog log = new ConversationLogGenerator(memory).generate(-1, false);
+
+            assertFalse(log.getMessages().isEmpty(),
+                    "an empty message list is what Anthropic rejects with 'messages: Field required'");
+            assertEquals("user", log.getMessages().getFirst().getRole());
+        }
+
+        @Test
+        @DisplayName("true — the greeting is kept")
+        void includeKeepsTheGreeting() {
+            var memory = memoryOf(greeting("Hello."), turn("Say OK.", "OK"));
+
+            ConversationLog log = new ConversationLogGenerator(memory).generate(-1, true);
+
+            assertEquals(3, log.getMessages().size());
+            assertEquals("assistant", log.getMessages().getFirst().getRole());
+        }
+    }
+
+    // ─── Input files (context) ──────────────────────────────────
+
+    @Nested
+    @DisplayName("Input Files")
+    class InputFileTests {
+
+        @Test
+        @DisplayName("context with inputFiles — generates content items")
+        void contextWithInputFiles() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "check this image");
+            output.put("context", Map.of(
+                    "inputFiles", List.of(
+                            Map.of("type", "image", "url", "https://example.com/img.png"))));
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            // Should have user message with 2 content items (image + text)
+            var userMsg = log.getMessages().getFirst();
+            assertEquals("user", userMsg.getRole());
+            assertEquals(2, userMsg.getContent().size());
+            // First content item should be the image file
+            var imageContent = userMsg.getContent().get(0);
+            assertEquals("https://example.com/img.png", imageContent.getValue());
+        }
+    }
+
+    // ─── Edge cases ─────────────────────────────────────────────
+
+    @Nested
+    @DisplayName("Edge cases")
+    class EdgeCases {
+
+        @Test
+        @DisplayName("output is empty list — no assistant message")
+        void emptyOutputList() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "hello");
+            output.put("output", List.of());
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            // Only user message, no assistant (empty output list)
+            assertEquals(1, log.getMessages().size());
+            assertEquals("user", log.getMessages().getFirst().getRole());
+        }
+
+        @Test
+        @DisplayName("null input — no user message, but output is generated")
+        void nullInput() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            // No "input" key
+            output.put("output", List.of(Map.of("text", "Hi!")));
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            // Only assistant message, no user
+            assertEquals(1, log.getMessages().size());
+            assertEquals("assistant", log.getMessages().getFirst().getRole());
+        }
+
+        @Test
+        @DisplayName("null text in output map — filters nulls out")
+        void nullTextInOutputMap() {
+            var memory = mock(IConversationMemory.class);
+            var outputs = new ArrayList<ConversationOutput>();
+            var output = new ConversationOutput();
+            output.put("input", "hello");
+            Map<String, Object> mapWithNull = new HashMap<>();
+            mapWithNull.put("text", null);
+            Map<String, Object> mapWithText = new HashMap<>();
+            mapWithText.put("text", "valid");
+            output.put("output", List.of(mapWithNull, mapWithText));
+            outputs.add(output);
+            when(memory.getConversationOutputs()).thenReturn(outputs);
+
+            var generator = new ConversationLogGenerator(memory);
+            ConversationLog log = generator.generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("assistant", log.getMessages().get(1).getRole());
+            assertEquals("valid", log.getMessages().get(1).getContent().getFirst().getValue());
+        }
+    }
+
+    // ─── D3: HITL-gated turns must survive into the log ─────────
+
+    @Nested
+    @DisplayName("heterogeneous output lists (HITL turns)")
+    class HeterogeneousOutput {
+
+        private IConversationMemory memoryWith(ConversationOutput output) {
+            var memory = mock(IConversationMemory.class);
+            when(memory.getConversationOutputs()).thenReturn(new ArrayList<>(List.of(output)));
+            return memory;
+        }
+
+        /**
+         * The stored shape of a HITL-gated turn: two announcements written via
+         * {@code addConversationOutputString(...)} followed by the ordinary output map.
+         * Reading the list's shape from element zero dropped the assistant turn
+         * entirely, so {@code GET /agents/&#123;id&#125;/log} returned
+         * {@code user, assistant, user, user} and the agent's own history lost every
+         * turn a human had approved.
+         */
+        @Test
+        @DisplayName("String, String, Map → assistant turn is present with all three texts")
+        void hitlShapedOutputIsKept() {
+            var output = new ConversationOutput();
+            output.put("input", "create the group");
+            output.put("output", List.of(
+                    "I'll create that group for you.",
+                    "Waiting for your approval.",
+                    Map.of("text", "Group created.")));
+
+            var log = new ConversationLogGenerator(memoryWith(output)).generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("assistant", log.getMessages().get(1).getRole());
+            assertEquals("I'll create that group for you. Waiting for your approval. Group created.",
+                    log.getMessages().get(1).getContent().getFirst().getValue());
+        }
+
+        @Test
+        @DisplayName("a list of plain Strings still produces an assistant turn")
+        void plainStringListIsKept() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("output", List.of("Paused for approval."));
+
+            var log = new ConversationLogGenerator(memoryWith(output)).generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("Paused for approval.", log.getMessages().get(1).getContent().getFirst().getValue());
+        }
+
+        @Test
+        @DisplayName("TextOutputItem entries keep working")
+        void textOutputItemsStillWork() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("output", List.of(new TextOutputItem("hello", 0)));
+
+            var log = new ConversationLogGenerator(memoryWith(output)).generate();
+
+            assertEquals(2, log.getMessages().size());
+            assertEquals("hello", log.getMessages().get(1).getContent().getFirst().getValue());
+        }
+
+        @Test
+        @DisplayName("an emptied output adds no assistant turn")
+        void emptiedOutputAddsNothing() {
+            var output = new ConversationOutput();
+            output.put("input", "hi");
+            output.put("output", List.of());
+
+            var log = new ConversationLogGenerator(memoryWith(output)).generate();
+
+            assertEquals(1, log.getMessages().size());
+        }
+    }
+
+}

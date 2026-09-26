@@ -1,0 +1,1940 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#  E.D.D.I — One-Command Install & Onboarding Wizard
+#
+#  Usage:
+#    curl -fsSL https://raw.githubusercontent.com/labsai/EDDI/main/install.sh | bash
+#
+#  Options (non-interactive):
+#    bash install.sh --defaults                 # all defaults, no prompts
+#    bash install.sh --db=postgres --with-auth  # specific choices
+# ─────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Configuration ──────────────────────────────────────────
+EDDI_BRANCH="${EDDI_BRANCH:-main}"
+EDDI_VERSION="${EDDI_VERSION:-latest}"
+EDDI_PORT="${EDDI_PORT:-7070}"
+EDDI_HTTPS_PORT="${EDDI_HTTPS_PORT:-7443}"
+# Host ports for the containers the compose files publish. The *_REQUESTED
+# values are what the caller pinned (empty = "resolve it for me"); the plain ones
+# carry the default until wizard_ports resolves them, so the summary and the
+# closing banner always have something to print. MONGO_PORT is the exception:
+# it stays empty for PostgreSQL installs, which publish no database port.
+MONGO_PORT_REQUESTED="${MONGO_PORT:-}"
+MONGO_PORT=""
+KEYCLOAK_PORT_REQUESTED="${KEYCLOAK_PORT:-}"
+KEYCLOAK_PORT="${KEYCLOAK_PORT:-8180}"
+GRAFANA_PORT_REQUESTED="${GRAFANA_PORT:-}"
+GRAFANA_PORT="${GRAFANA_PORT:-3000}"
+PROMETHEUS_PORT_REQUESTED="${PROMETHEUS_PORT:-}"
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
+JAEGER_PORT_REQUESTED="${JAEGER_PORT:-}"
+JAEGER_PORT="${JAEGER_PORT:-16686}"
+OTLP_GRPC_PORT_REQUESTED="${OTLP_GRPC_PORT:-}"
+OTLP_GRPC_PORT="${OTLP_GRPC_PORT:-4317}"
+OTLP_HTTP_PORT_REQUESTED="${OTLP_HTTP_PORT:-}"
+OTLP_HTTP_PORT="${OTLP_HTTP_PORT:-4318}"
+# Ports handed out during this run. Two components with adjacent defaults (Jaeger
+# OTLP 4317/4318) would otherwise both be offered the same free port -- nothing
+# is listening on it yet, so "free" is true for both until docker tries to bind.
+RESERVED_PORTS=()
+EDDI_DIR="${EDDI_DIR:-$HOME/.eddi}"
+# Strip trailing slash to avoid double-slash paths in output/config
+EDDI_DIR="${EDDI_DIR%/}"
+# Validate branch name (prevent path traversal in download URLs)
+if [[ ! "$EDDI_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+  echo "Invalid EDDI_BRANCH: $EDDI_BRANCH" >&2; exit 1
+fi
+COMPOSE_BASE_URL="https://raw.githubusercontent.com/labsai/EDDI/${EDDI_BRANCH}"
+EDDI_ALREADY_RUNNING=false
+
+# ── State flags ────────────────────────────────────────────
+CONTAINERS_STARTED=false
+HEALTHY=false
+COMPOSE_FILES=()
+
+# ── Colors ─────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  BOLD='\033[1m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  RED='\033[0;31m'
+  CYAN='\033[0;36m'
+  DIM='\033[2m'
+  RESET='\033[0m'
+else
+  BOLD='' GREEN='' YELLOW='' RED='' CYAN='' DIM='' RESET=''
+fi
+
+# ── Cleanup trap ───────────────────────────────────────────
+cleanup() {
+  if [[ "$CONTAINERS_STARTED" == "true" && "$HEALTHY" != "true" ]]; then
+    echo ""
+    echo -e "${YELLOW}⚠️  Setup interrupted. Cleaning up containers...${RESET}"
+    if [[ ${#COMPOSE_FILES[@]} -gt 0 ]]; then
+      local env_file="$EDDI_DIR/.env"
+      local flags=()
+      if [[ -f "$env_file" ]]; then
+        flags+=(--env-file "$env_file")
+      fi
+      for f in "${COMPOSE_FILES[@]}"; do
+        flags+=(-f "$f")
+      done
+      docker compose "${flags[@]}" down 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# ── Helpers ────────────────────────────────────────────────
+info()    { echo -e "  ${GREEN}✅${RESET} $1"; }
+warn()    { echo -e "  ${YELLOW}⚠️  $1${RESET}"; }
+fail()    { echo -e "  ${RED}❌ $1${RESET}"; exit 1; }
+step()    { echo -e "\n${BOLD}─── Step $1 of $TOTAL_STEPS: $2 ${RESET}───────────────────────"; echo ""; }
+section() { echo -e "\n${BOLD}─── $1 ${RESET}───────────────────────────────"; echo ""; }
+
+# ask DEFAULT VALID_VALUES...
+# Prompts user, validates input, returns choice on stdout
+ask() {
+  local default="$1"
+  shift
+  local valid=("$@")
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    echo "$default"
+    return
+  fi
+  while true; do
+    echo -ne "  Choose [${default}]: " >&2
+    local reply
+    read -r reply </dev/tty 2>/dev/null || reply=""
+    reply="${reply:-$default}"
+    # Validate if valid values were provided
+    if [[ ${#valid[@]} -gt 0 ]]; then
+      for v in "${valid[@]}"; do
+        if [[ "$reply" == "$v" ]]; then
+          echo "$reply"
+          return
+        fi
+      done
+      echo -e "  ${YELLOW}Please enter one of: ${valid[*]}${RESET}" >&2
+    else
+      echo "$reply"
+      return
+    fi
+  done
+}
+
+# Check if a TCP port is in use (probe order: ss → lsof → nc → /dev/tcp)
+#
+# Only ss short-circuits: when it is present, no match really does mean the port
+# is free. A negative lsof result proves nothing, because busybox's lsof (Alpine
+# and friends) ignores -i/-s entirely, lists every open file and exits 0 --
+# neither its exit code nor the absence of a "(LISTEN)" marker says anything
+# about the port. Judging by exit code alone made every port read as taken and
+# the resolver abort with "no free port found"; trusting a missing marker would
+# make every port read as free and hand the raw bind error back to Docker. So a
+# positive lsof match is trusted, and a negative one falls through to a connect
+# probe, which behaves the same on every implementation.
+port_in_use() {
+  local port="$1"
+
+  if command -v ss &>/dev/null; then
+    # Captured rather than piped into grep, for the same reason as the lsof
+    # branch below: `grep -q` exits on its first match, which can SIGPIPE ss
+    # while it is still writing. Under `set -o pipefail` that makes the whole
+    # pipeline non-zero even though the port WAS found -- so a busy port would
+    # read as free, and this branch does not fall through to another probe.
+    # The window is real on a host with enough listening sockets to overflow
+    # the 64 KiB pipe buffer, and the match can come long before the last row.
+    local ss_out=""
+    ss_out=$(ss -tln 2>/dev/null) || true
+    # Space/end-of-line anchor avoids matching port 70 when checking 7070
+    grep -qE ":${port}( |$)" <<<"$ss_out" && return 0
+    return 1
+  fi
+
+  if command -v lsof &>/dev/null; then
+    # Captured rather than piped into grep: `grep -q` exits on the first match
+    # and can SIGPIPE lsof, which `set -o pipefail` would then report as a
+    # failed pipeline even though the port was found.
+    local lsof_out=""
+    lsof_out=$(lsof -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null) || true
+    [[ "$lsof_out" == *LISTEN* ]] && return 0
+  fi
+
+  if command -v nc &>/dev/null; then
+    nc -z 127.0.0.1 "${port}" 2>/dev/null && return 0
+    return 1
+  fi
+
+  # Last resort: /dev/tcp (bash built-in)
+  (echo >/dev/tcp/127.0.0.1/"${port}") 2>/dev/null && return 0
+  return 1
+}
+
+# A port already handed out during this run counts as taken: nothing is
+# listening on it yet, so port_in_use alone would offer it twice.
+reserve_port() { RESERVED_PORTS+=("$1"); }
+
+port_reserved() {
+  # ${#arr[@]} is safe under `set -u` on an empty array; "${arr[@]}" is not on
+  # bash 3.2, which is what macOS still ships.
+  (( ${#RESERVED_PORTS[@]} == 0 )) && return 1
+  local p
+  for p in "${RESERVED_PORTS[@]}"; do
+    [[ "$p" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+port_taken() { port_reserved "$1" || port_in_use "$1"; }
+
+find_next_free_port() {
+  local start="$1"
+  for ((p=start; p<=start+100; p++)); do
+    if ! port_taken "$p"; then
+      echo "$p"
+      return
+    fi
+  done
+  echo "0"
+}
+
+# The project name `docker compose` will actually use, derived the same way it
+# derives it: COMPOSE_PROJECT_NAME wins outright; otherwise it is the basename
+# of the project directory, lowercased with everything outside [a-z0-9_-]
+# stripped. The project directory is the directory of the FIRST -f file, which
+# under --local is the repo checkout rather than EDDI_DIR -- getting that wrong
+# makes our own containers look like foreign listeners, and the resolver then
+# remaps a port it should have reused (or fails an explicit one outright).
+compose_project_name() {
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    echo "$COMPOSE_PROJECT_NAME"
+    return
+  fi
+
+  local project_dir="$EDDI_DIR"
+  if [[ "${LOCAL_IMAGE:-false}" == "true" ]]; then
+    # Mirrors resolve_compose_files, which puts the repo's
+    # docker-compose.local.yml first and so makes the repo the project dir.
+    project_dir="${EDDI_REPO_ROOT:-${SCRIPT_DIR:-$(pwd)}}"
+  fi
+
+  local name
+  name=$(basename "$project_dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+  echo "${name:-eddi}"
+}
+
+# Is the listener on $1 a container of *our* Compose project? Then it is not a
+# conflict -- `docker compose up` reuses that container instead of binding the
+# port a second time.
+port_owned_by_project() {
+  local port="$1" names project
+  project=$(compose_project_name)
+  names=$(docker ps --filter "publish=${port}" --filter "label=com.docker.compose.project=${project}" --format '{{.Names}}' 2>/dev/null) || return 1
+  [[ -n "$names" ]]
+}
+
+# Resolve one host port that the selected compose files publish. The wizard used
+# to look at EDDI's own 7070/7443 and nothing else, so every other published
+# port -- MongoDB 27017, Keycloak 8180, Grafana 3000, Prometheus 9090, Jaeger --
+# reached `docker compose up` unchecked and failed there with a raw
+# "ports are not available" bind error the installer could not explain.
+# Containers reach each other on the compose network using the service name and
+# the *internal* port, so moving a host port is invisible to the stack.
+#
+# Prints the resolved port on stdout; everything else goes to stderr.
+# Usage: resolve_published_port LABEL DEFAULT REQUESTED ENV_KEY
+resolve_published_port() {
+  local label="$1" default_port="$2" requested="$3" env_key="$4"
+  local preferred="$default_port" explicit=false
+
+  if [[ -n "$requested" ]]; then
+    explicit=true
+    if [[ ! "$requested" =~ ^[0-9]+$ ]] || (( requested < 1 || requested > 65535 )); then
+      fail "Invalid ${env_key} '${requested}'. Must be a port number (1-65535)." >&2
+    fi
+    preferred="$requested"
+  elif [[ -f "$EDDI_DIR/.env" ]]; then
+    # Reuse the port a previous install settled on, so re-runs stay stable
+    local previous
+    previous=$(grep -m1 -E "^${env_key}=[0-9]+$" "$EDDI_DIR/.env" 2>/dev/null | cut -d= -f2 || true)
+    [[ -n "$previous" ]] && preferred="$previous"
+  fi
+
+  if ! port_reserved "$preferred"; then
+    if ! port_in_use "$preferred"; then
+      info "${label} port: ${preferred}" >&2
+      echo "$preferred"
+      return
+    fi
+
+    # Our own container from a previous install already holds it -- compose
+    # reuses that container rather than binding the port a second time
+    if port_owned_by_project "$preferred"; then
+      info "${label} port: ${preferred} (held by the existing EDDI container)" >&2
+      echo "$preferred"
+      return
+    fi
+  fi
+
+  if [[ "$explicit" == "true" ]]; then
+    fail "Port ${preferred} is already in use.\n     Stop the process using it, or set ${env_key} to a free port." >&2
+  fi
+
+  warn "Port ${preferred} is in use — moving ${label} to another port." >&2
+  local free
+  free=$(find_next_free_port $((preferred + 1)))
+  if [[ "$free" == "0" ]]; then
+    fail "No free port found near ${preferred} for ${label}.\n     Stop the process using port ${preferred}, or set ${env_key} to a free port." >&2
+  fi
+  info "${label} port: ${free} (default ${preferred} was taken)" >&2
+  echo "$free"
+}
+
+# Resolve a port into the named global and reserve it. The reservation has to
+# happen here: resolve_published_port runs in a command substitution, and a
+# subshell cannot add to RESERVED_PORTS.
+# Usage: resolve_port_into VAR_NAME LABEL DEFAULT REQUESTED ENV_KEY
+resolve_port_into() {
+  local var_name="$1"
+  shift
+  local value
+  # Checked explicitly rather than left to `set -e`: the resolver runs in a
+  # command substitution, and set -e is suppressed for anything called from a
+  # condition context -- there the failed assignment would fall through and pin
+  # the port to an empty string.
+  if ! value=$(resolve_published_port "$@") || [[ -z "$value" ]]; then
+    exit 1
+  fi
+  printf -v "$var_name" '%s' "$value"
+  reserve_port "$value"
+}
+
+# Prompt the user for a port. Shows conflict info and suggests alternatives.
+# Returns the chosen port on stdout.
+# Usage: EDDI_PORT=$(read_port "HTTP" "$EDDI_PORT")
+read_port() {
+  local port_name="$1"
+  local default_port="$2"
+  local suggested="$default_port"
+
+  if port_taken "$default_port"; then
+    warn "Port ${default_port} is already in use!" >&2
+    local next_free
+    next_free=$(find_next_free_port $((default_port + 1)))
+    if [[ "$next_free" != "0" ]]; then
+      echo -e "  Suggested alternative: ${CYAN}${next_free}${RESET}" >&2
+      suggested="$next_free"
+    fi
+  else
+    echo -e "  ${DIM}Port ${default_port} is available.${RESET}" >&2
+  fi
+
+  echo "" >&2
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    info "${port_name} port: ${suggested}" >&2
+    echo "$suggested"
+    return
+  fi
+
+  while true; do
+    echo -ne "  ${port_name} port [${suggested}]: " >&2
+    local reply
+    read -r reply </dev/tty 2>/dev/null || reply=""
+    reply="${reply:-$suggested}"
+    if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1024 && reply <= 65535 )); then
+      if port_taken "$reply"; then
+        warn "Port ${reply} is in use. Try another." >&2
+      else
+        info "${port_name} port: ${reply}" >&2
+        echo "$reply"
+        return
+      fi
+    else
+      echo -e "  ${YELLOW}Please enter a valid port (1024-65535)${RESET}" >&2
+    fi
+  done
+}
+
+banner() {
+  echo ""
+  echo -e "${BOLD}     ______   ____    ____    ____  ${RESET}"
+  echo -e "${BOLD}    / ____/  / __ \\  / __ \\  /  _/ ${RESET}"
+  echo -e "${BOLD}   / __/    / / / / / / / /  / /   ${RESET}"
+  echo -e "${BOLD}  / /___   / /_/ / / /_/ / _/ /    ${RESET}"
+  echo -e "${BOLD} /_____/  /_____/ /_____/ /___/    ${RESET}"
+  echo ""
+  echo -e "   ${BOLD}Multi-Agent Orchestration Middleware${RESET}"
+  echo -e "   ${DIM}https://eddi.labs.ai${RESET}"
+  echo ""
+}
+
+# ── Parse arguments ────────────────────────────────────────
+NON_INTERACTIVE=false
+DB_CHOICE=""
+WITH_AUTH=false
+WITH_MONITORING=false
+LOCAL_IMAGE=false
+VAULT_KEY_ARG=""
+
+# Detect piped stdin (curl | bash) — disable interactive prompts
+if [[ ! -t 0 ]]; then
+  NON_INTERACTIVE=true
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    --defaults)       NON_INTERACTIVE=true; DB_CHOICE="${DB_CHOICE:-1}" ;;
+    --db=mongo*)      DB_CHOICE="1" ;;
+    --db=postgres*)   DB_CHOICE="2" ;;
+    --with-auth)      WITH_AUTH=true ;;
+    --with-monitoring) WITH_MONITORING=true ;;
+    --vault-key=*)    VAULT_KEY_ARG="${arg#*=}" ;;
+    --eddi-version=*) EDDI_VERSION="${arg#*=}" ;;
+    --mongo-port=*)   MONGO_PORT_REQUESTED="${arg#*=}" ;;
+    --full)           DB_CHOICE="2"; WITH_AUTH=true; WITH_MONITORING=true ;;
+    --local)          LOCAL_IMAGE=true ;;
+    --help|-h)
+      echo "EDDI Install Script"
+      echo ""
+      echo "Usage: curl -fsSL .../install.sh | bash"
+      echo "       bash install.sh [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --defaults              Accept all defaults (non-interactive)"
+      echo "  --db=mongodb            Use MongoDB (default)"
+      echo "  --db=postgres           Use PostgreSQL"
+      echo "  --vault-key=<key>       Set vault master key (min 16 chars)"
+      echo "  --with-auth             Include Keycloak authentication"
+      echo "  --with-monitoring       Include Grafana + Prometheus"
+      echo "  --eddi-version=<tag>    Pin EDDI image tag (default: latest)"
+      echo "  --mongo-port=<port>     Host port for MongoDB (default: 27017)"
+      echo "  --full                  All options enabled"
+      echo "  --local                 Use locally built Docker image (skip pull)"
+      echo ""
+      echo "Environment variables:"
+      echo "  EDDI_PORT           HTTP port (default: 7070)"
+      echo "  EDDI_HTTPS_PORT     HTTPS port (default: 7443)"
+      echo "  MONGO_PORT          Host port for MongoDB (default: 27017)"
+      echo "  KEYCLOAK_PORT       Host port for Keycloak (default: 8180)"
+      echo "  GRAFANA_PORT        Host port for Grafana (default: 3000)"
+      echo "  PROMETHEUS_PORT     Host port for Prometheus (default: 9090)"
+      echo "  JAEGER_PORT         Host port for the Jaeger UI (default: 16686)"
+      echo "  OTLP_GRPC_PORT      Host port for Jaeger OTLP gRPC (default: 4317)"
+      echo "  OTLP_HTTP_PORT      Host port for Jaeger OTLP HTTP (default: 4318)"
+      echo "  EDDI_DIR            Install directory (default: ~/.eddi)"
+      echo "  EDDI_VERSION        Image tag to pull (default: latest)"
+      echo ""
+      echo "  Every port is resolved before the containers start. A port left"
+      echo "  at its default is kept when free and moved to the next free port"
+      echo "  when something holds it. A port you pin here -- or with"
+      echo "  --mongo-port= -- is never moved: if it is busy the install stops"
+      echo "  and says so, rather than starting somewhere you did not ask for."
+      exit 0
+      ;;
+  esac
+done
+
+# ── Pre-flight checks ─────────────────────────────────────
+
+detect_platform() {
+  PLATFORM="unknown"
+  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      PLATFORM="wsl"
+    else
+      PLATFORM="linux"
+    fi
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    PLATFORM="macos"
+  fi
+}
+
+install_docker_linux() {
+  # Pinned Docker convenience install script (OpenSSF: pin downloads by hash)
+  # Source: https://github.com/docker/docker-install
+  # To update: pick a new commit, download, compute sha256sum, update both values.
+  local DOCKER_INSTALL_COMMIT="f2b0ef96e1f2a34340caf3c72a0a727aa0c48ec7"
+  local DOCKER_INSTALL_SHA256="93f04ab7de485fb08498d8d0257f11a1ffee145ebcc2074dc21937eacc706a2b"
+  local DOCKER_INSTALL_URL="https://raw.githubusercontent.com/docker/docker-install/${DOCKER_INSTALL_COMMIT}/install.sh"
+
+  echo ""
+  echo -e "  ${BOLD}Docker is required but not installed.${RESET}"
+  echo ""
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    echo "  Install Docker first: https://docs.docker.com/get-docker/"
+    exit 1
+  fi
+
+  echo -ne "  Install Docker now? [Y/n]: " >&2
+  local reply
+  read -r reply </dev/tty 2>/dev/null || reply="y"
+  reply="${reply:-y}"
+
+  if [[ "$reply" =~ ^[Yy]$ ]]; then
+    echo -e "  Installing Docker via ${CYAN}docker/docker-install${RESET}..."
+    local docker_install_script
+    docker_install_script=$(mktemp "${TMPDIR:-/tmp}/get-docker.XXXXXX")
+    if curl -fsSL "$DOCKER_INSTALL_URL" -o "$docker_install_script"; then
+      # Verify integrity before execution (OpenSSF pinned-dependencies requirement)
+      local actual_hash
+      actual_hash=$(sha256sum "$docker_install_script" | cut -d' ' -f1)
+      if [[ "$actual_hash" != "$DOCKER_INSTALL_SHA256" ]]; then
+        rm -f "$docker_install_script"
+        fail "Docker install script hash mismatch!\n     Expected: ${DOCKER_INSTALL_SHA256}\n     Got:      ${actual_hash}\n     The pinned script may need updating. Install Docker manually: https://docs.docker.com/get-docker/"
+      fi
+      if sh "$docker_install_script"; then
+        rm -f "$docker_install_script"
+        info "Docker installed!"
+        # Add current user to docker group (takes effect on next login)
+        if ! groups | grep -q docker; then
+          sudo usermod -aG docker "$USER" 2>/dev/null || true
+          echo -e "  ${YELLOW}Note: You may need to log out/in for Docker group to take effect.${RESET}"
+          echo -e "  ${YELLOW}      If docker commands fail, run: newgrp docker${RESET}"
+        fi
+      else
+        rm -f "$docker_install_script"
+        fail "Docker installation failed. Try manually: https://docs.docker.com/get-docker/"
+      fi
+    else
+      rm -f "$docker_install_script"
+      fail "Failed to download Docker install script.\n     Try manually: https://docs.docker.com/get-docker/"
+    fi
+  else
+    echo "  Install Docker first, then re-run this script."
+    exit 1
+  fi
+}
+
+check_prerequisites() {
+  echo ""
+  detect_platform
+
+  # curl
+  if ! command -v curl &>/dev/null; then
+    fail "curl is required but not found.\n     Install: apt install curl / brew install curl"
+  fi
+
+  # Docker
+  if ! command -v docker &>/dev/null; then
+    case "$PLATFORM" in
+      linux|wsl)
+        install_docker_linux
+        ;;
+      macos)
+        echo -e "  ${RED}❌ Docker is not installed.${RESET}"
+        echo ""
+        echo "     Install Docker Desktop for macOS:"
+        echo "       brew install --cask docker"
+        echo "       — or —"
+        echo "       https://docs.docker.com/desktop/install/mac-install/"
+        echo ""
+        echo "     After installing, open Docker Desktop and wait for it to start."
+        exit 1
+        ;;
+      *)
+        echo -e "  ${RED}❌ Docker is not installed.${RESET}"
+        echo ""
+        echo "     Install Docker: https://docs.docker.com/get-docker/"
+        exit 1
+        ;;
+    esac
+  fi
+  info "Docker found ($(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1))"
+
+  # Docker daemon running
+  if ! docker info &>/dev/null 2>&1; then
+    case "$PLATFORM" in
+      macos)
+        fail "Docker is installed but not running.\n     Open Docker Desktop from Applications." ;;
+      linux|wsl)
+        fail "Docker is installed but not running.\n     Run: sudo systemctl start docker" ;;
+      *)
+        fail "Docker is installed but not running.\n     Start Docker Desktop or the Docker daemon." ;;
+    esac
+  fi
+
+  # Docker Compose
+  if docker compose version &>/dev/null 2>&1; then
+    info "Docker Compose found ($(docker compose version --short 2>/dev/null))"
+  else
+    fail "Docker Compose not found.\n     Docker Compose is included with Docker Desktop.\n     Linux: sudo apt install docker-compose-plugin"
+  fi
+
+  # Disk space check (need ~2GB for images)
+  local available_gb
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS df doesn't support -BG, use -g for GB blocks
+    available_gb=$(df -g "$HOME" 2>/dev/null | awk 'NR==2{print $4}') || available_gb=999
+  else
+    available_gb=$(df -BG "$HOME" 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G') || available_gb=999
+  fi
+  if [[ "$available_gb" =~ ^[0-9]+$ ]] && [[ "$available_gb" -lt 3 ]]; then
+    warn "Low disk space (${available_gb}GB free). EDDI images need ~2GB."
+    warn "Free space: docker system prune"
+  fi
+
+  # Port check — is EDDI already running?
+  if curl -sf "http://localhost:${EDDI_PORT}/q/health/ready" &>/dev/null 2>&1; then
+    EDDI_ALREADY_RUNNING=true
+    info "EDDI already running on port ${EDDI_PORT}"
+  else
+    EDDI_ALREADY_RUNNING=false
+  fi
+}
+
+# ── Wizard steps ───────────────────────────────────────────
+
+TOTAL_STEPS=5
+EDDI_VAULT_MASTER_KEY=""
+
+wizard_database() {
+  if [[ -n "$DB_CHOICE" ]]; then return; fi
+
+  step 1 "Database"
+  echo "  EDDI needs a database to store agent configs & conversations."
+  echo ""
+  echo -e "  ${BOLD}1)${RESET} MongoDB        ${DIM}document store, simple setup (default)${RESET}"
+  echo -e "  ${BOLD}2)${RESET} PostgreSQL     ${DIM}relational, SQL-queryable, familiar${RESET}"
+  echo ""
+  DB_CHOICE=$(ask "1" "1" "2")
+}
+
+# Generate a cryptographically random vault key (32 base64 chars)
+generate_vault_key() {
+  if command -v openssl &>/dev/null; then
+    openssl rand -base64 24
+  else
+    # Fallback: read from /dev/urandom
+    head -c 24 /dev/urandom | base64
+  fi
+}
+
+wizard_security() {
+  # If a key was provided via CLI arg, use it
+  if [[ -n "$VAULT_KEY_ARG" ]]; then
+    if [[ ${#VAULT_KEY_ARG} -lt 16 ]]; then
+      fail "Vault key must be at least 16 characters (got ${#VAULT_KEY_ARG})"
+    fi
+    EDDI_VAULT_MASTER_KEY="$VAULT_KEY_ARG"
+    return
+  fi
+
+  # If a key already exists from a previous install, preserve it
+  local env_file="$EDDI_DIR/.env"
+  if [[ -f "$env_file" ]]; then
+    local existing_key
+    existing_key=$(sed -n 's/^EDDI_VAULT_MASTER_KEY=//p' "$env_file" 2>/dev/null || true)
+    # Strip surrounding double quotes to prevent quote accumulation on re-runs
+    existing_key="${existing_key#\"}"
+    existing_key="${existing_key%\"}"
+    if [[ -n "$existing_key" ]]; then
+      EDDI_VAULT_MASTER_KEY="$existing_key"
+      info "Vault key preserved from previous install" >&2
+      return
+    fi
+  fi
+
+  step 2 "Security"
+  echo "  EDDI encrypts API keys and secrets using a vault master key."
+  echo "  This key is unique to your installation — keep it safe!"
+  echo ""
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # Auto-generate for non-interactive installs
+    EDDI_VAULT_MASTER_KEY=$(generate_vault_key)
+    info "Vault master key auto-generated"
+    return
+  fi
+
+  echo -e "  ${BOLD}1)${RESET} Auto-generate  ${DIM}strong random key (recommended)${RESET}"
+  echo -e "  ${BOLD}2)${RESET} Custom         ${DIM}enter your own passphrase (min 16 chars)${RESET}"
+  echo ""
+  local sec_choice
+  sec_choice=$(ask "1" "1" "2")
+
+  if [[ "$sec_choice" == "1" ]]; then
+    EDDI_VAULT_MASTER_KEY=$(generate_vault_key)
+    info "Vault master key generated"
+  else
+    while true; do
+      echo -ne "  Enter passphrase: " >&2
+      local passphrase
+      read -rs passphrase </dev/tty 2>/dev/null || passphrase=""
+      echo "" >&2
+      if [[ ${#passphrase} -lt 16 ]]; then
+        echo -e "  ${YELLOW}Passphrase must be at least 16 characters${RESET}" >&2
+      else
+        EDDI_VAULT_MASTER_KEY="$passphrase"
+        info "Custom passphrase set"
+        break
+      fi
+    done
+  fi
+}
+
+wizard_auth() {
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then return; fi
+  if [[ "$WITH_AUTH" == "true" ]]; then return; fi
+
+  step 3 "Authentication"
+  echo "  How should EDDI handle user access?"
+  echo ""
+  echo -e "  ${BOLD}1)${RESET} Open access    ${DIM}no login needed (dev / personal)${RESET}"
+  echo -e "  ${BOLD}2)${RESET} Keycloak       ${DIM}multi-user OIDC (production)${RESET}"
+  echo ""
+  local auth_choice
+  auth_choice=$(ask "1" "1" "2")
+  if [[ "$auth_choice" == "2" ]]; then WITH_AUTH=true; fi
+}
+
+wizard_monitoring() {
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then return; fi
+  if [[ "$WITH_MONITORING" == "true" ]]; then return; fi
+
+  step 4 "Monitoring"
+  echo -e "  ${BOLD}1)${RESET} Skip for now   ${DIM}add later with: eddi update --with-monitoring${RESET}"
+  echo -e "  ${BOLD}2)${RESET} Grafana        ${DIM}dashboards + Prometheus metrics${RESET}"
+  echo ""
+  local mon_choice
+  mon_choice=$(ask "1" "1" "2")
+  if [[ "$mon_choice" == "2" ]]; then WITH_MONITORING=true; fi
+}
+
+wizard_ports() {
+  step 5 "Ports"
+  echo "  EDDI uses two ports: HTTP for the dashboard/API, HTTPS for secure access."
+  echo ""
+
+  EDDI_PORT=$(read_port "HTTP" "$EDDI_PORT")
+  reserve_port "$EDDI_PORT"
+  EDDI_HTTPS_PORT=$(read_port "HTTPS" "$EDDI_HTTPS_PORT")
+  reserve_port "$EDDI_HTTPS_PORT"
+
+  # Every other host port the selected compose files publish, resolved before
+  # docker refuses the bind
+  if [[ "${DB_CHOICE:-1}" == "2" ]]; then
+    # postgres-only.yml publishes no database port
+    MONGO_PORT=""
+  else
+    resolve_port_into MONGO_PORT "MongoDB" 27017 "$MONGO_PORT_REQUESTED" MONGO_PORT
+  fi
+
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    resolve_port_into KEYCLOAK_PORT "Keycloak" 8180 "$KEYCLOAK_PORT_REQUESTED" KEYCLOAK_PORT
+  fi
+
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    resolve_port_into GRAFANA_PORT "Grafana" 3000 "$GRAFANA_PORT_REQUESTED" GRAFANA_PORT
+    resolve_port_into PROMETHEUS_PORT "Prometheus" 9090 "$PROMETHEUS_PORT_REQUESTED" PROMETHEUS_PORT
+    resolve_port_into JAEGER_PORT "Jaeger UI" 16686 "$JAEGER_PORT_REQUESTED" JAEGER_PORT
+    resolve_port_into OTLP_GRPC_PORT "Jaeger OTLP gRPC" 4317 "$OTLP_GRPC_PORT_REQUESTED" OTLP_GRPC_PORT
+    resolve_port_into OTLP_HTTP_PORT "Jaeger OTLP HTTP" 4318 "$OTLP_HTTP_PORT_REQUESTED" OTLP_HTTP_PORT
+  fi
+}
+
+# ── Compose file management ───────────────────────────────
+
+# Detect script directory (empty when piped via curl | bash)
+# Guard: when piped, BASH_SOURCE is empty and dirname resolves to CWD,
+# which could contain unrelated files (e.g. ~/docker-compose.yml).
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+else
+  SCRIPT_DIR=""
+fi
+
+resolve_compose_files() {
+  mkdir -p "$EDDI_DIR"
+
+  local needed_files=()
+  COMPOSE_FILES=()
+
+  # Base compose file depends on database choice
+  if [[ "${DB_CHOICE:-1}" == "2" ]]; then
+    needed_files+=("docker-compose.postgres-only.yml")
+  else
+    needed_files+=("docker-compose.yml")
+  fi
+
+  # Local build overlay (overrides image with local build context)
+  if [[ "$LOCAL_IMAGE" == "true" ]]; then
+    # --local requires running from the EDDI repo checkout
+    EDDI_REPO_ROOT="${SCRIPT_DIR:-$(pwd)}"
+    if [[ ! -f "$EDDI_REPO_ROOT/docker-compose.local.yml" ]]; then
+      fail "--local requires running from the EDDI repo root.\n     Run: cd /path/to/EDDI && bash install.sh --local"
+    fi
+    if [[ ! -f "$EDDI_REPO_ROOT/src/main/docker/Dockerfile" ]]; then
+      fail "Dockerfile not found. Run: ./mvnw package -DskipTests first."
+    fi
+    # Use the file directly from the repo (build context must be repo root)
+    COMPOSE_FILES+=("$EDDI_REPO_ROOT/docker-compose.local.yml")
+  fi
+
+  # Auth overlay
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    needed_files+=("docker-compose.auth.yml")
+  fi
+
+  # Monitoring overlay
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    needed_files+=("docker-compose.monitoring.yml")
+  fi
+
+  # Resolve each file: prefer local copy, fall back to download
+  for f in "${needed_files[@]}"; do
+    local target="$EDDI_DIR/$f"
+
+    if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$f" ]]; then
+      # File exists next to the script — copy to install dir
+      cp "$SCRIPT_DIR/$f" "$target"
+      echo -e "  Using local ${f} ${GREEN}✅${RESET}"
+    else
+      # Not available locally — download from GitHub
+      local download_url="${COMPOSE_BASE_URL}/${f}"
+      echo -ne "  Downloading ${f}... "
+      if curl -fsSL "${download_url}" -o "$target"; then
+        echo -e "${GREEN}✅${RESET}"
+      else
+        fail "Failed to download ${f}.\n     URL: ${download_url}\n     Check your internet connection and that the branch '${EDDI_BRANCH}' exists."
+      fi
+    fi
+
+    COMPOSE_FILES+=("$target")
+  done
+
+  # Download monitoring support files if needed
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    echo ""
+    echo -e "  ${DIM}Downloading monitoring configuration...${RESET}"
+    local monitoring_files=(
+      "docs/monitoring/prometheus.yml"
+      "docs/monitoring/grafana-provisioning/dashboards/dashboards.yml"
+      "docs/monitoring/grafana-provisioning/datasources/datasources.yml"
+      "docs/monitoring/eddi-grafana-dashboard.json"
+      "docs/monitoring/eddi-operations-dashboard.json"
+      "docs/monitoring/eddi-full-metrics-dashboard.json"
+    )
+    for mf in "${monitoring_files[@]}"; do
+      local mf_target="$EDDI_DIR/$mf"
+      local mf_dir
+      mf_dir=$(dirname "$mf_target")
+      mkdir -p "$mf_dir"
+
+      if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$mf" ]]; then
+        cp "$SCRIPT_DIR/$mf" "$mf_target"
+      else
+        local mf_url="${COMPOSE_BASE_URL}/${mf}"
+        echo -ne "  Downloading ${mf}... "
+        if curl -fsSL "${mf_url}" -o "$mf_target"; then
+          echo -e "${GREEN}✅${RESET}"
+        else
+          # Every one of these is bind-mounted as a FILE by
+          # docker-compose.monitoring.yml, so a missing one is worse than it
+          # sounds: Docker creates a *directory* at the mount path. What happens
+          # next depends on the grafana-data volume, and neither outcome is
+          # acceptable — on a fresh volume the container starts and the dashboard
+          # is silently absent with nothing logged, and on a volume that already
+          # holds a file there runc fails the mount ("Are you trying to mount a
+          # directory onto a file") and the container never leaves state Created.
+          # The first case also poisons the volume: it creates a directory inside
+          # it, after which restoring the host file fails the mount in the
+          # opposite direction until that stale directory is deleted. Same
+          # reasoning as the Keycloak realm below; a half-built monitoring stack
+          # is not better than a refusal to build one.
+          #
+          # This list must therefore stay in step with every file-type bind
+          # mount in docker-compose.monitoring.yml. Adding a dashboard there
+          # without adding it here breaks --with-monitoring outright.
+          # -rf, not -f: the thing in the way is most likely a DIRECTORY that a
+          # previous run's failed mount left behind, and `rm -f` cannot remove
+          # one. Under `set -e` that turns this cleanup into the script's exit
+          # point, so the user sees "rm: cannot remove ...: Is a directory"
+          # instead of the message below, and the stale path survives to break
+          # the next run too.
+          rm -rf "$mf_target"
+          fail "Failed to download ${mf} (required for --with-monitoring).\n     URL: ${mf_url}"
+        fi
+      fi
+    done
+  fi
+
+  # Download Keycloak realm if auth enabled
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    # The realm JSON is required; the login-theme files are cosmetic. Both are
+    # bind-mounted by docker-compose.auth.yml, and a missing theme directory
+    # would leave Docker to create an empty one — so they must be fetched here.
+    local kc_files=(
+      "keycloak/eddi-realm.json"
+      "keycloak/themes/eddi/login/theme.properties"
+      "keycloak/themes/eddi/login/resources/css/eddi-login.css"
+      "keycloak/themes/eddi/login/resources/img/logo_eddi.png"
+      "keycloak/themes/eddi/login/resources/img/favicon.ico"
+      "keycloak/themes/eddi/login/resources/fonts/noto-sans-latin-variable.woff2"
+      "keycloak/themes/eddi/login/resources/fonts/noto-sans-latin-ext-variable.woff2"
+      "keycloak/themes/eddi/login/resources/fonts/noto-sans-cyrillic-variable.woff2"
+      "keycloak/themes/eddi/login/resources/fonts/noto-sans-greek-variable.woff2"
+      "keycloak/themes/eddi/login/resources/js/eddi-a11y.js"
+      "keycloak/themes/eddi/login/resources/js/eddi-theme.js"
+    )
+    # The theme is all-or-nothing. A *missing* theme directory is safe —
+    # Keycloak logs "Failed to find LOGIN theme" and serves the built-in one
+    # (verified: HTTP 200) — but a *partial* one is not: theme.properties would
+    # still resolve, and Keycloak would render the eddi theme with its
+    # stylesheet, fonts or scripts 404ing. So any cosmetic failure discards the
+    # whole theme rather than leaving a half-built one mounted.
+    local theme_incomplete=false
+    for kf in "${kc_files[@]}"; do
+      local kf_target="$EDDI_DIR/$kf"
+      local kf_dir
+      kf_dir=$(dirname "$kf_target")
+      mkdir -p "$kf_dir"
+
+      if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$kf" ]]; then
+        cp "$SCRIPT_DIR/$kf" "$kf_target"
+        echo -e "  Using local ${kf} ${GREEN}✅${RESET}"
+      else
+        local kf_url="${COMPOSE_BASE_URL}/${kf}"
+        echo -ne "  Downloading ${kf}... "
+        if curl -fsSL "${kf_url}" -o "$kf_target"; then
+          echo -e "${GREEN}✅${RESET}"
+        elif [[ "$kf" == "keycloak/eddi-realm.json" ]]; then
+          fail "Failed to download ${kf} (required for Keycloak).\n     URL: ${kf_url}"
+        else
+          rm -f "$kf_target"   # don't leave a truncated file behind
+          theme_incomplete=true
+          echo -e "${YELLOW}⚠️${RESET}"
+        fi
+      fi
+    done
+
+    if [[ "$theme_incomplete" == "true" ]]; then
+      rm -rf "$EDDI_DIR/keycloak/themes/eddi"
+      warn "Could not download the complete EDDI login theme — falling back to the default Keycloak login page"
+    fi
+  fi
+
+  # Save config for eddi CLI wrapper (no secrets — vault key stays in .env only)
+  echo "COMPOSE_FILES=${COMPOSE_FILES[*]}" > "$EDDI_DIR/.eddi-config"
+  echo "EDDI_PORT=$EDDI_PORT" >> "$EDDI_DIR/.eddi-config"
+  echo "EDDI_HTTPS_PORT=$EDDI_HTTPS_PORT" >> "$EDDI_DIR/.eddi-config"
+  echo "EDDI_BRANCH=$EDDI_BRANCH" >> "$EDDI_DIR/.eddi-config"
+
+  # Write .env file for docker compose variable substitution
+  # Escape double quotes in vault key to prevent .env corruption
+  local escaped_key="${EDDI_VAULT_MASTER_KEY//\"/\\\"}"
+  local db_txt="mongodb"
+  if [[ "${DB_CHOICE:-1}" == "2" ]]; then
+    db_txt="postgres"
+  fi
+  cat > "$EDDI_DIR/.env" <<EOF
+# EDDI environment — generated by installer
+# ⚠️  The vault master key encrypts all stored API keys.
+#     If you lose this key, encrypted secrets are UNRECOVERABLE.
+EDDI_VAULT_MASTER_KEY="${escaped_key}"
+EDDI_DATASTORE_TYPE=${db_txt}
+EDDI_PORT=$EDDI_PORT
+EDDI_HTTPS_PORT=$EDDI_HTTPS_PORT
+EDDI_VERSION=$EDDI_VERSION
+EOF
+  # Host ports for the containers the selected compose files publish. Only the
+  # components that are part of this install get a line -- a stale KEYCLOAK_PORT
+  # would otherwise outlive the overlay that used it.
+  if [[ -n "$MONGO_PORT" ]]; then
+    echo "MONGO_PORT=$MONGO_PORT" >> "$EDDI_DIR/.env"
+  fi
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    echo "KEYCLOAK_PORT=$KEYCLOAK_PORT" >> "$EDDI_DIR/.env"
+  fi
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    {
+      echo "GRAFANA_PORT=$GRAFANA_PORT"
+      echo "PROMETHEUS_PORT=$PROMETHEUS_PORT"
+      echo "JAEGER_PORT=$JAEGER_PORT"
+      echo "OTLP_GRPC_PORT=$OTLP_GRPC_PORT"
+      echo "OTLP_HTTP_PORT=$OTLP_HTTP_PORT"
+    } >> "$EDDI_DIR/.env"
+  fi
+  # Restrict permissions on sensitive files (owner-only read/write)
+  chmod 600 "$EDDI_DIR/.env"
+  chmod 600 "$EDDI_DIR/.eddi-config"
+}
+
+# Helper: run docker compose with the right -f flags
+compose_cmd() {
+  local flags=(--env-file "$EDDI_DIR/.env")
+  for f in "${COMPOSE_FILES[@]}"; do
+    flags+=(-f "$f")
+  done
+  docker compose "${flags[@]}" "$@"
+}
+
+# ── Start containers ──────────────────────────────────────
+
+start_eddi() {
+  section "Starting EDDI"
+
+  # Export port env vars so docker-compose variable substitution picks them up
+  # Note: vault key is NOT exported — it's read from --env-file only
+  export EDDI_PORT
+  export EDDI_HTTPS_PORT
+
+  if [[ "$LOCAL_IMAGE" == "true" ]]; then
+    echo "  Building local Docker image..."
+    echo ""
+    if compose_cmd build 2>&1 | sed 's/^/    /'; then
+      echo ""
+      info "Local image built"
+    else
+      fail "Failed to build local image.\n     Make sure you ran: ./mvnw package -DskipTests"
+    fi
+  else
+    echo "  Pulling images (this may take a minute)..."
+    echo ""
+    if compose_cmd pull 2>&1 | sed 's/^/    /'; then
+      echo ""
+      info "Images pulled"
+    else
+      fail "Failed to pull images. Check internet connection and disk space.\n     Run: docker system df"
+    fi
+  fi
+
+  echo -ne "  Starting containers...   "
+  local compose_err
+  compose_err=$(mktemp "${TMPDIR:-/tmp}/eddi-compose.XXXXXX")
+  if compose_cmd up -d 2>"$compose_err"; then
+    echo -e "${GREEN}✅${RESET}"
+    CONTAINERS_STARTED=true
+  else
+    echo ""
+    cat "$compose_err" >&2
+    rm -f "$compose_err"
+    fail "Failed to start containers.\n     If the error above says 'ports are not available', another process holds\n     one of EDDI's ports -- re-run with e.g. EDDI_PORT=7071 --mongo-port=27018.\n     If it mentions orphan containers, a previous install left some behind:\n       docker compose -p $(compose_project_name) down --remove-orphans\n     Check logs: docker compose logs in $EDDI_DIR"
+  fi
+  rm -f "$compose_err"
+}
+
+# ── Health check ──────────────────────────────────────────
+
+wait_for_ready() {
+  # Keycloak can take 60-90s to start; EDDI won't start until it's healthy
+  local max_wait=120
+  local elapsed=0
+  echo -ne "  Health check             "
+
+  while [[ $elapsed -lt $max_wait ]]; do
+    if curl -sf "http://localhost:${EDDI_PORT}/q/health/ready" &>/dev/null; then
+      echo -e "${GREEN}✅${RESET} ${DIM}ready in ${elapsed}s${RESET}"
+      HEALTHY=true
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+    echo -ne "."
+  done
+
+  echo -e "${RED}timeout${RESET}"
+  echo ""
+  echo -e "  ${YELLOW}EDDI didn't become ready in ${max_wait}s.${RESET}"
+  echo "  Check logs:"
+  echo "    cd $EDDI_DIR && docker compose ${COMPOSE_FILES[*]/#/-f } logs eddi"
+  echo "    cd $EDDI_DIR && docker compose ${COMPOSE_FILES[*]/#/-f } logs"
+  echo ""
+  echo "  Containers left running for inspection."
+  # Mark healthy to prevent cleanup trap from tearing down containers
+  # (we explicitly told the user containers are left running)
+  HEALTHY=true
+  exit 1
+}
+
+# ── Configure Keycloak client (post-start) ────────────────
+
+# Reads a Keycloak JSON document on stdin with whichever tool
+# configure_keycloak_client found ($1: jq or python3) and prints:
+#   names            the `name` of every entry in a list, one per line
+#   scope-id NAME    the id of the client scope called NAME in a list
+#   scope-def NAME   client scope NAME from a realm file's clientScopes, as JSON
+#   first-id         the `id` of the first entry in a list
+#   token            the `access_token` of a token response
+# Prints nothing when there is no match or the input is not JSON.
+kc_json() {
+  local tool="$1" mode="$2" name="${3:-}"
+  if [[ "$tool" == "jq" ]]; then
+    case "$mode" in
+      names)     jq -r '.[].name // empty' ;;
+      scope-id)  jq -r --arg n "$name" '[.[] | select(.name == $n) | .id][0] // empty' ;;
+      scope-def) jq -c --arg n "$name" '[.clientScopes[]? | select(.name == $n)][0] // empty' ;;
+      first-id)  jq -r '.[0].id // empty' ;;
+      token)     jq -r '.access_token // empty' ;;
+    esac 2>/dev/null
+  else
+    python3 -c '
+import sys, json
+mode, name = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+if mode == "names":
+    print("\n".join(s.get("name", "") for s in d))
+elif mode == "scope-id":
+    print(next((s["id"] for s in d if s.get("name") == name), ""))
+elif mode == "scope-def":
+    s = next((s for s in d.get("clientScopes", []) if s.get("name") == name), None)
+    print(json.dumps(s) if s else "")
+elif mode == "first-id":
+    print(d[0].get("id", "") if d else "")
+elif mode == "token":
+    print(d.get("access_token", ""))' "$mode" "$name" 2>/dev/null
+  fi
+}
+
+# Creates the client scopes that put a user's identity into eddi-frontend's
+# tokens when the realm lacks them, and attaches them to that client.
+#
+# The eddi-realm.json of EDDI 6.1.0-6.4.0 defined only the `openid` client scope,
+# and a realm file that defines any client scopes gets none of Keycloak's
+# built-in ones. So profile, email and basic did not exist: tokens carried no
+# preferred_username, email or even sub, EDDI resolved every caller's principal
+# to null, and a non-admin opening their own conversation got HTTP 500. Realm
+# import is one-shot, so the corrected file never reaches those installations.
+#
+# Definitions come from the realm file. basic, profile and email are attached
+# unless the client already has them as a default OR optional scope. web-origins
+# and acr are attached only when this run had to create them: on a realm that
+# has them, their absence from the client is an operator's choice. Removes
+# nothing, and a second run changes nothing. Under `set -e`, every assignment
+# from a pipeline carries `|| var=""` so a bad response cannot end the installer.
+#
+# Args: kc_base realm_file json_tool admin_token client_uuid
+repair_keycloak_identity_scopes() {
+  local kc_base="$1" realm_file="$2" json_tool="$3" admin_token="$4" client_uuid="$5"
+  local all_scopes_json default_json optional_json default_names optional_names
+  local scope scope_id scope_def created_now
+  local scopes_created=0 scopes_attached=0 scopes_failed=""
+
+  echo -ne "  Checking Keycloak identity scopes  "
+  all_scopes_json=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/client-scopes" 2>/dev/null) || all_scopes_json=""
+  default_json=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/clients/${client_uuid}/default-client-scopes" 2>/dev/null) || default_json=""
+  optional_json=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/clients/${client_uuid}/optional-client-scopes" 2>/dev/null) || optional_json=""
+
+  if [[ -z "$all_scopes_json" || -z "$default_json" || -z "$optional_json" || ! -f "$realm_file" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not read client scopes — identity claims not checked)${RESET}"
+    return 0
+  fi
+
+  default_names=$(echo "$default_json" | kc_json "$json_tool" names) || default_names=""
+  optional_names=$(echo "$optional_json" | kc_json "$json_tool" names) || optional_names=""
+  for scope in basic profile email web-origins acr; do
+    created_now=false
+    scope_id=$(echo "$all_scopes_json" | kc_json "$json_tool" scope-id "$scope") || scope_id=""
+    if [[ -z "$scope_id" ]]; then
+      scope_def=$(kc_json "$json_tool" scope-def "$scope" < "$realm_file") || scope_def=""
+      if [[ -z "$scope_def" ]] || ! curl -sf -o /dev/null -X POST \
+          -H "Authorization: Bearer ${admin_token}" \
+          -H "Content-Type: application/json" \
+          "${kc_base}/admin/realms/eddi/client-scopes" \
+          -d "$scope_def" 2>/dev/null; then
+        scopes_failed="${scopes_failed} ${scope}"
+        continue
+      fi
+      created_now=true
+      scopes_created=$((scopes_created + 1))
+      all_scopes_json=$(curl -sf \
+        -H "Authorization: Bearer ${admin_token}" \
+        "${kc_base}/admin/realms/eddi/client-scopes" 2>/dev/null) || all_scopes_json="[]"
+      scope_id=$(echo "$all_scopes_json" | kc_json "$json_tool" scope-id "$scope") || scope_id=""
+      if [[ -z "$scope_id" ]]; then
+        scopes_failed="${scopes_failed} ${scope}"
+        continue
+      fi
+    fi
+
+    if printf '%s\n%s\n' "$default_names" "$optional_names" | grep -qx -- "$scope"; then
+      continue
+    fi
+    if [[ "$created_now" != "true" && ( "$scope" == "web-origins" || "$scope" == "acr" ) ]]; then
+      continue
+    fi
+    if curl -sf -o /dev/null -X PUT \
+        -H "Authorization: Bearer ${admin_token}" \
+        "${kc_base}/admin/realms/eddi/clients/${client_uuid}/default-client-scopes/${scope_id}" \
+        2>/dev/null; then
+      scopes_attached=$((scopes_attached + 1))
+    else
+      scopes_failed="${scopes_failed} ${scope}"
+    fi
+  done
+
+  if [[ -n "$scopes_failed" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not set up:${scopes_failed} — see docs/security.md, Identity claims)${RESET}"
+  elif [[ $((scopes_created + scopes_attached)) -gt 0 ]]; then
+    echo -e "${GREEN}✅${RESET} ${DIM}(repaired: ${scopes_created} created, ${scopes_attached} attached — sign in again to pick them up)${RESET}"
+  else
+    echo -e "${GREEN}✅${RESET}"
+  fi
+}
+
+# main() leaves an installation that is already up alone, so the setup steps,
+# configure_keycloak_client among them, never run on it. Re-running the
+# installer is nonetheless how an existing installation picks up fixes, so the
+# identity-scope repair runs here on its own. Nothing else is re-applied: the
+# CORS origins configure_keycloak_client writes depend on ports this run may not
+# have been given.
+repair_running_keycloak() {
+  grep -q "docker-compose.auth.yml" "$EDDI_DIR/.eddi-config" 2>/dev/null || return 0
+
+  section "Keycloak"
+
+  local json_tool=""
+  if command -v jq &>/dev/null; then
+    json_tool="jq"
+  elif command -v python3 &>/dev/null; then
+    json_tool="python3"
+  else
+    warn "jq or python3 required — Keycloak identity scopes not checked"
+    return 0
+  fi
+
+  local kc_port kc_base
+  kc_port=$(grep '^KEYCLOAK_PORT=' "$EDDI_DIR/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"'\r ") || kc_port=""
+  kc_base="http://localhost:${kc_port:-8180}"
+
+  # The scope definitions have to be current: the realm file on disk is the one
+  # this installation was set up with, which is exactly the file that lacked
+  # them. Read them from a fresh copy in a temporary file instead, and leave the
+  # file on disk alone — an operator may have edited it, and a proxy's HTML page
+  # must not replace what the next fresh import reads.
+  local realm_defs
+  realm_defs=$(mktemp "${TMPDIR:-/tmp}/eddi-realm.XXXXXX") || realm_defs=""
+  if [[ -z "$realm_defs" ]]; then
+    echo -e "  Checking Keycloak identity scopes  ${YELLOW}⚠️${RESET}  ${DIM}(could not create a temporary file — see docs/security.md, Identity claims)${RESET}"
+    return 0
+  fi
+  if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/keycloak/eddi-realm.json" ]]; then
+    cp "$SCRIPT_DIR/keycloak/eddi-realm.json" "$realm_defs" 2>/dev/null || true
+  else
+    curl -fsSL "${COMPOSE_BASE_URL}/keycloak/eddi-realm.json" -o "$realm_defs" 2>/dev/null || true
+  fi
+
+  local admin_token clients_json client_uuid
+  admin_token=$(curl -sf -X POST \
+    -d "client_id=admin-cli&username=admin&password=admin&grant_type=password" \
+    "${kc_base}/realms/master/protocol/openid-connect/token" 2>/dev/null \
+    | kc_json "$json_tool" token) || admin_token=""
+  if [[ -z "$admin_token" ]]; then
+    rm -f "$realm_defs"
+    echo -e "  Checking Keycloak identity scopes  ${YELLOW}⚠️${RESET}  ${DIM}(could not log in to ${kc_base} as admin — see docs/security.md, Identity claims)${RESET}"
+    return 0
+  fi
+  clients_json=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/clients?clientId=eddi-frontend" 2>/dev/null) || clients_json=""
+  client_uuid=$(echo "$clients_json" | kc_json "$json_tool" first-id) || client_uuid=""
+  if [[ -z "$client_uuid" ]]; then
+    rm -f "$realm_defs"
+    echo -e "  Checking Keycloak identity scopes  ${YELLOW}⚠️${RESET}  ${DIM}(eddi-frontend client not found)${RESET}"
+    return 0
+  fi
+
+  repair_keycloak_identity_scopes "$kc_base" "$realm_defs" "$json_tool" "$admin_token" "$client_uuid"
+  rm -f "$realm_defs"
+}
+
+configure_keycloak_client() {
+  [[ "$WITH_AUTH" != "true" ]] && return 0
+
+  local kc_port="${KEYCLOAK_PORT:-8180}"
+  local kc_base="http://localhost:${kc_port}"
+
+  echo -ne "  Configuring Keycloak CORS  "
+
+  # Require jq or python3 for JSON parsing
+  local json_tool=""
+  if command -v jq &>/dev/null; then
+    json_tool="jq"
+  elif command -v python3 &>/dev/null; then
+    json_tool="python3"
+  else
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(jq or python3 required — Keycloak CORS not configured)${RESET}"
+    return 0
+  fi
+
+  # Wait up to 30s for Keycloak admin API
+  local elapsed=0
+  while [[ $elapsed -lt 30 ]]; do
+    if curl -sf "${kc_base}/realms/master/.well-known/openid-configuration" &>/dev/null; then
+      break
+    fi
+    sleep 2; elapsed=$((elapsed + 2)); echo -ne "."
+  done
+
+  # Get admin token
+  local admin_token_json admin_token=""
+  admin_token_json=$(curl -sf -X POST \
+    -d "client_id=admin-cli&username=admin&password=admin&grant_type=password" \
+    "${kc_base}/realms/master/protocol/openid-connect/token" 2>/dev/null) || true
+
+  if [[ "$json_tool" == "jq" ]]; then
+    admin_token=$(echo "$admin_token_json" | jq -r '.access_token // empty' 2>/dev/null) || admin_token=""
+  else
+    admin_token=$(echo "$admin_token_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null) || admin_token=""
+  fi
+
+  if [[ -z "$admin_token" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(Keycloak admin API unavailable — CORS origins not updated)${RESET}"
+    return 0
+  fi
+
+  # Get the eddi-frontend client UUID
+  local clients_json client_uuid=""
+  clients_json=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/clients?clientId=eddi-frontend" 2>/dev/null) || true
+
+  if [[ "$json_tool" == "jq" ]]; then
+    client_uuid=$(echo "$clients_json" | jq -r '.[0].id // empty' 2>/dev/null) || client_uuid=""
+  else
+    client_uuid=$(echo "$clients_json" | python3 -c "import sys,json; c=json.load(sys.stdin); print(c[0]['id'] if c else '')" 2>/dev/null) || client_uuid=""
+  fi
+
+  if [[ -z "$client_uuid" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(eddi-frontend client not found)${RESET}"
+    return 0
+  fi
+
+  # Build correct HTTP and HTTPS origins for EDDI
+  local http_origin="http://localhost:${EDDI_PORT}"
+  local https_origin="https://localhost:${EDDI_HTTPS_PORT}"
+
+  # GET full client config, patch webOrigins + redirectUris, PUT it back
+  # (partial PUT wipes omitted fields in Keycloak's Admin API)
+  local client_config updated_config=""
+  client_config=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/clients/${client_uuid}" 2>/dev/null) || true
+
+  if [[ -z "$client_config" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not read client config — CORS not updated)${RESET}"
+    return 0
+  fi
+
+  if [[ "$json_tool" == "jq" ]]; then
+    updated_config=$(echo "$client_config" | jq \
+      --arg h "$http_origin" \
+      --arg s "$https_origin" \
+      '.webOrigins = [$h, $s, "+"] | .redirectUris = ["http://localhost:*", "https://localhost:*", ($h + "/*"), ($s + "/*")]' \
+      2>/dev/null) || updated_config=""
+  else
+    updated_config=$(echo "$client_config" | \
+      HTTP_ORIGIN="$http_origin" HTTPS_ORIGIN="$https_origin" \
+      python3 -c "
+import sys, json, os
+d = json.load(sys.stdin)
+h = os.environ['HTTP_ORIGIN']
+s = os.environ['HTTPS_ORIGIN']
+d['webOrigins'] = [h, s, '+']
+d['redirectUris'] = ['http://localhost:*', 'https://localhost:*', h + '/*', s + '/*']
+print(json.dumps(d))" 2>/dev/null) || updated_config=""
+  fi
+
+  if [[ -z "$updated_config" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not patch client config — CORS not updated)${RESET}"
+    return 0
+  fi
+
+  local update_status
+  update_status=$(curl -sf -o /dev/null -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer ${admin_token}" \
+    -H "Content-Type: application/json" \
+    "${kc_base}/admin/realms/eddi/clients/${client_uuid}" \
+    -d "$updated_config" \
+    2>/dev/null) || update_status="000"
+
+  if [[ "$update_status" == "204" ]]; then
+    echo -e "${GREEN}✅${RESET}"
+  else
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(HTTP ${update_status} — CORS may not work for port ${EDDI_PORT})${RESET}"
+  fi
+
+  # ── Identity claims (client scopes) ─────────────────────
+  # Must not `return` early like the steps around it: the theme and default-role
+  # checks below still need to run.
+  repair_keycloak_identity_scopes "$kc_base" "$EDDI_DIR/keycloak/eddi-realm.json" \
+    "$json_tool" "$admin_token" "$client_uuid"
+
+  # ── EDDI login theme ────────────────────────────────────
+  # Realm import is one-shot: Keycloak skips realms that already exist, so a
+  # change to eddi-realm.json never reaches an existing installation. Set the
+  # theme through the Admin API so upgrades pick it up too. Idempotent.
+  echo -ne "  Applying EDDI login theme  "
+
+  local realm_config updated_realm=""
+  realm_config=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi" 2>/dev/null) || true
+
+  if [[ -z "$realm_config" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not read realm config — theme not applied)${RESET}"
+    return 0
+  fi
+
+  # GET-modify-PUT the full representation, same as the client update above.
+  if [[ "$json_tool" == "jq" ]]; then
+    # Branding is forced; locale settings are only seeded when the operator has
+    # not enabled internationalisation themselves. Overwriting them on every run
+    # would clobber a deliberately curated locale list.
+    updated_realm=$(echo "$realm_config" | jq \
+      '.loginTheme = "eddi" | .displayName = "EDDI" | .displayNameHtml = "EDDI"
+       | if (.internationalizationEnabled // false) then .
+         else .internationalizationEnabled = true
+              | .supportedLocales = ["ar","ca","cs","da","de","el","en","es","fa","fi","fr","hu","it","ja","ko","lt","lv","nl","no","pl","pt","pt-BR","ru","sk","sv","th","tr","uk","zh-CN","zh-TW"]
+              | .defaultLocale = "en" end' \
+      2>/dev/null) || updated_realm=""
+  else
+    updated_realm=$(echo "$realm_config" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['loginTheme'] = 'eddi'
+d['displayName'] = 'EDDI'
+d['displayNameHtml'] = 'EDDI'
+# Branding is forced; locale settings are only seeded when the operator has not
+# enabled internationalisation themselves, so a curated list survives. Enabling
+# it is also what puts lang/dir on <html> (WCAG 3.1.1).
+if not d.get('internationalizationEnabled'):
+    d['internationalizationEnabled'] = True
+    d['supportedLocales'] = ['ar','ca','cs','da','de','el','en','es','fa','fi','fr','hu','it','ja','ko','lt','lv','nl','no','pl','pt','pt-BR','ru','sk','sv','th','tr','uk','zh-CN','zh-TW']
+    d['defaultLocale'] = 'en'
+print(json.dumps(d))" 2>/dev/null) || updated_realm=""
+  fi
+
+  if [[ -z "$updated_realm" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not patch realm config — theme not applied)${RESET}"
+    return 0
+  fi
+
+  local theme_status
+  # No -f here: with it curl exits non-zero on 4xx/5xx and the real status is
+  # lost to the || fallback, so every failure would report HTTP 000.
+  theme_status=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer ${admin_token}" \
+    -H "Content-Type: application/json" \
+    "${kc_base}/admin/realms/eddi" \
+    -d "$updated_realm" \
+    2>/dev/null) || theme_status="000"
+
+  if [[ "$theme_status" == "204" ]]; then
+    echo -e "${GREEN}✅${RESET}"
+  else
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(HTTP ${theme_status} — login page will use the default theme)${RESET}"
+  fi
+
+  # ── Admin console login ─────────────────────────────────
+  # The admin console authenticates against the `master` realm, which is
+  # Keycloak's own and is not part of eddi-realm.json — so without this it keeps
+  # the stock Keycloak page while the EDDI realm is branded. Only applied when
+  # master has no login theme of its own: on a Keycloak shared with other
+  # products, an operator's existing admin branding wins.
+  echo -ne "  Theming admin console login  "
+
+  local master_config master_theme updated_master=""
+  master_config=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/master" 2>/dev/null) || master_config=""
+
+  if [[ -z "$master_config" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not read master realm — left unthemed)${RESET}"
+    return 0
+  fi
+
+  if [[ "$json_tool" == "jq" ]]; then
+    master_theme=$(echo "$master_config" | jq -r '.loginTheme // ""' 2>/dev/null)
+  else
+    master_theme=$(echo "$master_config" | python3 -c "
+import sys, json
+print(json.load(sys.stdin).get('loginTheme') or '')" 2>/dev/null)
+  fi
+
+  if [[ -n "$master_theme" ]]; then
+    echo -e "${GREEN}✅${RESET}  ${DIM}(kept existing theme '${master_theme}')${RESET}"
+    return 0
+  fi
+
+  if [[ "$json_tool" == "jq" ]]; then
+    # Also enable internationalisation. master ships with it off, which means
+    # no lang/dir on <html> (WCAG 3.1.1) on a page we now brand. A single
+    # supported locale adds the attributes without adding a locale switcher,
+    # and loses nothing: with i18n off the page was English-only anyway.
+    updated_master=$(echo "$master_config" | jq \
+      '.loginTheme = "eddi"
+       | .displayNameHtml = "EDDI"
+       | if (.internationalizationEnabled // false) then .
+         else .internationalizationEnabled = true
+              | .supportedLocales = ["ar","ca","cs","da","de","el","en","es","fa","fi","fr","hu","it","ja","ko","lt","lv","nl","no","pl","pt","pt-BR","ru","sk","sv","th","tr","uk","zh-CN","zh-TW"]
+              | .defaultLocale = "en" end' 2>/dev/null) || updated_master=""
+  else
+    updated_master=$(echo "$master_config" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['loginTheme'] = 'eddi'
+# master's displayNameHtml ships as a div.kc-logo-text, which keycloak.v2 still
+# styles with the Keycloak logo — it renders on top of ours. Plain text also
+# gives the header a correct accessible name. displayName is left alone: it
+# labels the realm in the admin console's realm selector.
+d['displayNameHtml'] = 'EDDI'
+# master ships with i18n off, so <html> gets no lang/dir (WCAG 3.1.1) on a page
+# we now brand. One supported locale adds them without adding a switcher, and
+# loses nothing: with i18n off the page was English-only anyway.
+if not d.get('internationalizationEnabled'):
+    d['internationalizationEnabled'] = True
+    d['supportedLocales'] = ['ar','ca','cs','da','de','el','en','es','fa','fi','fr','hu','it','ja','ko','lt','lv','nl','no','pl','pt','pt-BR','ru','sk','sv','th','tr','uk','zh-CN','zh-TW']
+    d['defaultLocale'] = 'en'
+print(json.dumps(d))" 2>/dev/null) || updated_master=""
+  fi
+
+  if [[ -z "$updated_master" ]]; then
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(could not patch master realm — left unthemed)${RESET}"
+    return 0
+  fi
+
+  local master_status
+  master_status=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+    -H "Authorization: Bearer ${admin_token}" \
+    -H "Content-Type: application/json" \
+    "${kc_base}/admin/realms/master" \
+    -d "$updated_master" \
+    2>/dev/null) || master_status="000"
+
+  if [[ "$master_status" == "204" ]]; then
+    echo -e "${GREEN}✅${RESET}"
+  else
+    echo -e "${YELLOW}⚠️${RESET}  ${DIM}(HTTP ${master_status} — admin console keeps the default theme)${RESET}"
+  fi
+
+  # -- Default-role safety check ---------------------------
+  # Realms created before this was fixed composite default-roles-eddi to
+  # eddi-admin/eddi-editor, so any user created without explicit roles - which
+  # is what self-registration produces - becomes an admin. Realm import is
+  # one-shot and will not correct it.
+  #
+  # This only WARNS. Unlike the branding fields, changing it is an authorization
+  # decision: an operator may have granted elevated defaults deliberately, and
+  # silently stripping them during an upgrade would be worse than leaving them.
+  # Fresh installs get the safe value from eddi-realm.json.
+  local default_composites elevated=""
+  default_composites=$(curl -sf \
+    -H "Authorization: Bearer ${admin_token}" \
+    "${kc_base}/admin/realms/eddi/roles/default-roles-eddi/composites" 2>/dev/null) || default_composites=""
+
+  if [[ -n "$default_composites" ]]; then
+    if [[ "$json_tool" == "jq" ]]; then
+      elevated=$(echo "$default_composites" \
+        | jq -r '[.[].name] | map(select(. == "eddi-admin" or . == "eddi-editor")) | join(", ")' 2>/dev/null)
+    else
+      elevated=$(echo "$default_composites" | python3 -c "
+import sys, json
+names = [r.get('name') for r in json.load(sys.stdin)]
+print(', '.join(n for n in names if n in ('eddi-admin', 'eddi-editor')))" 2>/dev/null)
+    fi
+
+    if [[ -n "$elevated" ]]; then
+      echo ""
+      warn "This realm grants ${elevated} to every new user by default."
+      echo -e "     ${DIM}Harmless while self-registration is off, but enabling it would${RESET}"
+      echo -e "     ${DIM}make everyone who signs up an admin. New installs no longer do this.${RESET}"
+      echo -e "     ${DIM}To fix: Admin console -> Realm roles -> default-roles-eddi ->${RESET}"
+      echo -e "     ${DIM}Associated roles -> remove ${elevated}.${RESET}"
+      echo -e "     ${DIM}Left unchanged on purpose: it may be deliberate here.${RESET}"
+    fi
+  fi
+}
+
+# ── Success banner ────────────────────────────────────────
+
+print_success() {
+  echo ""
+  echo -e "${GREEN}${BOLD}─── 🎉 Setup Complete! ────────────────────────────${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Dashboard${RESET}  →  ${CYAN}http://localhost:${EDDI_PORT}${RESET}"
+  echo -e "  ${BOLD}HTTPS${RESET}      →  ${CYAN}https://localhost:${EDDI_HTTPS_PORT}${RESET}"
+  echo -e "  ${BOLD}MCP${RESET}        →  ${CYAN}http://localhost:${EDDI_PORT}/mcp${RESET}"
+  echo -e "  ${BOLD}API docs${RESET}   →  ${CYAN}http://localhost:${EDDI_PORT}/q/swagger-ui${RESET}"
+
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Grafana${RESET}    →  ${CYAN}http://localhost:${GRAFANA_PORT}${RESET}  ${DIM}(admin/admin)${RESET}"
+    echo -e "  ${BOLD}Prometheus${RESET} →  ${CYAN}http://localhost:${PROMETHEUS_PORT}${RESET}"
+    echo -e "  ${BOLD}Jaeger${RESET}     →  ${CYAN}http://localhost:${JAEGER_PORT}${RESET}  ${DIM}(trace visualization)${RESET}"
+  fi
+
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    echo ""
+    echo -e "  ${BOLD}┌─ 🔐 Login Credentials ─────────────────────────────┐${RESET}"
+    echo -e "  ${BOLD}│${RESET}                                                    ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}│${RESET}  EDDI Admin:  ${CYAN}eddi / eddi${RESET}  (change on first login) ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}│${RESET}  Read-only:   ${CYAN}viewer / viewer${RESET}                      ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}│${RESET}                                                    ${BOLD}│${RESET}"
+    # Padded to the width of the default URL so the box stays square
+    local kc_url
+    printf -v kc_url '%-21s' "http://localhost:${KEYCLOAK_PORT}"
+    echo -e "  ${BOLD}│${RESET}  Keycloak Console:  ${CYAN}${kc_url}${RESET}           ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}│${RESET}  Console Admin:     ${CYAN}admin / admin${RESET}                  ${BOLD}│${RESET}"
+    echo -e "  ${BOLD}└────────────────────────────────────────────────────┘${RESET}"
+  fi
+
+  echo ""
+  echo -e "  ${YELLOW}┌─ 🔑 Vault Master Key ──────────────────────────────┐${RESET}"
+  echo -e "  ${YELLOW}│                                                    │${RESET}"
+  echo -e "  ${YELLOW}│${RESET}  Stored in: ${BOLD}${EDDI_DIR}/.env${RESET}${YELLOW}                      │${RESET}"
+  echo -e "  ${YELLOW}│${RESET}  ${DIM}Back up this file! If lost, encrypted${RESET}${YELLOW}             │${RESET}"
+  echo -e "  ${YELLOW}│${RESET}  ${DIM}secrets (API keys) are unrecoverable.${RESET}${YELLOW}             │${RESET}"
+  echo -e "  ${YELLOW}└────────────────────────────────────────────────────┘${RESET}"
+  echo ""
+  echo -e "  ${BOLD}🤖 Ready to create your first agent?${RESET}"
+  echo -e "     Activate the Platform Operator at ${CYAN}http://localhost:${EDDI_PORT}/manage/operator${RESET}"
+  echo "     and just describe the agent you want — it builds and deploys it for you."
+  echo -e "     Prefer a form? The wizard is at ${CYAN}http://localhost:${EDDI_PORT}/manage/agents/wizard${RESET}"
+  echo ""
+  echo -e "  ${DIM}┌─ Claude Desktop / Cursor ──────────────────────────┐${RESET}"
+  echo -e "  ${DIM}│ Add to your MCP config:                            │${RESET}"
+  echo -e "  ${DIM}│   \"eddi\": { \"url\": \"http://localhost:${EDDI_PORT}/mcp\" }   │${RESET}"
+  echo -e "  ${DIM}└────────────────────────────────────────────────────┘${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Manage EDDI:${RESET}"
+  echo "    eddi status     health + deployed agents"
+  echo "    eddi logs       view container logs"
+  echo "    eddi stop       stop all containers"
+  echo "    eddi update     pull latest version"
+  echo ""
+  echo -e "  ${DIM}Install dir: ${EDDI_DIR}${RESET}"
+  echo ""
+
+  # Try to open browser — Manager SPA handles Keycloak login if auth is enabled
+  local url="http://localhost:${EDDI_PORT}/manage"
+  case "$PLATFORM" in
+    macos) open "$url" 2>/dev/null || true ;;
+    wsl)   explorer.exe "$url" 2>/dev/null || true ;;
+    linux) xdg-open "$url" 2>/dev/null || true ;;
+  esac
+}
+
+# ── Install eddi CLI wrapper ─────────────────────────────
+
+install_cli_wrapper() {
+  local cli_path="$EDDI_DIR/eddi"
+
+  cat > "$cli_path" << 'EDDI_CLI'
+#!/usr/bin/env bash
+set -euo pipefail
+
+EDDI_DIR="${EDDI_DIR:-$HOME/.eddi}"
+CONFIG_FILE="$EDDI_DIR/.eddi-config"
+ENV_FILE="$EDDI_DIR/.env"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "EDDI not installed. Run the install script first."
+  exit 1
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "EDDI .env file missing. Run the install script first."
+  exit 1
+fi
+
+# Safe config parsing — no source/eval to prevent code injection
+_cfg() { grep "^$1=" "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//;s/"$//'; }
+EDDI_PORT=$(_cfg EDDI_PORT)
+EDDI_HTTPS_PORT=$(_cfg EDDI_HTTPS_PORT)
+EDDI_BRANCH="${EDDI_BRANCH:-$(_cfg EDDI_BRANCH)}"
+EDDI_BRANCH="${EDDI_BRANCH:-main}"
+if [[ ! "$EDDI_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+  echo "Invalid EDDI_BRANCH: $EDDI_BRANCH" >&2
+  exit 1
+fi
+COMPOSE_BASE_URL="https://raw.githubusercontent.com/labsai/EDDI/${EDDI_BRANCH}"
+
+# Parse compose files into array (handles paths with spaces)
+read -ra COMPOSE_FILE_LIST <<< "$(_cfg COMPOSE_FILES)"
+
+# Build compose command args as a proper array
+compose_args=(--env-file "$ENV_FILE")
+for f in "${COMPOSE_FILE_LIST[@]}"; do
+  compose_args+=(-f "$f")
+done
+
+case "${1:-help}" in
+  start)
+    docker compose "${compose_args[@]}" up -d
+    echo "EDDI started on port ${EDDI_PORT}"
+    ;;
+  stop)
+    docker compose "${compose_args[@]}" down
+    echo "EDDI stopped."
+    ;;
+  restart)
+    docker compose "${compose_args[@]}" down
+    docker compose "${compose_args[@]}" up -d
+    echo "EDDI restarted."
+    ;;
+  status)
+    echo "Containers:"
+    docker compose "${compose_args[@]}" ps
+    echo ""
+    if curl -sf "http://localhost:${EDDI_PORT}/q/health/ready" &>/dev/null; then
+      echo "Health: ✅ ready"
+      AGENT_COUNT=$(curl -sf "http://localhost:${EDDI_PORT}/administration/production/deploymentstatus" 2>/dev/null | grep -o '"agentId"' | wc -l || echo "0")
+      echo "Deployed agents: $AGENT_COUNT"
+    else
+      echo "Health: ❌ not ready"
+    fi
+    ;;
+  logs)
+    shift
+    docker compose "${compose_args[@]}" logs "${@}"
+    ;;
+  update)
+    # Optional: eddi update --eddi-version=<tag>
+    NEW_VERSION=""
+    for arg in "${@:2}"; do
+      case "$arg" in
+        --eddi-version=*) NEW_VERSION="${arg#*=}" ;;
+      esac
+    done
+
+    if [[ -n "$NEW_VERSION" ]]; then
+      echo "Pinning EDDI_VERSION=${NEW_VERSION} in ${ENV_FILE}..."
+      if grep -q '^EDDI_VERSION=' "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^EDDI_VERSION=.*|EDDI_VERSION=${NEW_VERSION}|" "$ENV_FILE"
+      else
+        echo "EDDI_VERSION=${NEW_VERSION}" >> "$ENV_FILE"
+      fi
+    fi
+
+    echo "Refreshing compose files from GitHub..."
+    for f in "${COMPOSE_FILE_LIST[@]}"; do
+      local_name=$(basename "$f")
+      download_url="${COMPOSE_BASE_URL}/${local_name}"
+      tmp_file="${f}.tmp"
+      echo -n "  Updating ${local_name}... "
+      if curl -fsSL "${download_url}" -o "$tmp_file" 2>/dev/null && [[ -s "$tmp_file" ]]; then
+        mv -f "$tmp_file" "$f"
+        echo "✅"
+      else
+        rm -f "$tmp_file"
+        echo "⚠️  (keeping existing file)"
+      fi
+    done
+
+    # Refreshing the compose files above can introduce new file-type bind
+    # mounts. When a bind-mount source is missing Docker creates a *directory*
+    # at that path, which either silently drops the dashboard or fails the mount
+    # outright depending on what the grafana-data volume already holds — and in
+    # the first case leaves a stale directory inside the volume that keeps
+    # failing the mount even after the host file is restored. So any monitoring
+    # asset added upstream has to be on disk BEFORE `up -d`: refreshing the
+    # compose files on their own is what breaks a previously working Grafana.
+    #
+    # The list is read out of the refreshed compose file instead of hardcoded
+    # here, so the next asset added to docker-compose.monitoring.yml needs no
+    # change to this wrapper. Only file-type mounts are fetched; the
+    # grafana-provisioning/* mounts are directories, which cannot be downloaded
+    # and do not fail the mount when their contents are stale.
+    monitoring_compose=""
+    for f in "${COMPOSE_FILE_LIST[@]}"; do
+      if [[ "$(basename "$f")" == "docker-compose.monitoring.yml" ]]; then
+        monitoring_compose="$f"
+      fi
+    done
+
+    if [[ -n "$monitoring_compose" && -f "$monitoring_compose" ]]; then
+      echo ""
+      echo "Refreshing monitoring assets..."
+      compose_dir=$(cd "$(dirname "$monitoring_compose")" && pwd)
+      missing_assets=""
+      while read -r rel_path; do
+        [[ -n "$rel_path" ]] || continue
+        asset="${rel_path#./}"
+        target="${compose_dir}/${asset}"
+        mkdir -p "$(dirname "$target")"
+        # -rf, not -f: what is in the way is most likely a DIRECTORY left behind
+        # by an earlier failed mount, and `rm -f` cannot remove one.
+        if [[ -d "$target" ]]; then
+          rm -rf "$target"
+        fi
+        tmp_asset="${target}.tmp"
+        echo -n "  Updating ${asset}... "
+        if curl -fsSL "${COMPOSE_BASE_URL}/${asset}" -o "$tmp_asset" 2>/dev/null && [[ -s "$tmp_asset" ]]; then
+          mv -f "$tmp_asset" "$target"
+          echo "✅"
+        elif [[ -f "$target" ]]; then
+          rm -f "$tmp_asset"
+          echo "⚠️  (keeping existing file)"
+        else
+          rm -f "$tmp_asset"
+          echo "❌"
+          missing_assets="${missing_assets} ${asset}"
+        fi
+      done < <(grep -oE '\./docs/monitoring/[A-Za-z0-9._/-]+\.(json|ya?ml)' "$monitoring_compose" | sort -u || true)
+
+      if [[ -n "$missing_assets" ]]; then
+        echo ""
+        echo "Aborting before restart. These files are bind-mounted by" >&2
+        echo "docker-compose.monitoring.yml but are not on disk and could not be" >&2
+        echo "downloaded:" >&2
+        for a in $missing_assets; do echo "  - $a" >&2; done
+        echo "Starting now would leave Grafana unable to mount them, so the" >&2
+        echo "running stack has been left untouched. Re-run once GitHub is" >&2
+        echo "reachable, or re-run the install script." >&2
+        exit 1
+      fi
+    fi
+
+    echo ""
+    echo "Pulling images..."
+    docker compose "${compose_args[@]}" pull
+    docker compose "${compose_args[@]}" up -d
+    echo "EDDI updated."
+    ;;
+  uninstall)
+    # Sanity check: refuse to delete if EDDI_DIR doesn't look right
+    if [[ ! "$EDDI_DIR" == *"/.eddi"* ]] && [[ ! "$EDDI_DIR" == *"\.eddi"* ]]; then
+      echo "EDDI_DIR doesn't look safe to delete: $EDDI_DIR"
+      exit 1
+    fi
+    echo "This will stop EDDI and remove all data."
+    read -rp "Are you sure? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      docker compose "${compose_args[@]}" down -v
+      rm -rf "$EDDI_DIR"
+      echo "EDDI uninstalled."
+    fi
+    ;;
+  help|--help|-h|*)
+    echo "EDDI CLI"
+    echo ""
+    echo "Usage: eddi <command>"
+    echo ""
+    echo "Commands:"
+    echo "  start                          Start EDDI containers"
+    echo "  stop                           Stop EDDI containers"
+    echo "  restart                        Restart EDDI containers"
+    echo "  status                         Show health and agent count"
+    echo "  logs [-f]                      View container logs"
+    echo "  update [--eddi-version=<tag>]  Refresh configs, pull images, restart"
+    echo "  uninstall                      Remove EDDI and all data"
+    ;;
+esac
+EDDI_CLI
+
+  chmod +x "$cli_path"
+
+  # Try to symlink into PATH
+  local link_target=""
+  if [[ -d "$HOME/.local/bin" ]]; then
+    link_target="$HOME/.local/bin/eddi"
+  elif [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
+    link_target="/usr/local/bin/eddi"
+  fi
+
+  if [[ -n "$link_target" ]]; then
+    ln -sf "$cli_path" "$link_target" 2>/dev/null || true
+  else
+    echo -e "  ${DIM}Tip: Add ${EDDI_DIR} to your PATH to use 'eddi' command${RESET}"
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────
+
+print_config_summary() {
+  section "Configuration"
+  local db_label="MongoDB"
+  [[ "${DB_CHOICE:-1}" == "2" ]] && db_label="PostgreSQL"
+  echo -e "  EDDI version:   ${BOLD}${EDDI_VERSION}${RESET}"
+  echo -e "  Database:       ${BOLD}${db_label}${RESET}"
+  echo -e "  Vault:          ${BOLD}🔒 enabled${RESET} ${DIM}(unique key)${RESET}"
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    echo -e "  Authentication: ${BOLD}Keycloak${RESET}"
+  else
+    echo -e "  Authentication: ${DIM}open access${RESET}"
+  fi
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    echo -e "  Monitoring:     ${BOLD}Grafana + Prometheus${RESET}"
+  else
+    echo -e "  Monitoring:     ${DIM}none${RESET}"
+  fi
+  echo -e "  Port:           ${BOLD}${EDDI_PORT}${RESET} (HTTP), ${BOLD}${EDDI_HTTPS_PORT}${RESET} (HTTPS)"
+  [[ -n "$MONGO_PORT" ]] && echo -e "  MongoDB port:   ${BOLD}${MONGO_PORT}${RESET}"
+  if [[ "$WITH_AUTH" == "true" ]]; then
+    echo -e "  Keycloak port:  ${BOLD}${KEYCLOAK_PORT}${RESET}"
+  fi
+  if [[ "$WITH_MONITORING" == "true" ]]; then
+    echo -e "  Grafana port:   ${BOLD}${GRAFANA_PORT}${RESET}"
+    echo -e "  Prometheus:     ${BOLD}${PROMETHEUS_PORT}${RESET}"
+    echo -e "  Jaeger port:    ${BOLD}${JAEGER_PORT}${RESET} ${DIM}(OTLP ${OTLP_GRPC_PORT}/${OTLP_HTTP_PORT})${RESET}"
+  fi
+  echo -e "  Install dir:    ${BOLD}${EDDI_DIR}${RESET}"
+}
+
+main() {
+  local start_time
+  start_time=$(date +%s)
+
+  banner
+  check_prerequisites
+
+  if [[ "$EDDI_ALREADY_RUNNING" == "true" ]]; then
+    # EDDI is already running — skip infra, check agents
+    section "EDDI Already Running"
+    # Ensure .eddi-config exists (may be missing if EDDI was started manually)
+    if [[ ! -f "$EDDI_DIR/.eddi-config" ]]; then
+      warn "No .eddi-config found — creating minimal config for CLI wrapper."
+      mkdir -p "$EDDI_DIR"
+      cat > "$EDDI_DIR/.eddi-config" <<CFGEOF
+COMPOSE_FILES=$EDDI_DIR/docker-compose.yml
+EDDI_PORT=$EDDI_PORT
+EDDI_HTTPS_PORT=$EDDI_HTTPS_PORT
+CFGEOF
+      chmod 600 "$EDDI_DIR/.eddi-config"
+    fi
+    repair_running_keycloak
+    install_cli_wrapper
+    print_success
+    exit 0
+  fi
+
+  # Interactive wizard
+  wizard_database
+  wizard_security
+  wizard_auth
+  wizard_monitoring
+  wizard_ports
+
+  # Show chosen config
+  print_config_summary
+
+  # Download and start
+  resolve_compose_files
+  start_eddi
+  wait_for_ready
+  configure_keycloak_client
+
+  # Install CLI wrapper
+  install_cli_wrapper
+
+  # Done!
+  local end_time
+  end_time=$(date +%s)
+  local elapsed=$(( end_time - start_time ))
+  print_success
+  echo -e "  ${DIM}Total setup time: ${elapsed}s${RESET}"
+  echo ""
+}
+
+main "$@"

@@ -1,0 +1,468 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.configs.groups.model;
+
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.ContextScope;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.DiscussionPhase;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.DiscussionStyle;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.PhaseType;
+import ai.labs.eddi.configs.groups.model.AgentGroupConfiguration.TurnOrder;
+import io.quarkus.qute.Engine;
+import io.quarkus.qute.ReflectionValueResolver;
+import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for {@link DiscussionStylePresets} — verifies that each style
+ * preset expands into the correct sequence of phases with proper configuration.
+ */
+class DiscussionStylePresetsTest {
+
+    // --- ROUND_TABLE ---
+
+    @Test
+    void roundTable_singleRound_producesOpinionAndSynthesis() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.ROUND_TABLE, 1);
+
+        assertEquals(2, phases.size());
+
+        // Phase 0: Initial opinion (no context)
+        var opinion = phases.get(0);
+        assertEquals(PhaseType.OPINION, opinion.type());
+        assertEquals(ContextScope.NONE, opinion.contextScope());
+        assertEquals("ALL", opinion.participants());
+        assertEquals(1, opinion.repeats());
+
+        // Phase 1: Synthesis
+        var synthesis = phases.get(1);
+        assertEquals(PhaseType.SYNTHESIS, synthesis.type());
+        assertEquals("MODERATOR", synthesis.participants());
+    }
+
+    @Test
+    void roundTable_multipleRounds_producesOpinionDiscussionAndSynthesis() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.ROUND_TABLE, 3);
+
+        assertEquals(3, phases.size());
+
+        // Phase 0: Independent opinion
+        assertEquals(PhaseType.OPINION, phases.get(0).type());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+        assertEquals(1, phases.get(0).repeats());
+
+        // Phase 1: Discussion (with context, repeats=2)
+        assertEquals(PhaseType.OPINION, phases.get(1).type());
+        assertEquals(ContextScope.FULL, phases.get(1).contextScope());
+        assertEquals(2, phases.get(1).repeats());
+
+        // Phase 2: Synthesis
+        assertEquals(PhaseType.SYNTHESIS, phases.get(2).type());
+    }
+
+    // --- PEER_REVIEW ---
+
+    @Test
+    void peerReview_produces4Phases() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.PEER_REVIEW, 2);
+
+        assertEquals(4, phases.size());
+
+        // Phase 0: Independent opinions (parallel, no context)
+        assertEquals(PhaseType.OPINION, phases.get(0).type());
+        assertEquals(TurnOrder.PARALLEL, phases.get(0).turnOrder());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+        assertFalse(phases.get(0).targetEachPeer());
+
+        // Phase 1: Critique (sequential, each→each peer)
+        assertEquals(PhaseType.CRITIQUE, phases.get(1).type());
+        assertEquals(TurnOrder.SEQUENTIAL, phases.get(1).turnOrder());
+        assertTrue(phases.get(1).targetEachPeer());
+
+        // Phase 2: Revision (parallel, own feedback only)
+        assertEquals(PhaseType.REVISION, phases.get(2).type());
+        assertEquals(TurnOrder.PARALLEL, phases.get(2).turnOrder());
+        assertEquals(ContextScope.OWN_FEEDBACK, phases.get(2).contextScope());
+
+        // Phase 3: Synthesis
+        assertEquals(PhaseType.SYNTHESIS, phases.get(3).type());
+        assertEquals("MODERATOR", phases.get(3).participants());
+    }
+
+    // --- DEVIL_ADVOCATE ---
+
+    @Test
+    void devilAdvocate_produces4Phases() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.DEVIL_ADVOCATE, 1);
+
+        assertEquals(4, phases.size());
+
+        // Phase 0: Independent opinions
+        assertEquals(PhaseType.OPINION, phases.get(0).type());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+
+        // Phase 1: Challenge (only devil's advocate)
+        assertEquals(PhaseType.CHALLENGE, phases.get(1).type());
+        assertEquals("ROLE:DEVIL_ADVOCATE", phases.get(1).participants());
+
+        // Phase 2: Defense (all agents)
+        assertEquals(PhaseType.DEFENSE, phases.get(2).type());
+        assertEquals("ALL", phases.get(2).participants());
+
+        // Phase 3: Synthesis
+        assertEquals(PhaseType.SYNTHESIS, phases.get(3).type());
+    }
+
+    // --- DELPHI ---
+
+    @Test
+    void delphi_producesAnonymousRoundsAndSynthesis() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.DELPHI, 3);
+
+        assertEquals(4, phases.size()); // 1 independent + 2 anonymous + synthesis
+
+        // Phase 0: Independent (no context, parallel)
+        assertEquals(PhaseType.OPINION, phases.get(0).type());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+        assertEquals(TurnOrder.PARALLEL, phases.get(0).turnOrder());
+
+        // Phases 1-2: Anonymous rounds
+        for (int i = 1; i <= 2; i++) {
+            assertEquals(PhaseType.OPINION, phases.get(i).type());
+            assertEquals(ContextScope.ANONYMOUS, phases.get(i).contextScope());
+            assertEquals(TurnOrder.PARALLEL, phases.get(i).turnOrder());
+        }
+
+        // Last: Synthesis
+        assertEquals(PhaseType.SYNTHESIS, phases.getLast().type());
+    }
+
+    // --- DEBATE ---
+
+    @Test
+    void debate_produces5Phases() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.DEBATE, 2);
+
+        assertEquals(5, phases.size());
+
+        // Phase 0: Pro opening (no context)
+        assertEquals(PhaseType.ARGUE, phases.get(0).type());
+        assertEquals("ROLE:PRO", phases.get(0).participants());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+
+        // Phase 1: Con opening (sees pro)
+        assertEquals(PhaseType.ARGUE, phases.get(1).type());
+        assertEquals("ROLE:CON", phases.get(1).participants());
+        assertEquals(ContextScope.FULL, phases.get(1).contextScope());
+
+        // Phase 2: Pro rebuttal
+        assertEquals(PhaseType.REBUTTAL, phases.get(2).type());
+        assertEquals("ROLE:PRO", phases.get(2).participants());
+
+        // Phase 3: Con rebuttal
+        assertEquals(PhaseType.REBUTTAL, phases.get(3).type());
+        assertEquals("ROLE:CON", phases.get(3).participants());
+
+        // Phase 4: Judgment
+        assertEquals(PhaseType.SYNTHESIS, phases.get(4).type());
+        assertEquals("MODERATOR", phases.get(4).participants());
+    }
+
+    // --- CUSTOM / null ---
+
+    @Test
+    void custom_returnsEmptyList() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.CUSTOM, 2);
+        assertTrue(phases.isEmpty());
+    }
+
+    @Test
+    void null_returnsEmptyList() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(null, 2);
+        assertTrue(phases.isEmpty());
+    }
+
+    // --- Default templates ---
+
+    @Test
+    void defaultTemplate_returnsNonNullForAllPhaseTypes() {
+        for (PhaseType type : PhaseType.values()) {
+            String template = DiscussionStylePresets.defaultTemplate(type);
+            assertNotNull(template, "Template should not be null for " + type);
+            assertFalse(template.isBlank(), "Template should not be blank for " + type);
+        }
+    }
+
+    @Test
+    void defaultTemplate_synthesisContainsTranscriptVariable() {
+        String template = DiscussionStylePresets.defaultTemplate(PhaseType.SYNTHESIS);
+        assertTrue(template.contains("in transcript}") || template.contains("transcript"),
+                "Synthesis template should reference transcript variable, got: " + template);
+    }
+
+    @Test
+    void defaultTemplate_critiqueContainsTargetVariables() {
+        String template = DiscussionStylePresets.defaultTemplate(PhaseType.CRITIQUE);
+        assertTrue(template.contains("{targetName}"), "Critique template should reference targetName");
+        assertTrue(template.contains("{targetResponse}"), "Critique template should reference targetResponse");
+    }
+
+    // --- DiscussionPhase convenience constructor ---
+
+    @Test
+    void discussionPhase_convenienceConstructor_appliesDefaults() {
+        var phase = new DiscussionPhase("Test", PhaseType.OPINION);
+
+        assertEquals("Test", phase.name());
+        assertEquals(PhaseType.OPINION, phase.type());
+        assertEquals("ALL", phase.participants());
+        assertEquals(TurnOrder.SEQUENTIAL, phase.turnOrder());
+        assertEquals(ContextScope.FULL, phase.contextScope());
+        assertFalse(phase.targetEachPeer());
+        assertNull(phase.inputTemplate());
+        assertEquals(1, phase.repeats());
+    }
+
+    // --- Edge cases ---
+
+    @Test
+    void roundTable_maxRoundsZero_treatsAsOne() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.ROUND_TABLE, 0);
+
+        // Should produce at minimum: 1 opinion + synthesis
+        assertFalse(phases.isEmpty());
+        assertEquals(PhaseType.OPINION, phases.getFirst().type());
+        assertEquals(PhaseType.SYNTHESIS, phases.getLast().type());
+    }
+
+    @Test
+    void delphi_singleRound_producesOneOpinionAndSynthesis() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.DELPHI, 1);
+
+        assertEquals(2, phases.size());
+        assertEquals(PhaseType.OPINION, phases.get(0).type());
+        assertEquals(ContextScope.NONE, phases.get(0).contextScope());
+        assertEquals(PhaseType.SYNTHESIS, phases.get(1).type());
+    }
+
+    // --- TASK_FORCE ---
+
+    @Test
+    void taskForce_produces4Phases() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.TASK_FORCE, 1);
+        assertEquals(4, phases.size());
+    }
+
+    @Test
+    void taskForce_phaseTypes() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.TASK_FORCE, 1);
+        assertEquals(PhaseType.PLAN, phases.get(0).type());
+        assertEquals(PhaseType.EXECUTE, phases.get(1).type());
+        assertEquals(PhaseType.VERIFY, phases.get(2).type());
+        assertEquals(PhaseType.SYNTHESIS, phases.get(3).type());
+    }
+
+    // --- NEGOTIATION (I11) ---
+
+    @Test
+    void negotiation_produces5Phases_withTheProtocolShape() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.NEGOTIATION, 3);
+
+        assertEquals(5, phases.size());
+
+        // ① Positions & Interests — PARALLEL and context-free: parties state
+        // genuine interests before anchoring on each other.
+        var positions = phases.get(0);
+        assertEquals(PhaseType.OPINION, positions.type());
+        assertEquals(TurnOrder.PARALLEL, positions.turnOrder());
+        assertEquals(ContextScope.NONE, positions.contextScope());
+
+        // ② Opening Proposals
+        var proposals = phases.get(1);
+        assertEquals(PhaseType.PROPOSAL, proposals.type());
+        assertEquals("ALL", proposals.participants());
+
+        // ③ Bargaining — repeats = maxRounds; the loop exits early on agreement.
+        var bargaining = phases.get(2);
+        assertEquals(PhaseType.BARGAIN, bargaining.type());
+        assertEquals(3, bargaining.repeats());
+        assertEquals(TurnOrder.SEQUENTIAL, bargaining.turnOrder());
+
+        // ④ Arbitration — MODERATOR, skipped entirely when agreement was reached,
+        // with its own template (the default SYNTHESIS asks for a balanced
+        // summary; an arbitrator DECIDES).
+        var arbitration = phases.get(3);
+        assertEquals(PhaseType.SYNTHESIS, arbitration.type());
+        assertEquals("MODERATOR", arbitration.participants());
+        assertEquals(AgentGroupConfiguration.PhaseSkipCondition.AGREEMENT_REACHED, arbitration.skipIf());
+        assertEquals(DiscussionStylePresets.TEMPLATE_ARBITRATION, arbitration.inputTemplate());
+
+        // ⑤ Synthesis
+        var synthesis = phases.get(4);
+        assertEquals(PhaseType.SYNTHESIS, synthesis.type());
+        assertEquals("MODERATOR", synthesis.participants());
+        assertNull(synthesis.skipIf(), "only the arbitration is conditional");
+    }
+
+    @Test
+    void taskForce_turnOrders() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.TASK_FORCE, 1);
+        assertEquals(TurnOrder.SEQUENTIAL, phases.get(0).turnOrder()); // PLAN
+        assertEquals(TurnOrder.PARALLEL, phases.get(1).turnOrder()); // EXECUTE
+        assertEquals(TurnOrder.SEQUENTIAL, phases.get(2).turnOrder()); // VERIFY
+        assertEquals(TurnOrder.SEQUENTIAL, phases.get(3).turnOrder()); // SYNTHESIS
+    }
+
+    @Test
+    void taskForce_contextScopes() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.TASK_FORCE, 1);
+        assertEquals(ContextScope.FULL, phases.get(0).contextScope()); // PLAN
+        assertEquals(ContextScope.TASK_ONLY, phases.get(1).contextScope()); // EXECUTE
+        assertEquals(ContextScope.FULL, phases.get(2).contextScope()); // VERIFY
+        assertEquals(ContextScope.FULL, phases.get(3).contextScope()); // SYNTHESIS
+    }
+
+    @Test
+    void taskForce_participants() {
+        List<DiscussionPhase> phases = DiscussionStylePresets.expand(DiscussionStyle.TASK_FORCE, 1);
+        assertEquals("MODERATOR", phases.get(0).participants()); // PLAN
+        assertEquals("ALL", phases.get(1).participants()); // EXECUTE
+        assertEquals("MODERATOR", phases.get(2).participants()); // VERIFY
+        assertEquals("MODERATOR", phases.get(3).participants()); // SYNTHESIS
+    }
+
+    // =================================================================
+    // I3 — the judgment template must survive Qute
+    // =================================================================
+
+    @Test
+    void debateJudgmentTemplate_survivesQuteRendering() {
+        // Every other test in the I3 suite mocks ITemplatingEngine, so none of
+        // them would notice Qute eating the JSON contract out of this template —
+        // and the symptom would be a judge that never returns parseable output,
+        // i.e. the feature silently never working. The literal braces here are
+        // load-bearing and this is the only test that proves they survive.
+        //
+        // Formatting matters more than it looks: `{` immediately followed by `"`
+        // renders literally, but the same JSON pretty-printed across lines (a `{`
+        // followed by a newline) does NOT — Qute consumes it. Keep the contract
+        // line on one line.
+        var engine = Engine.builder().addDefaults().addValueResolver(new ReflectionValueResolver()).build();
+        var transcript = List.of(Map.of("speaker", "Pro", "content", "We should ship.", "phaseName", "Arguments"));
+
+        String rendered = engine.parse(DiscussionStylePresets.TEMPLATE_DEBATE_JUDGMENT)
+                .data("question", "Ship on Friday?")
+                .data("transcript", transcript)
+                .render();
+
+        assertTrue(rendered.contains("""
+                {"winner": "PRO" | "CON" | "TIE", "scores": {"PRO": <0-10>, "CON": <0-10>}, "reasoning": "<your full analysis>"}"""),
+                "the JSON contract must reach the judge verbatim, otherwise DebateVerdictParser can never parse a reply:\n" + rendered);
+        // The data bindings still work — a template that renders literally
+        // everywhere would be just as broken.
+        assertTrue(rendered.contains("Ship on Friday?"));
+        assertTrue(rendered.contains("We should ship."));
+    }
+
+    @Test
+    void debateJudgmentTemplate_scoresArgumentQualityNotAssertiveness() {
+        // The anti-sycophancy directive the plan requires. An LLM judge shown two
+        // sides reliably rewards the more forceful one; dropping this line turns
+        // the verdict into a measure of rhetoric.
+        String t = DiscussionStylePresets.TEMPLATE_DEBATE_JUDGMENT;
+        assertTrue(t.contains("FACTUAL SUPPORT"), t);
+        assertTrue(t.contains("do NOT reward assertiveness"), t);
+        assertTrue(t.contains("A tie is a legitimate verdict"), t);
+        // The reasoning is the discussion's answer, so a length cap here would
+        // quietly shorten the output of every existing DEBATE config.
+        assertFalse(t.contains("2-3 sentences"), "reasoning must stay uncapped: " + t);
+    }
+
+    // ---------------------------------------------------------------- templateFor
+
+    private static DiscussionPhase phaseWithTemplate(PhaseType type, String template) {
+        return new DiscussionPhase("Test", type, "ALL", TurnOrder.SEQUENTIAL, ContextScope.FULL, false, template, 1);
+    }
+
+    /**
+     * {@code templateFor} exists so no engine can reach for
+     * {@link DiscussionStylePresets#defaultTemplate} directly and bypass the
+     * designer's override. TaskForceEngine did exactly that at all three of its
+     * phases — PLAN, EXECUTE and VERIFY, which is the whole TASK_FORCE style — so
+     * for that style the phase-template mechanism was inert end to end. Save-time
+     * validation did not object, and the preset produces plausible output, so the
+     * only symptom was a transcript in the wrong language or the wrong format.
+     */
+    @Test
+    void templateForPrefersTheDesignersTemplate() {
+        var phase = phaseWithTemplate(PhaseType.PLAN, "Zerlege die Aufgabe auf Deutsch.");
+
+        assertEquals("Zerlege die Aufgabe auf Deutsch.", DiscussionStylePresets.templateFor(phase, PhaseType.PLAN),
+                "an explicit inputTemplate is the documented way to steer a phase and must win over the preset");
+    }
+
+    @Test
+    void templateForFallsBackToThePresetWhenNoneIsConfigured() {
+        var phase = phaseWithTemplate(PhaseType.EXECUTE, null);
+
+        assertEquals(DiscussionStylePresets.defaultTemplate(PhaseType.EXECUTE), DiscussionStylePresets.templateFor(phase, PhaseType.EXECUTE));
+    }
+
+    @Test
+    void templateForToleratesANullPhase() {
+        assertEquals(DiscussionStylePresets.defaultTemplate(PhaseType.VERIFY), DiscussionStylePresets.templateFor(null, PhaseType.VERIFY));
+    }
+
+    /**
+     * The override has to reach every task-force phase, not just the one someone
+     * remembered. Asserting each type separately is what would have caught the
+     * original defect, which was three independent call sites rather than one.
+     */
+    /**
+     * The helper only helps if the engines use it. Reaching for a preset without
+     * consulting {@code inputTemplate()} is the bypass this change removes, and it
+     * is invisible at runtime — the preset renders fine, it is simply not what the
+     * designer asked for.
+     * <p>
+     * The rule is "consults the override", not "calls templateFor".
+     * {@code GroupContextBuilder} resolves the fallback itself, because a DEBATE
+     * judgment turn needs a different preset from the same phase type — but it
+     * still checks {@code phase.inputTemplate()} first, which is the property that
+     * matters.
+     */
+    @Test
+    void noPhaseEngineReachesPastTemplateFor() throws Exception {
+        Path engines = Path.of("").toAbsolutePath().resolve(Path.of("src", "main", "java", "ai", "labs", "eddi", "engine", "internal", "groups"));
+        assertTrue(Files.isDirectory(engines), "the group engines package moved; update this guard");
+
+        var offenders = new ArrayList<String>();
+        try (var files = Files.list(engines)) {
+            for (Path f : files.filter(x -> x.getFileName().toString().endsWith(".java")).toList()) {
+                String body = Files.readString(f, StandardCharsets.UTF_8);
+                if (body.contains("DiscussionStylePresets.defaultTemplate(") && !body.contains("inputTemplate()")) {
+                    offenders.add(f.getFileName().toString());
+                }
+            }
+        }
+        assertTrue(offenders.isEmpty(), "these reach for a style preset without ever consulting phase.inputTemplate(), so a "
+                + "configured template is silently discarded; use DiscussionStylePresets.templateFor(phase, type): " + offenders);
+    }
+
+    @Test
+    void templateForHonoursTheOverrideAtEveryTaskForcePhase() {
+        for (PhaseType type : List.of(PhaseType.PLAN, PhaseType.EXECUTE, PhaseType.VERIFY)) {
+            var phase = phaseWithTemplate(type, "custom for " + type);
+            assertEquals("custom for " + type, DiscussionStylePresets.templateFor(phase, type),
+                    type + " must honour a configured inputTemplate");
+        }
+    }
+}

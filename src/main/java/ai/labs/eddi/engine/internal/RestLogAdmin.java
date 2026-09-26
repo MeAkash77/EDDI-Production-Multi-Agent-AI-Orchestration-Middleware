@@ -1,0 +1,159 @@
+/*
+ * Copyright EDDI contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package ai.labs.eddi.engine.internal;
+
+import ai.labs.eddi.engine.api.IRestLogAdmin;
+import ai.labs.eddi.engine.model.Deployment;
+import ai.labs.eddi.engine.model.LogEntry;
+import ai.labs.eddi.engine.runtime.BoundedLogStore;
+import ai.labs.eddi.engine.runtime.IDatabaseLogs;
+import ai.labs.eddi.engine.runtime.InstanceIdProducer;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.sse.OutboundSseEvent;
+import jakarta.ws.rs.sse.Sse;
+import jakarta.ws.rs.sse.SseEventSink;
+import org.jboss.logging.Logger;
+
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
+
+import static ai.labs.eddi.utils.LogSanitizer.sanitize;
+
+/**
+ * REST implementation for log administration — provides real-time SSE streaming
+ * from the in-memory ring buffer and historical queries from the database.
+ *
+ * @author ginccc
+ * @since 6.0.0
+ */
+@ApplicationScoped
+public class RestLogAdmin implements IRestLogAdmin {
+
+    private static final Logger log = Logger.getLogger(RestLogAdmin.class);
+
+    private static final long HEARTBEAT_INTERVAL_MS = 15_000;
+
+    private final BoundedLogStore boundedLogStore;
+    private final IDatabaseLogs databaseLogs;
+    private final InstanceIdProducer instanceIdProducer;
+    private final LongSupplier clock;
+
+    @Inject
+    public RestLogAdmin(BoundedLogStore boundedLogStore, IDatabaseLogs databaseLogs, InstanceIdProducer instanceIdProducer) {
+        this(boundedLogStore, databaseLogs, instanceIdProducer, System::currentTimeMillis);
+    }
+
+    // Package-private constructor for testing — allows injecting a controllable
+    // time source
+    RestLogAdmin(BoundedLogStore boundedLogStore, IDatabaseLogs databaseLogs, InstanceIdProducer instanceIdProducer, LongSupplier clock) {
+        this.boundedLogStore = boundedLogStore;
+        this.databaseLogs = databaseLogs;
+        this.instanceIdProducer = instanceIdProducer;
+        this.clock = clock;
+    }
+
+    @Override
+    public List<LogEntry> getRecentLogs(String agentId, String conversationId, String level, int limit) {
+        return boundedLogStore.getEntries(agentId, conversationId, level, limit);
+    }
+
+    @Override
+    public List<LogEntry> getHistoryLogs(Deployment.Environment environment, String agentId, Integer agentVersion, String conversationId,
+                                         String userId, String instanceId, Integer skip, Integer limit) {
+        return databaseLogs.getLogs(environment, agentId, agentVersion, conversationId, userId, instanceId, skip, limit);
+    }
+
+    @Override
+    public void streamLogs(String agentId, String conversationId, String level, SseEventSink eventSink, Sse sse) {
+
+        AtomicLong lastEventTime = new AtomicLong(clock.getAsLong());
+
+        // Send initial batch from ring buffer
+        List<LogEntry> initial = boundedLogStore.getEntries(agentId, conversationId, level, 50);
+        for (int i = initial.size() - 1; i >= 0; i--) {
+            sendEvent(eventSink, sse, initial.get(i), lastEventTime);
+        }
+
+        // Register listener for live push
+        String listenerId = boundedLogStore.addListener(entry -> {
+            if (eventSink.isClosed())
+                return;
+
+            // Apply filters
+            if (agentId != null && !agentId.equals(entry.agentId()))
+                return;
+            if (conversationId != null && !conversationId.equals(entry.conversationId()))
+                return;
+            if (level != null && !boundedLogStore.meetsMinimumLevel(entry.level(), level))
+                return;
+
+            sendEvent(eventSink, sse, entry, lastEventTime);
+        });
+
+        // Clean up when client disconnects or after max lifetime
+        Thread.ofVirtual().name("sse-log-cleanup-" + listenerId).start(() -> {
+            long maxLifetimeMs = TimeUnit.HOURS.toMillis(24);
+            long start = clock.getAsLong();
+            try {
+                while (!eventSink.isClosed() && (clock.getAsLong() - start) < maxLifetimeMs) {
+                    Thread.sleep(2000);
+                    if ((clock.getAsLong() - lastEventTime.get()) > HEARTBEAT_INTERVAL_MS) {
+                        try {
+                            OutboundSseEvent heartbeat = sse.newEventBuilder()
+                                    .comment("heartbeat")
+                                    .build();
+                            eventSink.send(heartbeat).exceptionally(t -> {
+                                log.debugv("Failed to send heartbeat: {0}", t.getMessage());
+                                return null;
+                            });
+                            lastEventTime.set(clock.getAsLong());
+                        } catch (Exception e) {
+                            // Client likely disconnected — will be caught by isClosed() check
+                            break;
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                try {
+                    boundedLogStore.removeListener(listenerId);
+                    if (!eventSink.isClosed()) {
+                        eventSink.close();
+                    }
+                    log.debugv("SSE log listener {0} removed (client disconnected or max lifetime reached)", listenerId);
+                } catch (Exception e) {
+                    // CDI container may already be shut down (e.g. during test teardown) —
+                    // swallow to avoid noisy "ArC container not initialized" stacktraces
+                }
+            }
+        });
+
+        log.debugv("SSE log stream started (listenerId={0}, agentId={1}, level={2})", listenerId, sanitize(agentId),
+                sanitize(level));
+    }
+
+    @Override
+    public InstanceInfo getInstanceId() {
+        return new InstanceInfo(instanceIdProducer.getInstanceId());
+    }
+
+    private void sendEvent(SseEventSink eventSink, Sse sse, LogEntry entry, AtomicLong lastEventTime) {
+        try {
+            OutboundSseEvent event = sse.newEventBuilder().name("log").mediaType(MediaType.APPLICATION_JSON_TYPE).data(LogEntry.class, entry).build();
+            eventSink.send(event).exceptionally(t -> {
+                log.debugv("Failed to send SSE log event: {0}", t.getMessage());
+                return null;
+            });
+            lastEventTime.set(clock.getAsLong());
+        } catch (Exception e) {
+            log.debugv("Error sending SSE log event: {0}", e.getMessage());
+        }
+    }
+}
