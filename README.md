@@ -43,13 +43,13 @@ The fastest way to get EDDI running is the **one-command installer**. It sets up
 **Linux / macOS / WSL2:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/labsai/EDDI/main/install.sh | bash
+curl -fsSL https://github.com/MeAkash77/EDDI-Production-Multi-Agent-AI-Orchestration-Middleware | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/labsai/EDDI/main/install.ps1" -OutFile "install.ps1"
+Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/MeAkash77/EDDI-Production-Multi-Agent-AI-Orchestration-Middleware/labsai/EDDI/main/install.ps1" -OutFile "install.ps1"
 Unblock-File .\install.ps1
 .\install.ps1
 ```
@@ -143,11 +143,6 @@ The Ollama overlay pulls `llama3.2:3b` on first start and keeps models in a name
 
 ```bash
 docker pull labsai/eddi    # Pull latest from Docker Hub
-```
-
-→ [hub.docker.com/r/labsai/eddi](https://hub.docker.com/r/labsai/eddi)
-
----
 
 ## 💡 Why EDDI?
 
